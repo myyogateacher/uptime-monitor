@@ -1,7 +1,7 @@
 import mysql from 'mysql2/promise'
-import { config } from './config.js'
+import { config } from './config'
 
-export const pool = mysql.createPool({
+export const pool: any = mysql.createPool({
   ...config.mysql,
   waitForConnections: true,
 })

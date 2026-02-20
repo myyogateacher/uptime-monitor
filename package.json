@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "concurrently -k -n client,server -c cyan,green \"bun run dev:client\" \"bun run dev:server\"",
     "dev:client": "vite",
-    "dev:server": "TZ=UTC bun --watch server/index.js",
+    "dev:server": "TZ=UTC bun --watch server/index.ts",
     "start": "NODE_ENV=production TZ=UTC bun run start:server",
-    "start:server": "TZ=UTC bun server/index.js",
+    "start:server": "TZ=UTC bun server/index.ts",
     "build": "vite build",
+    "typecheck": "tsc --noEmit && tsc --project tsconfig.server.json --noEmit",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -28,8 +29,11 @@
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@tailwindcss/vite": "^4.2.0",
+    "@types/node": "^24.4.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
+    "@typescript-eslint/eslint-plugin": "^8.56.0",
+    "@typescript-eslint/parser": "^8.56.0",
     "@vitejs/plugin-react": "^5.1.1",
     "concurrently": "^9.2.1",
     "eslint": "^9.39.1",
@@ -37,6 +41,7 @@
     "eslint-plugin-react-refresh": "^0.4.24",
     "globals": "^16.5.0",
     "tailwindcss": "^4.2.0",
+    "typescript": "^5.9.2",
     "vite": "^7.3.1"
   }
 }

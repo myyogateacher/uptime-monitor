@@ -1,10 +1,10 @@
 import mysql from 'mysql2/promise'
 import { createClient } from 'redis'
 
-import { config } from './config.js'
-import { pool } from './db.js'
-import { MONITOR_CHECKED_EVENT, monitorEvents } from './events.js'
-import { notifyStatusChange } from './notifier.js'
+import { config } from './config'
+import { pool } from './db'
+import { MONITOR_CHECKED_EVENT, monitorEvents } from './events'
+import { notifyStatusChange } from './notifier'
 
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 

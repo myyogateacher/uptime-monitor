@@ -1,6 +1,10 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
 
-async function request(path, options = {}) {
+type RequestOptions = RequestInit & {
+  headers?: Record<string, string>
+}
+
+async function request(path: string, options: RequestOptions = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
     cache: 'no-store',
     headers: {

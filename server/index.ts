@@ -6,8 +6,8 @@ import cors from 'cors'
 import express from 'express'
 import { WebSocketServer } from 'ws'
 
-import { config } from './config.js'
-import { initDatabase, pool } from './db.js'
+import { config } from './config'
+import { initDatabase, pool } from './db'
 import {
   ENDPOINT_CREATED_EVENT,
   ENDPOINT_DELETED_EVENT,
@@ -17,8 +17,8 @@ import {
   GROUP_UPDATED_EVENT,
   MONITOR_CHECKED_EVENT,
   monitorEvents,
-} from './events.js'
-import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService.js'
+} from './events'
+import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService'
 
 const app = express()
 const httpServer = createServer(app)

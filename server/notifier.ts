@@ -1,4 +1,4 @@
-import { config } from "./config.js";
+import { config } from './config'
 
 const isValidEvent = (status) => status === "up" || status === "down";
 const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
