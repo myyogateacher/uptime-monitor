@@ -337,10 +337,24 @@ const getMappedEndpointsByGroupId = async (groupId: number): Promise<Array<Recor
 }
 
 const isAuthenticated = (req: Request): boolean => Boolean(req.session?.user)
+const getSessionEmail = (req: Request): string =>
+  String(req.session?.user?.email ?? '')
+    .trim()
+    .toLowerCase()
+const canEditControlPlane = (req: Request): boolean => {
+  if (!isAuthenticated(req)) return false
+  const allowlist = config.auth.editorEmails
+  if (!allowlist.length) return true
+  const email = getSessionEmail(req)
+  return allowlist.includes(email)
+}
 
-const requireAuth = (req: Request, res: Response, next: NextFunction) => {
-  if (isAuthenticated(req)) return next()
-  return res.status(401).json({ error: 'Authentication required' })
+const requireEditor = (req: Request, res: Response, next: NextFunction) => {
+  if (!isAuthenticated(req)) {
+    return res.status(401).json({ error: 'Authentication required' })
+  }
+  if (canEditControlPlane(req)) return next()
+  return res.status(403).json({ error: 'You do not have permission to edit monitors' })
 }
 
 const requireGoogleConfig = (res: Response): boolean => {
@@ -361,12 +375,13 @@ const buildLoginUrl = (returnTo?: string): string => {
 
 app.get('/api/auth/me', (req: Request, res: Response) => {
   if (!req.session?.user) {
-    return res.status(200).json({ authenticated: false, user: null })
+    return res.status(200).json({ authenticated: false, user: null, canEdit: false })
   }
 
   return res.status(200).json({
     authenticated: true,
     user: req.session.user,
+    canEdit: canEditControlPlane(req),
   })
 })
 
@@ -508,7 +523,7 @@ app.get('/api/groups', async (_req: Request, res: Response) => {
   res.json(rows)
 })
 
-app.post('/api/groups', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/groups', requireEditor, async (req: Request, res: Response) => {
   const name = String(req.body.name ?? '').trim()
   const description = String(req.body.description ?? '').trim() || null
 
@@ -527,7 +542,7 @@ app.post('/api/groups', requireAuth, async (req: Request, res: Response) => {
   return res.status(201).json(createdGroup)
 })
 
-app.put('/api/groups/:id', requireAuth, async (req: Request, res: Response) => {
+app.put('/api/groups/:id', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
   const name = String(req.body.name ?? '').trim()
   const description = String(req.body.description ?? '').trim() || null
@@ -557,7 +572,7 @@ app.put('/api/groups/:id', requireAuth, async (req: Request, res: Response) => {
   return res.json(updatedGroup)
 })
 
-app.delete('/api/groups/:id', requireAuth, async (req: Request, res: Response) => {
+app.delete('/api/groups/:id', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -574,7 +589,7 @@ app.delete('/api/groups/:id', requireAuth, async (req: Request, res: Response) =
   return res.status(204).send()
 })
 
-app.post('/api/groups/:id/pause', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/groups/:id/pause', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -609,7 +624,7 @@ app.post('/api/groups/:id/pause', requireAuth, async (req: Request, res: Respons
   })
 })
 
-app.post('/api/groups/:id/resume', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/groups/:id/resume', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -671,7 +686,7 @@ app.get('/api/endpoints', async (req: Request, res: Response) => {
   res.json(rows.map(mapEndpointRow))
 })
 
-app.post('/api/endpoints', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/endpoints', requireEditor, async (req: Request, res: Response) => {
   let payload
 
   try {
@@ -744,7 +759,7 @@ app.post('/api/endpoints', requireAuth, async (req: Request, res: Response) => {
   return res.status(201).json(createdEndpoint)
 })
 
-app.put('/api/endpoints/:id', requireAuth, async (req: Request, res: Response) => {
+app.put('/api/endpoints/:id', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -823,7 +838,7 @@ app.put('/api/endpoints/:id', requireAuth, async (req: Request, res: Response) =
   return res.json(updatedEndpoint)
 })
 
-app.delete('/api/endpoints/:id', requireAuth, async (req: Request, res: Response) => {
+app.delete('/api/endpoints/:id', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -840,7 +855,7 @@ app.delete('/api/endpoints/:id', requireAuth, async (req: Request, res: Response
   return res.status(204).send()
 })
 
-app.post('/api/endpoints/:id/check', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/endpoints/:id/check', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -864,7 +879,7 @@ app.post('/api/endpoints/:id/check', requireAuth, async (req: Request, res: Resp
   return res.json(result)
 })
 
-app.post('/api/endpoints/:id/pause', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/endpoints/:id/pause', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -891,7 +906,7 @@ app.post('/api/endpoints/:id/pause', requireAuth, async (req: Request, res: Resp
   return res.json(endpoint)
 })
 
-app.post('/api/endpoints/:id/resume', requireAuth, async (req: Request, res: Response) => {
+app.post('/api/endpoints/:id/resume', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -939,7 +954,7 @@ app.get('/api/endpoints/:id/runs', async (req: Request, res: Response) => {
   res.json(rows)
 })
 
-app.delete('/api/endpoints/:id/runs', requireAuth, async (req: Request, res: Response) => {
+app.delete('/api/endpoints/:id/runs', requireEditor, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {

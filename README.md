@@ -90,10 +90,16 @@ Use `.env` (see `.env.example`):
 - `CONTROL_PLANE_PATH`
 - `LOGIN_PATH`
 - `TRUST_PROXY`
+- `CONTROL_PLANE_EDITOR_EMAILS`
 - `NOTIFICATIONS_ENABLED`
 - `SLACK_BOT_TOKEN`
 - `SLACK_CHANNEL_ID`
 - `NOTIFICATION_TARGETS_JSON`
+
+Editor access control:
+- Set `CONTROL_PLANE_EDITOR_EMAILS` as a comma-separated list of Google account emails that can mutate monitors/groups.
+- Example: `CONTROL_PLANE_EDITOR_EMAILS=ops@company.com,sre@company.com`
+- If empty, any authenticated user can edit (default behavior).
 
 Notification config examples:
 

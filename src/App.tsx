@@ -435,6 +435,7 @@ function AdminPage({
   groupedEndpoints,
   endpointForm,
   editingEndpointId,
+  canEdit,
   isLoading,
   isSavingEndpoint,
   setEndpointForm,
@@ -499,6 +500,11 @@ function AdminPage({
         <section className="grid gap-6 lg:grid-cols-[1.35fr_1fr]">
           <section className="glass-card rounded-xl p-5">
             <h2 className="text-lg font-semibold">Monitored Routes</h2>
+            {!canEdit ? (
+              <p className="mt-2 rounded-md border border-amber-200/80 bg-amber-50/75 px-3 py-2 text-xs text-amber-700">
+                You have read-only access. Editing actions are restricted to allowed editor emails.
+              </p>
+            ) : null}
             {isLoading ? (
               <p className="mt-3 text-sm text-slate-500">Loading...</p>
             ) : (
@@ -519,7 +525,7 @@ function AdminPage({
                         <button
                           type="button"
                           onClick={() => handleToggleGroupPause(group)}
-                          disabled={!hasMonitors}
+                          disabled={!hasMonitors || !canEdit}
                           className={`cursor-pointer rounded border px-3 py-1.5 text-xs text-white transition duration-150 ease-out active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 ${
                             allPaused
                               ? 'border-emerald-300/70 bg-gradient-to-r from-emerald-600 to-teal-600 shadow-[0_6px_16px_rgba(5,150,105,0.26)] hover:from-emerald-500 hover:to-teal-500 focus-visible:ring-emerald-300/80'
@@ -578,24 +584,25 @@ function AdminPage({
                                 <button
                                   type="button"
                                   onClick={() => handleTogglePause(endpoint)}
+                                  disabled={!canEdit}
                                   className={`cursor-pointer rounded border px-3 py-1.5 text-xs text-white transition duration-150 ease-out active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 ${
                                     endpoint.is_paused
                                       ? 'border-emerald-300/70 bg-gradient-to-r from-emerald-600 to-teal-600 shadow-[0_6px_16px_rgba(5,150,105,0.26)] hover:from-emerald-500 hover:to-teal-500 focus-visible:ring-emerald-300/80'
                                       : 'border-slate-300/70 bg-gradient-to-r from-slate-600 to-slate-700 shadow-[0_6px_16px_rgba(51,65,85,0.25)] hover:from-slate-500 hover:to-slate-600 focus-visible:ring-slate-300/80'
-                                  }`}
+                                  } disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100`}
                                 >
                                   {endpoint.is_paused ? 'Resume' : 'Pause'}
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => handleCheckNow(endpoint.id)}
-                                  disabled={endpoint.is_paused}
+                                  disabled={endpoint.is_paused || !canEdit}
                                   className="cursor-pointer rounded border border-blue-300/60 bg-gradient-to-r from-blue-600 to-indigo-600 px-3 py-1.5 text-xs text-white shadow-[0_6px_16px_rgba(37,99,235,0.25)] transition duration-150 ease-out hover:from-blue-500 hover:to-indigo-500 active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300/80 disabled:cursor-not-allowed disabled:from-slate-400 disabled:to-slate-500 disabled:opacity-60 disabled:active:scale-100"
                                 >
                                   Check now
                                 </button>
-                                <button type="button" onClick={() => handleDeleteHistory(endpoint.id)} className="cursor-pointer rounded border border-amber-300/70 bg-gradient-to-r from-amber-500 to-orange-500 px-3 py-1.5 text-xs text-white shadow-[0_6px_16px_rgba(245,158,11,0.22)] transition duration-150 ease-out hover:from-amber-400 hover:to-orange-400 active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/80">Delete history</button>
-                                <button type="button" onClick={() => handleDeleteEndpoint(endpoint.id)} className="cursor-pointer rounded border border-rose-300/70 bg-gradient-to-r from-rose-500 to-pink-500 px-3 py-1.5 text-xs text-white shadow-[0_6px_16px_rgba(244,63,94,0.24)] transition duration-150 ease-out hover:from-rose-400 hover:to-pink-400 active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/80">Delete</button>
+                                <button type="button" disabled={!canEdit} onClick={() => handleDeleteHistory(endpoint.id)} className="cursor-pointer rounded border border-amber-300/70 bg-gradient-to-r from-amber-500 to-orange-500 px-3 py-1.5 text-xs text-white shadow-[0_6px_16px_rgba(245,158,11,0.22)] transition duration-150 ease-out hover:from-amber-400 hover:to-orange-400 active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/80 disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100">Delete history</button>
+                                <button type="button" disabled={!canEdit} onClick={() => handleDeleteEndpoint(endpoint.id)} className="cursor-pointer rounded border border-rose-300/70 bg-gradient-to-r from-rose-500 to-pink-500 px-3 py-1.5 text-xs text-white shadow-[0_6px_16px_rgba(244,63,94,0.24)] transition duration-150 ease-out hover:from-rose-400 hover:to-pink-400 active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/80 disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100">Delete</button>
                               </div>
                             </div>
                             <div className="mt-3 grid gap-2 text-xs text-slate-600 md:grid-cols-2">
@@ -622,9 +629,10 @@ function AdminPage({
               <div className="flex items-center justify-between gap-3">
                 <h2 className="text-lg font-semibold">{editingEndpointId ? 'Edit Monitor' : 'Add Monitor'}</h2>
                 {editingEndpointId ? (
-                  <button type="button" onClick={handleCancelEdit} className="cursor-pointer rounded border border-slate-300/70 bg-white/70 px-3 py-1.5 text-xs text-slate-700 transition duration-150 ease-out hover:bg-white active:scale-[0.97]">Cancel Edit</button>
+                  <button type="button" onClick={handleCancelEdit} disabled={!canEdit} className="cursor-pointer rounded border border-slate-300/70 bg-white/70 px-3 py-1.5 text-xs text-slate-700 transition duration-150 ease-out hover:bg-white active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100">Cancel Edit</button>
                 ) : null}
               </div>
+              <fieldset disabled={!canEdit || isSavingEndpoint} className="contents">
 
               <label className="mt-3 block text-sm font-medium text-slate-700">
                 Group (type new or choose existing)
@@ -879,11 +887,12 @@ function AdminPage({
 
               <button
                 type="submit"
-                disabled={isSavingEndpoint}
+                disabled={isSavingEndpoint || !canEdit}
                 className="mt-4 cursor-pointer rounded-lg border border-blue-300/60 bg-gradient-to-r from-blue-600 to-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-[0_8px_24px_rgba(37,99,235,0.28)] transition duration-150 ease-out hover:from-blue-500 hover:to-indigo-500 hover:shadow-[0_10px_28px_rgba(37,99,235,0.35)] active:scale-[0.98] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300/80 disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100"
               >
                 {isSavingEndpoint ? 'Saving...' : editingEndpointId ? 'Update Monitor' : 'Create Monitor'}
               </button>
+              </fieldset>
             </form>
 
             {error && <p className="rounded-lg border border-rose-200/80 bg-rose-50/80 px-4 py-3 text-sm text-rose-700 backdrop-blur">{error}</p>}
@@ -913,6 +922,7 @@ function App() {
   const [currentTimeMs, setCurrentTimeMs] = useState(Date.now())
   const [authChecked, setAuthChecked] = useState(false)
   const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [canEdit, setCanEdit] = useState(false)
   const [authError, setAuthError] = useState('')
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -936,8 +946,10 @@ function App() {
         const sessionState = await monitoringService.getSession()
         const authenticated = Boolean(sessionState?.authenticated)
         setIsAuthenticated(authenticated)
+        setCanEdit(Boolean(sessionState?.canEdit))
       } catch (requestError) {
         setIsAuthenticated(false)
+        setCanEdit(false)
         setAuthError(requestError.message)
       } finally {
         setAuthChecked(true)
@@ -1147,6 +1159,10 @@ function App() {
   const handleEndpointSubmit = async (event) => {
     event.preventDefault()
     setError('')
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     setIsSavingEndpoint(true)
 
     try {
@@ -1207,6 +1223,10 @@ function App() {
 
   const handleDeleteEndpoint = async (endpointId) => {
     setError('')
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     try {
       await monitoringService.deleteEndpoint(endpointId)
       setEndpoints((current) => current.filter((endpoint) => endpoint.id !== endpointId))
@@ -1226,6 +1246,10 @@ function App() {
 
   const handleDeleteHistory = async (endpointId) => {
     setError('')
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     if (!window.confirm('Delete all historical check runs for this monitor?')) return
 
     try {
@@ -1237,6 +1261,10 @@ function App() {
   }
 
   const handleStartEdit = (endpoint) => {
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     const groupName = groups.find((group) => group.id === endpoint.group_id)?.name ?? endpoint.group_name ?? ''
 
     setEndpointForm({
@@ -1268,6 +1296,10 @@ function App() {
 
   const handleCheckNow = async (endpointId) => {
     setError('')
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     try {
       await monitoringService.triggerCheck(endpointId)
       const optimisticNow = new Date().toISOString()
@@ -1285,6 +1317,10 @@ function App() {
 
   const handleTogglePause = async (endpoint) => {
     setError('')
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     try {
       const updatedEndpoint = endpoint.is_paused
         ? await monitoringService.resumeEndpoint(endpoint.id)
@@ -1306,6 +1342,10 @@ function App() {
 
   const handleToggleGroupPause = async (group) => {
     setError('')
+    if (!canEdit) {
+      setError('You do not have permission to edit monitors')
+      return
+    }
     try {
       const hasMonitors = group.endpoints.length > 0
       if (!hasMonitors) return
@@ -1353,6 +1393,7 @@ function App() {
       groupedEndpoints={groupedEndpoints}
       endpointForm={endpointForm}
       editingEndpointId={editingEndpointId}
+      canEdit={canEdit}
       isLoading={isLoading}
       isSavingEndpoint={isSavingEndpoint}
       setEndpointForm={setEndpointForm}

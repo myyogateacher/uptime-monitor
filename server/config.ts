@@ -93,6 +93,12 @@ const parseNotificationTargets = () => {
   ]
 }
 
+const parseEmailAllowlist = (rawValue: string | undefined): string[] =>
+  String(rawValue ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+
 const nodeEnv = process.env.NODE_ENV ?? 'development'
 
 export const config = {
@@ -128,5 +134,6 @@ export const config = {
     controlPlanePath: process.env.CONTROL_PLANE_PATH ?? '/monitors',
     loginPath: process.env.LOGIN_PATH ?? '/login',
     trustProxy: toBoolean(process.env.TRUST_PROXY, nodeEnv === 'production'),
+    editorEmails: parseEmailAllowlist(process.env.CONTROL_PLANE_EDITOR_EMAILS),
   },
 }
