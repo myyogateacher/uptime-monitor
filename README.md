@@ -30,6 +30,13 @@ The backend serves the built frontend (`dist/`) so both control plane and status
   - Connection JSON
   - Optional probe command
   - Optional expected probe value matching
+- NATS JetStream monitor support:
+  - Connection JSON
+  - JetStream probe command support (`jetstream.info`, `stream.info:<name>`)
+  - Optional expected probe value matching
+- TCP port monitor support:
+  - Host/port connection check
+  - Optional expected probe value matching (default `"open"`)
 - Retry-based health transitions:
   - Interval per monitor
   - Retries before marking down

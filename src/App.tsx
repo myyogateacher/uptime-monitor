@@ -7,12 +7,16 @@ const MONITOR_TYPE_OPTIONS = [
   { value: 'http', label: 'HTTP API' },
   { value: 'mysql', label: 'MySQL' },
   { value: 'redis', label: 'Redis' },
+  { value: 'nats', label: 'NATS JetStream' },
+  { value: 'tcp', label: 'TCP Port' },
 ]
 
 const DEFAULT_CONNECTION_JSON = {
   http: '{\n  "timeoutMs": 10000\n}',
   mysql: '{\n  "host": "127.0.0.1",\n  "port": 3306,\n  "user": "root",\n  "password": "",\n  "database": "app_db"\n}',
   redis: '{\n  "host": "127.0.0.1",\n  "port": 6379\n}',
+  nats: '{\n  "servers": ["nats://127.0.0.1:4222"]\n}',
+  tcp: '{\n  "host": "127.0.0.1",\n  "port": 443,\n  "timeoutMs": 5000\n}',
 }
 
 const INITIAL_ENDPOINT_FORM = {
@@ -766,7 +770,17 @@ function AdminPage({
                       value={endpointForm.probe_command}
                       onChange={(event) => setEndpointForm((current) => ({ ...current, probe_command: event.target.value }))}
                       className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-xs focus:border-slate-500 focus:outline-none"
-                      placeholder={endpointForm.monitor_type === 'mysql' ? 'SELECT 1 AS health' : 'PING or ["GET","health:key"]'}
+                      placeholder={
+                        endpointForm.monitor_type === 'mysql'
+                          ? 'SELECT 1 AS health'
+                          : endpointForm.monitor_type === 'redis'
+                            ? 'PING or ["GET","health:key"]'
+                            : endpointForm.monitor_type === 'nats'
+                              ? 'jetstream.info or stream.info:ORDERS'
+                              : endpointForm.monitor_type === 'tcp'
+                                ? 'Optional (default checks open port)'
+                                : ''
+                      }
                     />
                   </label>
                   <label className="mt-3 block text-sm font-medium text-slate-700">
@@ -775,7 +789,17 @@ function AdminPage({
                       value={endpointForm.expected_probe_value}
                       onChange={(event) => setEndpointForm((current) => ({ ...current, expected_probe_value: event.target.value }))}
                       className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-xs focus:border-slate-500 focus:outline-none"
-                      placeholder={'1 or "PONG"'}
+                      placeholder={
+                        endpointForm.monitor_type === 'mysql'
+                          ? '1'
+                          : endpointForm.monitor_type === 'redis'
+                            ? '"PONG"'
+                            : endpointForm.monitor_type === 'nats'
+                              ? '"ok" or stream name'
+                              : endpointForm.monitor_type === 'tcp'
+                                ? '"open"'
+                                : ''
+                      }
                     />
                   </label>
                 </>

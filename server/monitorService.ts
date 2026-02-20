@@ -1,5 +1,7 @@
 import mysql from 'mysql2/promise'
 import { createClient } from 'redis'
+import net from 'node:net'
+import { connect as connectNats } from 'nats'
 
 import { config } from './config'
 import { pool } from './db'
@@ -9,7 +11,7 @@ import { notifyStatusChange } from './notifier'
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 
 type MonitorStatus = 'pending' | 'up' | 'down'
-type MonitorType = 'http' | 'mysql' | 'redis'
+type MonitorType = 'http' | 'mysql' | 'redis' | 'nats' | 'tcp'
 
 type JsonObject = Record<string, unknown>
 
@@ -414,6 +416,127 @@ async function runRedisCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
   }
 }
 
+async function runNatsCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
+  const connection = parseConnection(endpoint.connection_json)
+  const serversRaw = connection.servers ?? connection.server ?? connection.url ?? 'nats://127.0.0.1:4222'
+  const servers = Array.isArray(serversRaw)
+    ? serversRaw.map((item) => String(item))
+    : [String(serversRaw)]
+
+  let nc: Awaited<ReturnType<typeof connectNats>> | null = null
+
+  console.log(`Connecting to NATS servers: ${JSON.stringify(connection)}`)
+  try {
+    nc = await withTimeout(
+      connectNats({
+        servers,
+        user: connection.user == null ? undefined : String(connection.user),
+        pass: connection.password == null ? undefined : String(connection.password),
+        token: connection.token == null ? undefined : String(connection.token),
+        timeout: Number(connection.timeoutMs ?? config.requestTimeoutMs),
+      }),
+      config.requestTimeoutMs,
+      'NATS connect',
+    )
+
+    const command = endpoint.probe_command?.trim() || 'jetstream.info'
+    let actualValue: unknown = 'ok'
+
+    if (command === 'jetstream.info') {
+      const jsm = await nc.jetstreamManager()
+      const accountInfo = await withTimeout(jsm.getAccountInfo(), config.requestTimeoutMs, 'JetStream info')
+      actualValue = accountInfo != null ? 'ok' : null
+    } else if (command.startsWith('stream.info:')) {
+      const streamName = command.slice('stream.info:'.length).trim()
+      if (!streamName) {
+        return {
+          checkPassed: false,
+          responseCode: 500,
+          matchedValue: null,
+          errorMessage: 'stream.info command requires stream name',
+        }
+      }
+      const jsm = await nc.jetstreamManager()
+      const streamInfo = await withTimeout(
+        jsm.streams.info(streamName),
+        config.requestTimeoutMs,
+        'JetStream stream info',
+      )
+      actualValue = streamInfo?.config?.name ?? null
+    }
+
+    const expectedRaw = endpoint.expected_probe_value ?? '"ok"'
+    const expectedResult = validateExpectedProbeValue(actualValue, expectedRaw)
+
+    return {
+      checkPassed: expectedResult.ok,
+      responseCode: expectedResult.ok ? 200 : 500,
+      matchedValue: expectedResult.matchedValue,
+      errorMessage: expectedResult.errorMessage,
+    }
+  } catch (error) {
+    return {
+      checkPassed: false,
+      responseCode: 500,
+      matchedValue: null,
+      errorMessage: error instanceof Error ? error.message : 'NATS check failed',
+    }
+  } finally {
+    if (nc) {
+      await nc.close()
+    }
+  }
+}
+
+async function runTcpCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
+  const connection = parseConnection(endpoint.connection_json)
+  const host = String(connection.host ?? '127.0.0.1')
+  const port = Number(connection.port ?? 80)
+  const timeoutMs = Number(connection.timeoutMs ?? config.requestTimeoutMs)
+
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    return {
+      checkPassed: false,
+      responseCode: 500,
+      matchedValue: null,
+      errorMessage: 'Invalid TCP port in connection_json',
+    }
+  }
+
+  const connectPromise = new Promise<unknown>((resolve, reject) => {
+    const socket = net.createConnection({ host, port })
+
+    socket.once('connect', () => {
+      socket.end()
+      resolve('open')
+    })
+    socket.once('error', (error) => {
+      socket.destroy()
+      reject(error)
+    })
+  })
+
+  try {
+    const actualValue = await withTimeout(connectPromise, timeoutMs, 'TCP connect')
+    const expectedRaw = endpoint.expected_probe_value ?? '"open"'
+    const expectedResult = validateExpectedProbeValue(actualValue, expectedRaw)
+
+    return {
+      checkPassed: expectedResult.ok,
+      responseCode: expectedResult.ok ? 200 : 500,
+      matchedValue: expectedResult.matchedValue,
+      errorMessage: expectedResult.errorMessage,
+    }
+  } catch (error) {
+    return {
+      checkPassed: false,
+      responseCode: 500,
+      matchedValue: null,
+      errorMessage: error instanceof Error ? error.message : 'TCP check failed',
+    }
+  }
+}
+
 export async function runCheck(endpoint: MonitorEndpoint): Promise<MonitorCheckedPayload | null> {
   if (Number(endpoint.is_paused) === 1) {
     return null
@@ -427,6 +550,10 @@ export async function runCheck(endpoint: MonitorEndpoint): Promise<MonitorChecke
     result = await runMysqlCheck(endpoint)
   } else if (endpoint.monitor_type === 'redis') {
     result = await runRedisCheck(endpoint)
+  } else if (endpoint.monitor_type === 'nats') {
+    result = await runNatsCheck(endpoint)
+  } else if (endpoint.monitor_type === 'tcp') {
+    result = await runTcpCheck(endpoint)
   } else {
     result = await runHttpCheck(endpoint)
   }

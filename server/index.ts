@@ -2,9 +2,9 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 
-import cors from 'cors'
-import express from 'express'
-import { WebSocketServer } from 'ws'
+import cors, { type CorsOptions } from 'cors'
+import express, { type NextFunction, type Request, type Response } from 'express'
+import { WebSocket, WebSocketServer } from 'ws'
 
 import { config } from './config'
 import { initDatabase, pool } from './db'
@@ -20,17 +20,21 @@ import {
 } from './events'
 import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService'
 
+type JsonObject = Record<string, unknown>
+type WsFrame = { type: string; payload?: unknown; timestamp?: string }
+type MonitorType = 'http' | 'mysql' | 'redis' | 'nats' | 'tcp'
+
 const app = express()
 const httpServer = createServer(app)
 const wsServer = new WebSocketServer({ server: httpServer, path: '/ws' })
-const wsClients = new Set()
+const wsClients: Set<WebSocket> = new Set()
 
-const safeSend = (ws, message) => {
+const safeSend = (ws: WebSocket, message: WsFrame): void => {
   if (ws.readyState !== 1) return
   ws.send(JSON.stringify(message))
 }
 
-wsServer.on('connection', (ws) => {
+wsServer.on('connection', (ws: WebSocket) => {
   wsClients.add(ws)
   safeSend(ws, { type: 'connected', timestamp: new Date().toISOString() })
 
@@ -39,10 +43,10 @@ wsServer.on('connection', (ws) => {
   })
 })
 
-const broadcast = (type, payload) => {
+const broadcast = (type: string, payload: unknown): void => {
   const message = { type, payload }
   for (const client of wsClients) {
-    safeSend(client, message)
+    safeSend(client, message as WsFrame)
   }
 }
 
@@ -74,7 +78,7 @@ monitorEvents.on(ENDPOINT_DELETED_EVENT, (payload) => {
   broadcast(ENDPOINT_DELETED_EVENT, payload)
 })
 
-const corsOptions = {
+const corsOptions: CorsOptions = {
   origin(origin, callback) {
     if (!origin) return callback(null, true)
     if (config.corsOrigins.includes(origin)) return callback(null, true)
@@ -89,20 +93,20 @@ app.options(/.*/, cors(corsOptions))
 
 app.use(express.json({ limit: '1mb' }))
 
-const MONITOR_TYPES = new Set(['http', 'mysql', 'redis'])
+const MONITOR_TYPES = new Set(['http', 'mysql', 'redis', 'nats', 'tcp'])
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 
-const toInteger = (value, fallback = null) => {
+const toInteger = (value: unknown, fallback: number | null = null): number | null => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return fallback
   return Math.trunc(parsed)
 }
 
-const parseJsonObjectInput = (value, fieldLabel) => {
+const parseJsonObjectInput = (value: unknown, fieldLabel: string): JsonObject => {
   if (value == null || value === '') return {}
 
   if (typeof value === 'object' && !Array.isArray(value)) {
-    return value
+    return value as JsonObject
   }
 
   if (typeof value !== 'string') {
@@ -118,7 +122,7 @@ const parseJsonObjectInput = (value, fieldLabel) => {
   return parsed
 }
 
-const normalizeHttpPayload = (payload) => {
+const normalizeHttpPayload = (payload: JsonObject): JsonObject => {
   const url = String(payload.url ?? '').trim()
   const method = String(payload.method ?? 'GET').toUpperCase()
   const bodyText = payload.body_text == null ? null : String(payload.body_text)
@@ -167,7 +171,10 @@ const normalizeHttpPayload = (payload) => {
   }
 }
 
-const normalizeMysqlOrRedisPayload = (payload, monitorType) => {
+const normalizeConnectionMonitorPayload = (
+  payload: JsonObject,
+  monitorType: MonitorType,
+): JsonObject => {
   const connection = parseJsonObjectInput(payload.connection_json, 'connection_json')
   const probeCommand = String(payload.probe_command ?? '').trim() || null
   const expectedProbeValue =
@@ -175,7 +182,14 @@ const normalizeMysqlOrRedisPayload = (payload, monitorType) => {
       ? null
       : String(payload.expected_probe_value)
 
-  const defaultPort = monitorType === 'mysql' ? 3306 : 6379
+  const defaultPortByType = {
+    mysql: 3306,
+    redis: 6379,
+    nats: 4222,
+    tcp: 80,
+  }
+
+  const defaultPort = defaultPortByType[monitorType] ?? 80
   const host = connection.host ?? '127.0.0.1'
   const port = Number(connection.port ?? defaultPort)
 
@@ -197,9 +211,9 @@ const normalizeMysqlOrRedisPayload = (payload, monitorType) => {
   }
 }
 
-const normalizeEndpointPayload = (payload) => {
+const normalizeEndpointPayload = (payload: JsonObject): JsonObject => {
   const name = String(payload.name ?? '').trim()
-  const monitorType = String(payload.monitor_type ?? 'http').trim().toLowerCase()
+  const monitorTypeRaw = String(payload.monitor_type ?? 'http').trim().toLowerCase()
   const intervalSeconds = toInteger(payload.interval_seconds, NaN)
   const downRetries = toInteger(payload.down_retries, NaN)
   const upRetries = toInteger(payload.up_retries, NaN)
@@ -207,9 +221,10 @@ const normalizeEndpointPayload = (payload) => {
 
   if (!name) throw new Error('Name is required')
 
-  if (!MONITOR_TYPES.has(monitorType)) {
-    throw new Error('monitor_type must be one of http, mysql, redis')
+  if (!MONITOR_TYPES.has(monitorTypeRaw)) {
+    throw new Error('monitor_type must be one of http, mysql, redis, nats, tcp')
   }
+  const monitorType = monitorTypeRaw as MonitorType
 
   if (!Number.isInteger(intervalSeconds) || intervalSeconds < 5) {
     throw new Error('interval_seconds must be at least 5 seconds')
@@ -230,7 +245,7 @@ const normalizeEndpointPayload = (payload) => {
   const monitorSpecific =
     monitorType === 'http'
       ? normalizeHttpPayload(payload)
-      : normalizeMysqlOrRedisPayload(payload, monitorType)
+      : normalizeConnectionMonitorPayload(payload, monitorType)
 
   return {
     name,
@@ -243,13 +258,13 @@ const normalizeEndpointPayload = (payload) => {
   }
 }
 
-const mapEndpointRow = (row) => {
-  const parseOrDefault = (value, fallback = {}) => {
+const mapEndpointRow = (row: Record<string, any>): Record<string, any> => {
+  const parseOrDefault = (value: unknown, fallback: JsonObject = {}): JsonObject => {
     if (!value) return fallback
-    if (typeof value === 'object') return value
+    if (typeof value === 'object') return value as JsonObject
 
     try {
-      return JSON.parse(value)
+      return JSON.parse(String(value))
     } catch {
       return fallback
     }
@@ -263,7 +278,7 @@ const mapEndpointRow = (row) => {
   }
 }
 
-const getMappedEndpointById = async (endpointId) => {
+const getMappedEndpointById = async (endpointId: number): Promise<Record<string, any> | null> => {
   const [rows] = await pool.query(
     `
       SELECT
@@ -281,7 +296,7 @@ const getMappedEndpointById = async (endpointId) => {
   return mapEndpointRow(rows[0])
 }
 
-const getMappedEndpointsByGroupId = async (groupId) => {
+const getMappedEndpointsByGroupId = async (groupId: number): Promise<Array<Record<string, any>>> => {
   const [rows] = await pool.query(
     `
       SELECT
@@ -298,7 +313,7 @@ const getMappedEndpointsByGroupId = async (groupId) => {
   return rows.map(mapEndpointRow)
 }
 
-app.get('/api/health', async (_req, res) => {
+app.get('/api/health', async (_req: Request, res: Response) => {
   const [rows] = await pool.query('SELECT COUNT(*) AS endpoint_count FROM monitor_endpoints')
 
   res.json({
@@ -308,7 +323,7 @@ app.get('/api/health', async (_req, res) => {
   })
 })
 
-app.get('/api/groups', async (_req, res) => {
+app.get('/api/groups', async (_req: Request, res: Response) => {
   const [rows] = await pool.query(`
     SELECT
       g.*,
@@ -322,7 +337,7 @@ app.get('/api/groups', async (_req, res) => {
   res.json(rows)
 })
 
-app.post('/api/groups', async (req, res) => {
+app.post('/api/groups', async (req: Request, res: Response) => {
   const name = String(req.body.name ?? '').trim()
   const description = String(req.body.description ?? '').trim() || null
 
@@ -341,7 +356,7 @@ app.post('/api/groups', async (req, res) => {
   return res.status(201).json(createdGroup)
 })
 
-app.put('/api/groups/:id', async (req, res) => {
+app.put('/api/groups/:id', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
   const name = String(req.body.name ?? '').trim()
   const description = String(req.body.description ?? '').trim() || null
@@ -371,7 +386,7 @@ app.put('/api/groups/:id', async (req, res) => {
   return res.json(updatedGroup)
 })
 
-app.delete('/api/groups/:id', async (req, res) => {
+app.delete('/api/groups/:id', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -388,7 +403,7 @@ app.delete('/api/groups/:id', async (req, res) => {
   return res.status(204).send()
 })
 
-app.post('/api/groups/:id/pause', async (req, res) => {
+app.post('/api/groups/:id/pause', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -423,7 +438,7 @@ app.post('/api/groups/:id/pause', async (req, res) => {
   })
 })
 
-app.post('/api/groups/:id/resume', async (req, res) => {
+app.post('/api/groups/:id/resume', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -458,7 +473,7 @@ app.post('/api/groups/:id/resume', async (req, res) => {
   })
 })
 
-app.get('/api/endpoints', async (req, res) => {
+app.get('/api/endpoints', async (req: Request, res: Response) => {
   const groupId = toInteger(req.query.group_id, null)
 
   const params = []
@@ -485,7 +500,7 @@ app.get('/api/endpoints', async (req, res) => {
   res.json(rows.map(mapEndpointRow))
 })
 
-app.post('/api/endpoints', async (req, res) => {
+app.post('/api/endpoints', async (req: Request, res: Response) => {
   let payload
 
   try {
@@ -558,7 +573,7 @@ app.post('/api/endpoints', async (req, res) => {
   return res.status(201).json(createdEndpoint)
 })
 
-app.put('/api/endpoints/:id', async (req, res) => {
+app.put('/api/endpoints/:id', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -637,7 +652,7 @@ app.put('/api/endpoints/:id', async (req, res) => {
   return res.json(updatedEndpoint)
 })
 
-app.delete('/api/endpoints/:id', async (req, res) => {
+app.delete('/api/endpoints/:id', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -654,7 +669,7 @@ app.delete('/api/endpoints/:id', async (req, res) => {
   return res.status(204).send()
 })
 
-app.post('/api/endpoints/:id/check', async (req, res) => {
+app.post('/api/endpoints/:id/check', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -678,7 +693,7 @@ app.post('/api/endpoints/:id/check', async (req, res) => {
   return res.json(result)
 })
 
-app.post('/api/endpoints/:id/pause', async (req, res) => {
+app.post('/api/endpoints/:id/pause', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -705,7 +720,7 @@ app.post('/api/endpoints/:id/pause', async (req, res) => {
   return res.json(endpoint)
 })
 
-app.post('/api/endpoints/:id/resume', async (req, res) => {
+app.post('/api/endpoints/:id/resume', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -732,7 +747,7 @@ app.post('/api/endpoints/:id/resume', async (req, res) => {
   return res.json(endpoint)
 })
 
-app.get('/api/endpoints/:id/runs', async (req, res) => {
+app.get('/api/endpoints/:id/runs', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -753,7 +768,7 @@ app.get('/api/endpoints/:id/runs', async (req, res) => {
   res.json(rows)
 })
 
-app.delete('/api/endpoints/:id/runs', async (req, res) => {
+app.delete('/api/endpoints/:id/runs', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -773,7 +788,7 @@ app.delete('/api/endpoints/:id/runs', async (req, res) => {
   })
 })
 
-app.use('/api', (err, _req, res, next) => {
+app.use('/api', (err: unknown, _req: Request, res: Response, next: NextFunction) => {
   void next
   const message = err instanceof Error ? err.message : 'Internal server error'
   console.error(err)
@@ -784,7 +799,7 @@ const distPath = path.resolve(process.cwd(), 'dist')
 if (existsSync(distPath)) {
   app.use(express.static(distPath))
 
-  app.get(/^\/(?!api).*/, (_req, res) => {
+  app.get(/^\/(?!api).*/, (_req: Request, res: Response) => {
     res.sendFile(path.join(distPath, 'index.html'))
   })
 }
@@ -798,15 +813,15 @@ async function start() {
   })
 }
 
-start().catch((error) => {
+start().catch((error: unknown) => {
   console.error('Failed to start server:', error)
   process.exit(1)
 })
 
 const shutdown = async () => {
   stopMonitor()
-  await new Promise((resolve) => wsServer.close(resolve))
-  await new Promise((resolve) => httpServer.close(resolve))
+  await new Promise<void>((resolve) => wsServer.close(() => resolve()))
+  await new Promise<void>((resolve) => httpServer.close(() => resolve()))
   await pool.end()
   process.exit(0)
 }
