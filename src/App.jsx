@@ -85,6 +85,13 @@ function formatFriendlyDateTime(input) {
   }).format(date)
 }
 
+function getGroupStatus(endpoints) {
+  if (!endpoints.length) return 'pending'
+  if (endpoints.some((endpoint) => endpoint.status === 'down')) return 'down'
+  if (endpoints.every((endpoint) => endpoint.status === 'up')) return 'up'
+  return 'pending'
+}
+
 function LatencySparkline({ runs }) {
   const containerRef = useRef(null)
   const [hoveredPoint, setHoveredPoint] = useState(null)
@@ -215,6 +222,7 @@ function StatusPage({ groups, endpoints, runsByEndpoint, health, isLoading }) {
     return groups.map((group) => ({
       ...group,
       endpoints: endpoints.filter((endpoint) => endpoint.group_id === group.id),
+      group_status: getGroupStatus(endpoints.filter((endpoint) => endpoint.group_id === group.id)),
     }))
   }, [groups, endpoints])
 
@@ -226,6 +234,12 @@ function StatusPage({ groups, endpoints, runsByEndpoint, health, isLoading }) {
     if (endpoint.status === 'up') return 'bg-emerald-500'
     if (endpoint.status === 'down') return 'bg-rose-500'
     return 'bg-amber-500'
+  }
+
+  const renderGroupStatus = (status) => {
+    if (status === 'up') return 'bg-emerald-100 text-emerald-700 border-emerald-200/80'
+    if (status === 'down') return 'bg-rose-100 text-rose-700 border-rose-200/80'
+    return 'bg-amber-100 text-amber-700 border-amber-200/80'
   }
 
   return (
@@ -271,9 +285,14 @@ function StatusPage({ groups, endpoints, runsByEndpoint, health, isLoading }) {
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <h2 className="text-xl font-semibold">{group.name}</h2>
-                    <p className="text-sm text-slate-500">{group.description || 'No description'}</p>
+                    <p className="text-sm text-slate-500">{group.description || ''}</p>
                   </div>
-                  <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">{group.endpoints.length} services</span>
+                  <div className="flex items-center gap-2">
+                    <span className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase ${renderGroupStatus(group.group_status)}`}>
+                      {group.group_status}
+                    </span>
+                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">{group.endpoints.length} services</span>
+                  </div>
                 </div>
 
                 <div className="mt-4 grid gap-4 lg:grid-cols-2">
@@ -382,6 +401,7 @@ function AdminPage({
   handleDeleteEndpoint,
   handleCheckNow,
   handleTogglePause,
+  handleToggleGroupPause,
   handleStartEdit,
   currentTimeMs,
   error,
@@ -401,6 +421,12 @@ function AdminPage({
     if (endpoint.status === 'up') return 'bg-emerald-500'
     if (endpoint.status === 'down') return 'bg-rose-500'
     return 'bg-amber-500'
+  }
+
+  const renderGroupStatus = (status) => {
+    if (status === 'up') return 'bg-emerald-100 text-emerald-700 border-emerald-200/80'
+    if (status === 'down') return 'bg-rose-100 text-rose-700 border-rose-200/80'
+    return 'bg-amber-100 text-amber-700 border-amber-200/80'
   }
 
   return (
@@ -437,12 +463,31 @@ function AdminPage({
                 {!groupedEndpoints.length && <p className="text-sm text-slate-500">No groups configured yet.</p>}
                 {groupedEndpoints.map((group) => (
                   <div key={group.id} className="rounded-lg border border-white/60 bg-white/40 p-4 backdrop-blur">
+                    {(() => {
+                      const hasMonitors = group.endpoints.length > 0
+                      const allPaused = hasMonitors && group.endpoints.every((endpoint) => endpoint.is_paused)
+                      return (
                     <div className="flex items-center justify-between gap-4">
                       <div>
                         <h3 className="text-base font-semibold">{group.name}</h3>
-                        <p className="text-xs text-slate-500">{group.description || 'No description'}</p>
+                        <p className="text-xs text-slate-500">{group.description || ''}</p>
                       </div>
                       <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleGroupPause(group)}
+                          disabled={!hasMonitors}
+                          className={`cursor-pointer rounded border px-3 py-1.5 text-xs text-white transition duration-150 ease-out active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 ${
+                            allPaused
+                              ? 'border-emerald-300/70 bg-gradient-to-r from-emerald-600 to-teal-600 shadow-[0_6px_16px_rgba(5,150,105,0.26)] hover:from-emerald-500 hover:to-teal-500 focus-visible:ring-emerald-300/80'
+                              : 'border-slate-300/70 bg-gradient-to-r from-slate-600 to-slate-700 shadow-[0_6px_16px_rgba(51,65,85,0.25)] hover:from-slate-500 hover:to-slate-600 focus-visible:ring-slate-300/80'
+                          } disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100`}
+                        >
+                          {allPaused ? 'Resume Group' : 'Pause Group'}
+                        </button>
+                        <span className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase ${renderGroupStatus(group.group_status)}`}>
+                          {group.group_status}
+                        </span>
                         <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">{group.endpoints.length} monitors</span>
                         <button
                           type="button"
@@ -463,6 +508,8 @@ function AdminPage({
                         </button>
                       </div>
                     </div>
+                      )
+                    })()}
 
                     {!collapsedGroups[group.id] && (
                       <div className="mt-4 space-y-3">
@@ -805,6 +852,7 @@ function App() {
     return groups.map((group) => ({
       ...group,
       endpoints: endpoints.filter((endpoint) => endpoint.group_id === group.id),
+      group_status: getGroupStatus(endpoints.filter((endpoint) => endpoint.group_id === group.id)),
     }))
   }, [groups, endpoints])
 
@@ -1147,6 +1195,28 @@ function App() {
     }
   }
 
+  const handleToggleGroupPause = async (group) => {
+    setError('')
+    try {
+      const hasMonitors = group.endpoints.length > 0
+      if (!hasMonitors) return
+
+      const allPaused = group.endpoints.every((endpoint) => endpoint.is_paused)
+      const response = allPaused
+        ? await monitoringService.resumeGroup(group.id)
+        : await monitoringService.pauseGroup(group.id)
+
+      const updatedById = new Map((response.updatedEndpoints ?? []).map((endpoint) => [endpoint.id, endpoint]))
+      if (!updatedById.size) return
+
+      setEndpoints((current) =>
+        current.map((endpoint) => updatedById.get(endpoint.id) ?? endpoint),
+      )
+    } catch (requestError) {
+      setError(requestError.message)
+    }
+  }
+
   if (isHomePage) {
     return <LandingPage />
   }
@@ -1179,6 +1249,7 @@ function App() {
       handleDeleteEndpoint={handleDeleteEndpoint}
       handleCheckNow={handleCheckNow}
       handleTogglePause={handleTogglePause}
+      handleToggleGroupPause={handleToggleGroupPause}
       handleStartEdit={handleStartEdit}
       currentTimeMs={currentTimeMs}
       error={error}

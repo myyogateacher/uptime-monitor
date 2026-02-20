@@ -4,6 +4,7 @@ import { createClient } from 'redis'
 import { config } from './config.js'
 import { pool } from './db.js'
 import { MONITOR_CHECKED_EVENT, monitorEvents } from './events.js'
+import { notifyStatusChange } from './notifier.js'
 
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 
@@ -124,7 +125,15 @@ const computeStatus = (endpoint, checkPassed) => {
 
 const getEndpointById = async (endpointId) => {
   const [rows] = await pool.query(
-    'SELECT * FROM monitor_endpoints WHERE id = ? LIMIT 1',
+    `
+      SELECT
+        e.*,
+        g.name AS group_name
+      FROM monitor_endpoints e
+      INNER JOIN monitor_groups g ON g.id = e.group_id
+      WHERE e.id = ?
+      LIMIT 1
+    `,
     [endpointId],
   )
 
@@ -331,6 +340,7 @@ export async function runCheck(endpoint) {
   }
 
   const startedAt = Date.now()
+  const previousStatus = endpoint.status ?? 'pending'
 
   let result
   if (endpoint.monitor_type === 'mysql') {
@@ -404,6 +414,24 @@ export async function runCheck(endpoint) {
 
   monitorEvents.emit(MONITOR_CHECKED_EVENT, payload)
 
+  if (previousStatus !== next.status && (next.status === 'up' || next.status === 'down')) {
+    await notifyStatusChange({
+      endpointId: endpoint.id,
+      endpointName: endpoint.name,
+      groupId: endpoint.group_id,
+      groupName: endpoint.group_name ?? null,
+      monitorType: endpoint.monitor_type,
+      url: endpoint.url,
+      previousStatus,
+      currentStatus: next.status,
+      responseCode: result.responseCode,
+      responseTimeMs,
+      checkedAt: payload.lastCheckedAt,
+      errorMessage: result.errorMessage ?? null,
+      matchedValue: result.matchedValue ?? null,
+    })
+  }
+
   return payload
 }
 
@@ -413,7 +441,16 @@ async function tick() {
 
   try {
     const [endpoints] = await pool.query(
-      'SELECT * FROM monitor_endpoints WHERE is_paused = 0 AND next_check_at <= NOW() ORDER BY next_check_at ASC LIMIT 50',
+      `
+        SELECT
+          e.*,
+          g.name AS group_name
+        FROM monitor_endpoints e
+        INNER JOIN monitor_groups g ON g.id = e.group_id
+        WHERE e.is_paused = 0 AND e.next_check_at <= NOW()
+        ORDER BY e.next_check_at ASC
+        LIMIT 50
+      `,
     )
 
     await Promise.all(endpoints.map((endpoint) => runCheck(endpoint)))

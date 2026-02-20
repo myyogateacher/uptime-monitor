@@ -33,6 +33,8 @@ The backend serves the built frontend (`dist/`) so both control plane and status
   - Retries before marking up
 - Pause/resume monitors
 - Manual "Check now"
+- Rich Slack notifications for up/down transitions
+- Pluggable webhook notifications for any custom endpoint
 - Group monitors by logical groups
 - Edit monitor configuration
 - Delete monitor historical runs per monitor
@@ -65,6 +67,23 @@ Use `.env` (see `.env.example`):
 - `REQUEST_TIMEOUT_MS`
 - `CORS_ORIGINS`
 - `VITE_API_BASE_URL`
+- `NOTIFICATIONS_ENABLED`
+- `SLACK_BOT_TOKEN`
+- `SLACK_CHANNEL_ID`
+- `NOTIFICATION_TARGETS_JSON`
+
+Notification config examples:
+
+```env
+NOTIFICATIONS_ENABLED=true
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_CHANNEL_ID=C0123456789
+NOTIFICATION_TARGETS_JSON=[]
+```
+
+```env
+NOTIFICATION_TARGETS_JSON=[{"name":"ops-slack","type":"slack","token":"xoxb-your-bot-token","channel":"C0123456789","events":["down","up"]},{"name":"incident-webhook","type":"webhook","url":"https://example.com/hooks/uptime","events":["down"],"headers":{"Authorization":"Bearer token"}}]
+```
 
 ## Getting Started (Local Development)
 
@@ -112,7 +131,6 @@ docker compose up -d --build
 Services:
 - App: `http://localhost:8000`
 - MySQL: `localhost:3306`
-- Redis: `localhost:6379`
 
 Stop:
 

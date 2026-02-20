@@ -281,6 +281,23 @@ const getMappedEndpointById = async (endpointId) => {
   return mapEndpointRow(rows[0])
 }
 
+const getMappedEndpointsByGroupId = async (groupId) => {
+  const [rows] = await pool.query(
+    `
+      SELECT
+        e.*,
+        g.name AS group_name
+      FROM monitor_endpoints e
+      INNER JOIN monitor_groups g ON g.id = e.group_id
+      WHERE e.group_id = ?
+      ORDER BY e.name ASC
+    `,
+    [groupId],
+  )
+
+  return rows.map(mapEndpointRow)
+}
+
 app.get('/api/health', async (_req, res) => {
   const [rows] = await pool.query('SELECT COUNT(*) AS endpoint_count FROM monitor_endpoints')
 
@@ -369,6 +386,76 @@ app.delete('/api/groups/:id', async (req, res) => {
 
   monitorEvents.emit(GROUP_DELETED_EVENT, { id })
   return res.status(204).send()
+})
+
+app.post('/api/groups/:id/pause', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid group id' })
+  }
+
+  const [groupRows] = await pool.query('SELECT id FROM monitor_groups WHERE id = ? LIMIT 1', [id])
+  if (!groupRows.length) {
+    return res.status(404).json({ error: 'Group not found' })
+  }
+
+  await pool.query(
+    `
+      UPDATE monitor_endpoints
+      SET
+        is_paused = 1,
+        next_check_at = DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)
+      WHERE group_id = ?
+    `,
+    [id],
+  )
+
+  const updatedEndpoints = await getMappedEndpointsByGroupId(id)
+  for (const endpoint of updatedEndpoints) {
+    monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint)
+  }
+
+  return res.json({
+    groupId: id,
+    action: 'paused',
+    updatedEndpoints,
+  })
+})
+
+app.post('/api/groups/:id/resume', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid group id' })
+  }
+
+  const [groupRows] = await pool.query('SELECT id FROM monitor_groups WHERE id = ? LIMIT 1', [id])
+  if (!groupRows.length) {
+    return res.status(404).json({ error: 'Group not found' })
+  }
+
+  await pool.query(
+    `
+      UPDATE monitor_endpoints
+      SET
+        is_paused = 0,
+        next_check_at = NOW()
+      WHERE group_id = ?
+    `,
+    [id],
+  )
+
+  const updatedEndpoints = await getMappedEndpointsByGroupId(id)
+  for (const endpoint of updatedEndpoints) {
+    monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint)
+  }
+
+  return res.json({
+    groupId: id,
+    action: 'resumed',
+    updatedEndpoints,
+  })
 })
 
 app.get('/api/endpoints', async (req, res) => {

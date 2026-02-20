@@ -34,6 +34,16 @@ export const monitoringService = {
       body: JSON.stringify(input),
     })
   },
+  pauseGroup(groupId) {
+    return request(`/api/groups/${groupId}/pause`, {
+      method: 'POST',
+    })
+  },
+  resumeGroup(groupId) {
+    return request(`/api/groups/${groupId}/resume`, {
+      method: 'POST',
+    })
+  },
   getEndpoints() {
     return request('/api/endpoints')
   },
