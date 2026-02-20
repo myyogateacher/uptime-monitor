@@ -180,22 +180,3 @@ export async function notifyStatusChange(event) {
         }),
     );
 }
-
-setTimeout(() => {
-    console.log("[notify] notifier initialized");
-    notifyStatusChange({
-        endpointId: 12,
-        endpointName: "Payments API",
-        groupId: 3,
-        groupName: "Payments",
-        monitorType: "http",
-        url: "https://api.example.com/payments/health",
-        previousStatus: "up",
-        currentStatus: "down",
-        responseCode: 503,
-        responseTimeMs: 1842,
-        checkedAt: "2026-02-20T15:30:00.000Z",
-        errorMessage: "Expected HTTP 200, got 503",
-        matchedValue: null,
-    });
-}, 2000);
