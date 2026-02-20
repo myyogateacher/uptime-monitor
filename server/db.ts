@@ -1,7 +1,7 @@
 import mysql from 'mysql2/promise'
 import { config } from './config'
 
-export const pool: any = mysql.createPool({
+export const pool: mysql.Pool = mysql.createPool({
   ...config.mysql,
   waitForConnections: true,
 })
@@ -98,7 +98,7 @@ async function ensureSchemaMigrationsTable() {
 
 async function getAppliedVersions() {
   const [rows] = await pool.query('SELECT version FROM schema_migrations')
-  return new Set(rows.map((row) => Number(row.version)))
+  return new Set((rows as { version: number }[]).map((row) => Number(row.version)))
 }
 
 export async function initDatabase() {
