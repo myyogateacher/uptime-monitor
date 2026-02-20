@@ -45,7 +45,7 @@ The backend serves the built frontend (`dist/`) so both control plane and status
 - Pause/resume entire groups
 - Manual "Check now"
 - Google-only login for control plane
-- In-memory backend sessions
+- MySQL-backed backend sessions
 - Rich Slack notifications for up/down transitions
 - Pluggable webhook notifications for any custom endpoint
 - Group monitors by logical groups
@@ -100,6 +100,10 @@ Editor access control:
 - Set `CONTROL_PLANE_EDITOR_EMAILS` as a comma-separated list of Google account emails that can mutate monitors/groups.
 - Example: `CONTROL_PLANE_EDITOR_EMAILS=ops@company.com,sre@company.com`
 - If empty, any authenticated user can edit (default behavior).
+
+Session storage:
+- Sessions are persisted in MySQL (table managed by `express-mysql-session`).
+- Default login validity is 1 day (`SESSION_MAX_AGE_MS=86400000`).
 
 Notification config examples:
 

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import cors, { type CorsOptions } from 'cors'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import session from 'express-session'
+import createMySqlSession from 'express-mysql-session'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import { config } from './config'
@@ -30,6 +31,18 @@ const app = express()
 const httpServer = createServer(app)
 const wsServer = new WebSocketServer({ server: httpServer, path: '/ws' })
 const wsClients: Set<WebSocket> = new Set()
+const MySQLSessionStore = createMySqlSession(session)
+const sessionStore = new MySQLSessionStore({
+  host: config.mysql.host,
+  port: config.mysql.port,
+  user: config.mysql.user,
+  password: config.mysql.password,
+  database: config.mysql.database,
+  clearExpired: true,
+  checkExpirationInterval: 15 * 60 * 1000,
+  expiration: config.auth.sessionMaxAgeMs,
+  createDatabaseTable: true,
+})
 
 const safeSend = (ws: WebSocket, message: WsFrame): void => {
   if (ws.readyState !== 1) return
@@ -102,6 +115,7 @@ app.use(
   session({
     name: 'uptime.sid',
     secret: config.auth.sessionSecret,
+    store: sessionStore,
     proxy: config.auth.trustProxy,
     resave: false,
     saveUninitialized: false,
@@ -1008,6 +1022,7 @@ const shutdown = async () => {
   stopMonitor()
   await new Promise<void>((resolve) => wsServer.close(() => resolve()))
   await new Promise<void>((resolve) => httpServer.close(() => resolve()))
+  await new Promise<void>((resolve) => sessionStore.close().then(() => resolve()).catch(() => resolve()))
   await pool.end()
   process.exit(0)
 }

@@ -124,7 +124,7 @@ export const config = {
   },
   auth: {
     sessionSecret: process.env.SESSION_SECRET ?? 'change-me',
-    sessionMaxAgeMs: toNumber(process.env.SESSION_MAX_AGE_MS, 1000 * 60 * 60 * 24 * 7),
+    sessionMaxAgeMs: toNumber(process.env.SESSION_MAX_AGE_MS, 1000 * 60 * 60 * 24),
     google: {
       clientId: process.env.GOOGLE_CLIENT_ID ?? '',
       clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
