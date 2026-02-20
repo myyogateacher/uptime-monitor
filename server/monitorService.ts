@@ -8,12 +8,76 @@ import { notifyStatusChange } from './notifier'
 
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 
-let timer = null
+type MonitorStatus = 'pending' | 'up' | 'down'
+type MonitorType = 'http' | 'mysql' | 'redis'
+
+type JsonObject = Record<string, unknown>
+
+interface MonitorEndpoint {
+  id: number
+  group_id: number
+  group_name?: string | null
+  name: string
+  monitor_type: MonitorType
+  url: string
+  method: string
+  headers_json: unknown
+  body_text: string | null
+  expected_status: number
+  expected_json_path: string | null
+  expected_json_value: string | null
+  connection_json: unknown
+  probe_command: string | null
+  expected_probe_value: string | null
+  interval_seconds: number
+  down_retries: number
+  up_retries: number
+  status: MonitorStatus
+  consecutive_failures: number
+  consecutive_successes: number
+  is_paused: number | boolean
+}
+
+interface CheckResult {
+  checkPassed: boolean
+  responseCode: number | null
+  matchedValue: string | null
+  errorMessage: string | null
+}
+
+interface ProbeValidationResult {
+  ok: boolean
+  matchedValue: string | null
+  errorMessage: string | null
+}
+
+interface StatusComputation {
+  status: MonitorStatus
+  failures: number
+  successes: number
+}
+
+interface MonitorCheckedPayload {
+  endpointId: number
+  groupId: number
+  monitorType: MonitorType
+  status: MonitorStatus
+  responseCode: number | null
+  lastCheckedAt: string
+  lastError: string | null
+  lastMatchValue: string | null
+  consecutiveFailures: number
+  consecutiveSuccesses: number
+  responseTimeMs: number
+  errorMessage: string | null
+}
+
+let timer: ReturnType<typeof setInterval> | null = null
 let isTickRunning = false
 
-const withTimeout = async (promise, timeoutMs, label) => {
-  let timeoutId
-  const timeoutPromise = new Promise((_, reject) => {
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<T>((_, reject) => {
     timeoutId = setTimeout(() => {
       reject(new Error(`${label} timed out after ${timeoutMs}ms`))
     }, timeoutMs)
@@ -26,46 +90,57 @@ const withTimeout = async (promise, timeoutMs, label) => {
   }
 }
 
-const parseJson = (value) => {
+const parseJson = (value: unknown): unknown => {
   if (value == null || value === '') return null
   try {
-    return JSON.parse(value)
+    return JSON.parse(String(value))
   } catch {
     return null
   }
 }
 
-const parseHeaders = (headersJson) => {
+const parseHeaders = (headersJson: unknown): Record<string, string> => {
   if (!headersJson) return {}
-  if (typeof headersJson === 'object') return headersJson
+  if (typeof headersJson === 'object' && !Array.isArray(headersJson)) {
+    return Object.fromEntries(
+      Object.entries(headersJson as JsonObject).map(([key, value]) => [key, String(value)]),
+    )
+  }
 
   const parsed = parseJson(headersJson)
-  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return Object.fromEntries(
+      Object.entries(parsed as JsonObject).map(([key, value]) => [key, String(value)]),
+    )
+  }
+  return {}
 }
 
-const parseConnection = (connectionJson) => {
+const parseConnection = (connectionJson: unknown): JsonObject => {
   if (!connectionJson) return {}
-  if (typeof connectionJson === 'object') return connectionJson
+  if (typeof connectionJson === 'object' && !Array.isArray(connectionJson)) {
+    return connectionJson as JsonObject
+  }
 
   const parsed = parseJson(connectionJson)
-  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as JsonObject) : {}
 }
 
-const normalizeComparable = (value) => {
+const normalizeComparable = (value: unknown): string | null => {
   if (value === undefined) return '__UNDEFINED__'
   if (value === null) return null
   if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }
 
-const deepEqual = (left, right) => {
+const deepEqual = (left: unknown, right: unknown): boolean => {
   if (typeof left === 'object' && left !== null && typeof right === 'object' && right !== null) {
     return JSON.stringify(left) === JSON.stringify(right)
   }
   return left === right
 }
 
-const parseExpectedValue = (rawValue) => {
+const parseExpectedValue = (rawValue: unknown): unknown => {
   if (rawValue == null) return null
   const trimmed = String(rawValue).trim()
 
@@ -77,22 +152,23 @@ const parseExpectedValue = (rawValue) => {
   }
 }
 
-const resolveJsonPath = (data, path) => {
+const resolveJsonPath = (data: unknown, path: string | null | undefined): unknown => {
   if (!path) return undefined
-  const tokens = []
+  const tokens: Array<string | number> = []
   const matcher = /([^.[\]]+)|\[(\d+)\]/g
 
   for (const match of path.matchAll(matcher)) {
     tokens.push(match[1] ?? Number(match[2]))
   }
 
-  return tokens.reduce((acc, token) => {
+  return tokens.reduce<unknown>((acc, token) => {
     if (acc == null) return undefined
-    return acc[token]
+    if (typeof acc !== 'object') return undefined
+    return (acc as Record<string | number, unknown>)[token]
   }, data)
 }
 
-const computeStatus = (endpoint, checkPassed) => {
+const computeStatus = (endpoint: MonitorEndpoint, checkPassed: boolean): StatusComputation => {
   const downRetries = Math.max(1, Number(endpoint.down_retries) || 1)
   const upRetries = Math.max(1, Number(endpoint.up_retries) || 1)
 
@@ -123,7 +199,7 @@ const computeStatus = (endpoint, checkPassed) => {
   return { status, failures, successes }
 }
 
-const getEndpointById = async (endpointId) => {
+const getEndpointById = async (endpointId: number): Promise<MonitorEndpoint | null> => {
   const [rows] = await pool.query(
     `
       SELECT
@@ -137,10 +213,13 @@ const getEndpointById = async (endpointId) => {
     [endpointId],
   )
 
-  return rows[0] ?? null
+  return ((rows as MonitorEndpoint[])[0] ?? null)
 }
 
-const validateExpectedProbeValue = (actual, expectedRaw) => {
+const validateExpectedProbeValue = (
+  actual: unknown,
+  expectedRaw: unknown,
+): ProbeValidationResult => {
   if (expectedRaw == null || String(expectedRaw).trim() === '') {
     return { ok: true, matchedValue: normalizeComparable(actual), errorMessage: null }
   }
@@ -155,7 +234,7 @@ const validateExpectedProbeValue = (actual, expectedRaw) => {
   }
 }
 
-async function runHttpCheck(endpoint) {
+async function runHttpCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
   const method = ALLOWED_METHODS.has(endpoint.method) ? endpoint.method : 'GET'
   const headers = parseHeaders(endpoint.headers_json)
   const body = endpoint.body_text || null
@@ -217,20 +296,20 @@ async function runHttpCheck(endpoint) {
   return { checkPassed, responseCode, matchedValue, errorMessage }
 }
 
-async function runMysqlCheck(endpoint) {
+async function runMysqlCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
   const connection = parseConnection(endpoint.connection_json)
-  let conn
+  let conn: mysql.Connection | null = null
 
   try {
-    if (connection.url) {
+    if (typeof connection.url === 'string' && connection.url.trim()) {
       conn = await mysql.createConnection(connection.url)
     } else {
       conn = await mysql.createConnection({
-        host: connection.host ?? '127.0.0.1',
+        host: String(connection.host ?? '127.0.0.1'),
         port: Number(connection.port ?? 3306),
-        user: connection.user,
-        password: connection.password,
-        database: connection.database,
+        user: connection.user == null ? undefined : String(connection.user),
+        password: connection.password == null ? undefined : String(connection.password),
+        database: connection.database == null ? undefined : String(connection.database),
         connectTimeout: config.requestTimeoutMs,
       })
     }
@@ -238,10 +317,11 @@ async function runMysqlCheck(endpoint) {
     const query = endpoint.probe_command?.trim() || 'SELECT 1 AS health'
     const [rows] = await conn.query(query)
 
-    let actualValue = null
+    let actualValue: unknown = null
     if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object' && rows[0] !== null) {
-      const firstKey = Object.keys(rows[0])[0]
-      actualValue = firstKey ? rows[0][firstKey] : null
+      const firstRow = rows[0] as Record<string, unknown>
+      const firstKey = Object.keys(firstRow)[0]
+      actualValue = firstKey ? firstRow[firstKey] : null
     }
 
     const expectedResult = validateExpectedProbeValue(actualValue, endpoint.expected_probe_value)
@@ -265,7 +345,7 @@ async function runMysqlCheck(endpoint) {
   }
 }
 
-const parseRedisCommand = (probeCommand) => {
+const parseRedisCommand = (probeCommand: string | null | undefined): string[] => {
   if (!probeCommand || !probeCommand.trim()) return ['PING']
 
   const parsed = parseJson(probeCommand)
@@ -279,20 +359,20 @@ const parseRedisCommand = (probeCommand) => {
     .filter(Boolean)
 }
 
-async function runRedisCheck(endpoint) {
+async function runRedisCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
   const connection = parseConnection(endpoint.connection_json)
   const client = createClient({
-    ...(connection.url
+    ...(typeof connection.url === 'string' && connection.url.trim()
       ? { url: connection.url }
       : {
           socket: {
-            host: connection.host ?? '127.0.0.1',
+            host: String(connection.host ?? '127.0.0.1'),
             port: Number(connection.port ?? 6379),
             connectTimeout: config.requestTimeoutMs,
             reconnectStrategy: false,
           },
-          username: connection.username,
-          password: connection.password,
+          username: connection.username == null ? undefined : String(connection.username),
+          password: connection.password == null ? undefined : String(connection.password),
           database:
             connection.database == null ? undefined : Number(connection.database),
         }),
@@ -306,7 +386,7 @@ async function runRedisCheck(endpoint) {
       client.sendCommand(command),
       config.requestTimeoutMs,
       'Redis command',
-    )
+    ) as unknown
 
     const commandName = String(command[0] ?? '').toUpperCase()
     const expectedRaw = endpoint.expected_probe_value ?? (commandName === 'PING' ? '"PONG"' : null)
@@ -334,7 +414,7 @@ async function runRedisCheck(endpoint) {
   }
 }
 
-export async function runCheck(endpoint) {
+export async function runCheck(endpoint: MonitorEndpoint): Promise<MonitorCheckedPayload | null> {
   if (Number(endpoint.is_paused) === 1) {
     return null
   }
@@ -342,12 +422,11 @@ export async function runCheck(endpoint) {
   const startedAt = Date.now()
   const previousStatus = endpoint.status ?? 'pending'
 
-  let result
+  let result: CheckResult
   if (endpoint.monitor_type === 'mysql') {
     result = await runMysqlCheck(endpoint)
   } else if (endpoint.monitor_type === 'redis') {
     result = await runRedisCheck(endpoint)
-    console.log('Redis check completed with result:', result)
   } else {
     result = await runHttpCheck(endpoint)
   }
@@ -453,7 +532,7 @@ async function tick() {
       `,
     )
 
-    await Promise.all(endpoints.map((endpoint) => runCheck(endpoint)))
+    await Promise.all((endpoints as MonitorEndpoint[]).map((endpoint: MonitorEndpoint) => runCheck(endpoint)))
   } finally {
     isTickRunning = false
   }
@@ -475,7 +554,7 @@ export function stopMonitor() {
   timer = null
 }
 
-export async function triggerCheckNow(endpointId) {
+export async function triggerCheckNow(endpointId: number): Promise<MonitorCheckedPayload | null> {
   const endpoint = await getEndpointById(endpointId)
   if (!endpoint) return null
 
