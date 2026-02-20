@@ -8,22 +8,21 @@ services:
     ports:
       - "28000:28000"
     environment:
-      NODE_ENV=production
-      TZ=UTC
-      PORT=28000
-      MYSQL_HOST=127.0.0.1
-      MYSQL_PORT=3306
-      MYSQL_USER=uptime
-      MYSQL_PASSWORD=uptime
-      MYSQL_DATABASE=uptime
-      MYSQL_CONNECTION_LIMIT=5
-      MONITOR_POLL_MS=1000
-      REQUEST_TIMEOUT_MS=10000
-      CORS_ORIGINS=https://uptime.azure-services.myyogateacher.com
-      NOTIFICATIONS_ENABLED=true
-      SLACK_BOT_TOKEN=
-      SLACK_CHANNEL_ID=
-      NOTIFICATION_TARGETS_JSON=[]
+      NODE_ENV: production
+      TZ: UTC
+      PORT: 28000
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_USER: uptime
+      MYSQL_PASSWORD: uptime
+      MYSQL_DATABASE: uptime
+      MYSQL_CONNECTION_LIMIT: 5
+      MONITOR_POLL_MS: 1000
+      REQUEST_TIMEOUT_MS: 10000
+      CORS_ORIGINS: https://uptime.azure-services.myyogateacher.com
+      NOTIFICATIONS_ENABLED: 'true'
+      SLACK_BOT_TOKEN: ''
+      SLACK_CHANNEL_ID: ''
 
   mysql:
     image: mysql:8.4
