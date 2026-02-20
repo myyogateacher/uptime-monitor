@@ -102,6 +102,7 @@ app.use(
   session({
     name: 'uptime.sid',
     secret: config.auth.sessionSecret,
+    proxy: config.auth.trustProxy,
     resave: false,
     saveUninitialized: false,
     cookie: {

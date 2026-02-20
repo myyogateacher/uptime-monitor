@@ -1,6 +1,6 @@
 # Uptime Monitor
 
-Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, and Redis.
+Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, Redis, NATS JetStream, and TCP ports.
 
 ![Uptime Control Panel](images/screenshot_control_panel.png)
 ![Uptime Control Panel](images/screenshot_status_page.png)
@@ -42,6 +42,7 @@ The backend serves the built frontend (`dist/`) so both control plane and status
   - Retries before marking down
   - Retries before marking up
 - Pause/resume monitors
+- Pause/resume entire groups
 - Manual "Check now"
 - Google-only login for control plane
 - In-memory backend sessions
@@ -54,7 +55,7 @@ The backend serves the built frontend (`dist/`) so both control plane and status
 - Status page with grouped services and latency graph (with hover tooltip)
 - Glass-style SaaS UI
 - DB schema versioning via `schema_migrations`
-- Docker deployment with app + MySQL + Redis
+- Docker deployment with app + MySQL
 
 ## Pages
 
@@ -121,7 +122,7 @@ bun install
 cp .env.example .env
 ```
 
-3. Update `.env` for your local MySQL/Redis.
+3. Update `.env` for your local infrastructure (MySQL required, Redis/NATS optional based on monitor types).
 
 4. Run frontend + backend:
 
@@ -185,7 +186,7 @@ docker compose down -v
 
 ## Database Migrations
 
-`server/db.js` uses versioned migrations.
+`server/db.ts` uses versioned migrations.
 
 - Applied versions are stored in `schema_migrations`.
 - Only pending migrations run at startup.

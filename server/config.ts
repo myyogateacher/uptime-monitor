@@ -93,8 +93,10 @@ const parseNotificationTargets = () => {
   ]
 }
 
+const nodeEnv = process.env.NODE_ENV ?? 'development'
+
 export const config = {
-  nodeEnv: process.env.NODE_ENV ?? 'development',
+  nodeEnv,
   port: toNumber(process.env.PORT, 3001),
   monitorPollMs: toNumber(process.env.MONITOR_POLL_MS, 1000),
   requestTimeoutMs: toNumber(process.env.REQUEST_TIMEOUT_MS, 10000),
@@ -125,6 +127,6 @@ export const config = {
     },
     controlPlanePath: process.env.CONTROL_PLANE_PATH ?? '/monitors',
     loginPath: process.env.LOGIN_PATH ?? '/login',
-    trustProxy: toBoolean(process.env.TRUST_PROXY, false),
+    trustProxy: toBoolean(process.env.TRUST_PROXY, nodeEnv === 'production'),
   },
 }

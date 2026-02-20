@@ -343,10 +343,12 @@ function LandingPage() {
       <div className="mx-auto max-w-6xl space-y-8">
         <section className="glass-card rounded-2xl p-8 md:p-10">
           <p className="text-xs uppercase tracking-[0.25em] text-cyan-700">Uptime Monitor</p>
-          <h1 className="mt-3 text-4xl font-semibold tracking-tight md:text-5xl">Monitor APIs, MySQL, and Redis in one place</h1>
+          <h1 className="mt-3 text-4xl font-semibold tracking-tight md:text-5xl">
+            Monitor APIs, data stores, messaging, and ports in one place
+          </h1>
           <p className="mt-4 max-w-3xl text-base text-slate-600">
-            This service continuously checks your HTTP endpoints, MySQL databases, and Redis instances with
-            retry-aware status transitions, history, and latency visibility.
+            Track HTTP APIs, MySQL, Redis, NATS JetStream, and TCP services with retry-aware health transitions,
+            real-time updates, and latency history. Control plane access is protected with Google login.
           </p>
 
           <div className="mt-7 flex flex-wrap gap-3">
@@ -369,19 +371,22 @@ function LandingPage() {
           <article className="glass-card rounded-xl p-5">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Control Plane</h2>
             <p className="mt-2 text-sm text-slate-600">
-              Configure monitors, group services, edit checks, and control historical data retention.
+              Configure monitors, group services, pause/resume endpoints or entire groups, edit checks, and manage
+              historical run data.
             </p>
           </article>
           <article className="glass-card rounded-xl p-5">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Status Page</h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Public Status</h2>
             <p className="mt-2 text-sm text-slate-600">
-              Share real-time service health with grouped monitor statuses and latency trend graphs.
+              Share a public status page with grouped health, realtime state updates, and latency trend graphs with
+              hover tooltips.
             </p>
           </article>
           <article className="glass-card rounded-xl p-5">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Alert Readiness</h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Secure Alerts</h2>
             <p className="mt-2 text-sm text-slate-600">
-              Built-in retry logic helps reduce noise while still surfacing meaningful service degradation.
+              Google-authenticated control plane, in-memory sessions, and rich Slack/webhook notifications for up/down
+              events.
             </p>
           </article>
         </section>
@@ -446,7 +451,7 @@ function AdminPage({
 }) {
   const isHttpType = endpointForm.monitor_type === 'http'
   const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false)
-  const [collapsedGroups, setCollapsedGroups] = useState({})
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<number, boolean>>({})
 
   const filteredGroupOptions = useMemo(() => {
     const query = endpointForm.group_name.trim().toLowerCase()
@@ -532,13 +537,13 @@ function AdminPage({
                           onClick={() =>
                             setCollapsedGroups((current) => ({
                               ...current,
-                              [group.id]: !(current[group.id] ?? false),
+                              [group.id]: !(current[group.id] ?? true),
                             }))
                           }
-                          aria-label={collapsedGroups[group.id] ? 'Expand group' : 'Collapse group'}
+                          aria-label={(collapsedGroups[group.id] ?? true) ? 'Expand group' : 'Collapse group'}
                           className="cursor-pointer rounded border border-slate-300/70 bg-white/70 p-2 text-slate-700 transition hover:bg-white"
                         >
-                          {collapsedGroups[group.id] ? (
+                          {(collapsedGroups[group.id] ?? true) ? (
                             <FaChevronRight className="h-3 w-3" />
                           ) : (
                             <FaChevronDown className="h-3 w-3" />
@@ -549,7 +554,7 @@ function AdminPage({
                       )
                     })()}
 
-                    {!collapsedGroups[group.id] && (
+                    {!(collapsedGroups[group.id] ?? true) && (
                       <div className="mt-4 space-y-3">
                         {!group.endpoints.length && <p className="text-sm text-slate-500">No monitors in this group.</p>}
                         {group.endpoints.map((endpoint) => (
