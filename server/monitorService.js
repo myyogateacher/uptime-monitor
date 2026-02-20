@@ -10,6 +10,21 @@ const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'
 let timer = null
 let isTickRunning = false
 
+const withTimeout = async (promise, timeoutMs, label) => {
+  let timeoutId
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+  })
+
+  try {
+    return await Promise.race([promise, timeoutPromise])
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
 const parseJson = (value) => {
   if (value == null || value === '') return null
   try {
@@ -265,6 +280,7 @@ async function runRedisCheck(endpoint) {
             host: connection.host ?? '127.0.0.1',
             port: Number(connection.port ?? 6379),
             connectTimeout: config.requestTimeoutMs,
+            reconnectStrategy: false,
           },
           username: connection.username,
           password: connection.password,
@@ -274,15 +290,19 @@ async function runRedisCheck(endpoint) {
   })
 
   try {
-    await client.connect()
+    await withTimeout(client.connect(), config.requestTimeoutMs, 'Redis connect')
 
     const command = parseRedisCommand(endpoint.probe_command)
-    const rawResult = await client.sendCommand(command)
+    const rawResult = await withTimeout(
+      client.sendCommand(command),
+      config.requestTimeoutMs,
+      'Redis command',
+    )
 
-    const expectedRaw = endpoint.expected_probe_value ?? (command[0] === 'PING' ? '"PONG"' : null)
+    const commandName = String(command[0] ?? '').toUpperCase()
+    const expectedRaw = endpoint.expected_probe_value ?? (commandName === 'PING' ? '"PONG"' : null)
     const expectedResult = validateExpectedProbeValue(rawResult, expectedRaw)
 
-    console.log('Redis check result:', { rawResult, expectedRaw, expectedResult })
     return {
       checkPassed: expectedResult.ok,
       responseCode: expectedResult.ok ? 200 : 500,
@@ -323,7 +343,6 @@ export async function runCheck(endpoint) {
   }
 
   const next = computeStatus(endpoint, result.checkPassed)
-  console.log(endpoint)
   const responseTimeMs = Date.now() - startedAt
 
   await pool.query(

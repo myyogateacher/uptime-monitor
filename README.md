@@ -1,23 +1,59 @@
 # Uptime Monitor
 
-React + Vite + Tailwind frontend with an Express + Bun backend using MySQL storage.
+Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, and Redis.
+
+It uses:
+- Frontend: React + Vite + Tailwind
+- Backend: Express on Bun
+- Storage: MySQL
+- Realtime updates: WebSocket (`/ws`)
+
+The backend serves the built frontend (`dist/`) so both control plane and status page can be deployed together.
 
 ## Features
 
-- Monitor HTTP endpoints with full URL, method, headers, and body
-- Validate expected HTTP response code
-- Validate nested JSON value by path (e.g. `data.status` or `items[0].id`)
-- Monitor MySQL with connection config JSON plus optional probe SQL/value matching
-- Monitor Redis with connection config JSON plus optional probe command/value matching
-- Configure interval, retries before down, and retries before up
-- Group routes by logical monitor groups
-- Serve frontend static build from `dist/` in the same backend service
+- HTTP monitor support:
+  - Full URL endpoint
+  - HTTP method
+  - Optional headers JSON
+  - Optional request body
+  - Expected HTTP status code validation
+  - Nested JSON path + expected value matching
+- MySQL monitor support:
+  - Connection JSON
+  - Optional probe SQL
+  - Optional expected probe value matching
+- Redis monitor support:
+  - Connection JSON
+  - Optional probe command
+  - Optional expected probe value matching
+- Retry-based health transitions:
+  - Interval per monitor
+  - Retries before marking down
+  - Retries before marking up
+- Pause/resume monitors
+- Manual "Check now"
+- Group monitors by logical groups
+- Edit monitor configuration
+- Delete monitor historical runs per monitor
+- Realtime updates over WebSocket across tabs/sessions
+- Status page with grouped services and latency graph (with hover tooltip)
+- Glass-style SaaS UI
+- DB schema versioning via `schema_migrations`
+- Docker deployment with app + MySQL + Redis
+
+## Pages
+
+- `/` landing page
+- `/monitors` control plane
+- `/status` public status page
 
 ## Environment
 
-Set values in `.env` (already added):
+Use `.env` (see `.env.example`):
 
 - `NODE_ENV`
+- `TZ`
 - `PORT`
 - `MYSQL_HOST`
 - `MYSQL_PORT`
@@ -27,28 +63,93 @@ Set values in `.env` (already added):
 - `MYSQL_CONNECTION_LIMIT`
 - `MONITOR_POLL_MS`
 - `REQUEST_TIMEOUT_MS`
+- `CORS_ORIGINS`
 - `VITE_API_BASE_URL`
 
-## Install
+## Getting Started (Local Development)
+
+1. Install dependencies:
 
 ```bash
 bun install
 ```
 
-## Run in Development
+2. Configure env:
+
+```bash
+cp .env.example .env
+```
+
+3. Update `.env` for your local MySQL/Redis.
+
+4. Run frontend + backend:
 
 ```bash
 bun run dev
 ```
 
+Default local URLs:
 - Frontend: `http://localhost:5173`
-- Backend API: `http://localhost:3001/api`
+- Backend/API: `http://localhost:8000`
 
-## Production-style Run (single service)
+## Build and Run (Single Service)
+
+Build frontend and run backend serving `dist/`:
 
 ```bash
 bun run build
 bun run start
 ```
 
-This serves API routes and frontend static assets from `dist/` via Express.
+## Docker Deployment
+
+Build and start full stack:
+
+```bash
+docker compose up -d --build
+```
+
+Services:
+- App: `http://localhost:8000`
+- MySQL: `localhost:3306`
+- Redis: `localhost:6379`
+
+Stop:
+
+```bash
+docker compose down
+```
+
+Stop and remove volumes:
+
+```bash
+docker compose down -v
+```
+
+## NPM/Bun Scripts
+
+- `bun run dev` - run client + server in watch mode
+- `bun run dev:client` - run Vite dev server
+- `bun run dev:server` - run Bun server in watch mode
+- `bun run build` - build frontend
+- `bun run start` - run production backend (serves built frontend)
+- `bun run lint` - run ESLint
+- `bun run preview` - preview Vite build
+
+## How Monitoring Works
+
+- Monitor loop selects due monitors (`next_check_at`) and runs checks.
+- Check results are stored in `monitor_check_runs`.
+- Endpoint health state is updated with retry-aware transitions.
+- WebSocket events push monitor/group/endpoint changes to connected clients.
+
+## Database Migrations
+
+`server/db.js` uses versioned migrations.
+
+- Applied versions are stored in `schema_migrations`.
+- Only pending migrations run at startup.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
