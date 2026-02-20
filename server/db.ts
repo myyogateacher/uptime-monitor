@@ -83,17 +83,7 @@ const MIGRATIONS = [
         )
       `)
     },
-  },
-  {
-    version: 4,
-    name: 'add_endpoint_is_paused',
-    up: async () => {
-      await pool.query(`
-        ALTER TABLE monitor_endpoints
-        ADD COLUMN IF NOT EXISTS is_paused TINYINT(1) NOT NULL DEFAULT 0 AFTER last_match_value
-      `)
-    },
-  },
+  }
 ]
 
 async function ensureSchemaMigrationsTable() {
