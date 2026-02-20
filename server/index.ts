@@ -1,9 +1,11 @@
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
 
 import cors, { type CorsOptions } from 'cors'
 import express, { type NextFunction, type Request, type Response } from 'express'
+import session from 'express-session'
 import { WebSocket, WebSocketServer } from 'ws'
 
 import { config } from './config'
@@ -84,12 +86,32 @@ const corsOptions: CorsOptions = {
     if (config.corsOrigins.includes(origin)) return callback(null, true)
     return callback(new Error(`Origin ${origin} is not allowed by CORS`))
   },
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }
 
 app.use(cors(corsOptions))
 app.options(/.*/, cors(corsOptions))
+
+if (config.auth.trustProxy) {
+  app.set('trust proxy', 1)
+}
+
+app.use(
+  session({
+    name: 'uptime.sid',
+    secret: config.auth.sessionSecret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: config.nodeEnv === 'production',
+      maxAge: config.auth.sessionMaxAgeMs,
+    },
+  }),
+)
 
 app.use(express.json({ limit: '1mb' }))
 
@@ -313,6 +335,154 @@ const getMappedEndpointsByGroupId = async (groupId: number): Promise<Array<Recor
   return rows.map(mapEndpointRow)
 }
 
+const isAuthenticated = (req: Request): boolean => Boolean(req.session?.user)
+
+const requireAuth = (req: Request, res: Response, next: NextFunction) => {
+  if (isAuthenticated(req)) return next()
+  return res.status(401).json({ error: 'Authentication required' })
+}
+
+const requireGoogleConfig = (res: Response): boolean => {
+  const google = config.auth.google
+  if (!google.clientId || !google.clientSecret || !google.redirectUri) {
+    res.status(500).json({ error: 'Google auth is not configured' })
+    return false
+  }
+  return true
+}
+
+const buildLoginUrl = (returnTo?: string): string => {
+  const params = new URLSearchParams()
+  if (returnTo) params.set('returnTo', returnTo)
+  const suffix = params.toString()
+  return `${config.auth.loginPath}${suffix ? `?${suffix}` : ''}`
+}
+
+app.get('/api/auth/me', (req: Request, res: Response) => {
+  if (!req.session?.user) {
+    return res.status(200).json({ authenticated: false, user: null })
+  }
+
+  return res.status(200).json({
+    authenticated: true,
+    user: req.session.user,
+  })
+})
+
+app.get('/api/auth/google', (req: Request, res: Response) => {
+  if (!requireGoogleConfig(res)) return
+
+  const state = randomUUID()
+  req.session.oauthState = state
+  const returnTo = String(req.query.returnTo ?? '')
+  req.session.oauthReturnTo =
+    returnTo.startsWith('/') && !returnTo.startsWith('//')
+      ? returnTo
+      : config.auth.controlPlanePath
+
+  const params = new URLSearchParams({
+    client_id: config.auth.google.clientId,
+    redirect_uri: config.auth.google.redirectUri,
+    response_type: 'code',
+    scope: 'openid email profile',
+    access_type: 'online',
+    include_granted_scopes: 'true',
+    prompt: 'select_account',
+    state,
+  })
+
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`)
+})
+
+app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
+  if (!requireGoogleConfig(res)) return
+
+  const code = String(req.query.code ?? '')
+  const state = String(req.query.state ?? '')
+  const expectedState = req.session.oauthState
+  const returnTo = req.session.oauthReturnTo || config.auth.controlPlanePath
+  delete req.session.oauthState
+  delete req.session.oauthReturnTo
+
+  if (!code || !state || !expectedState || state !== expectedState) {
+    return res.redirect(buildLoginUrl(returnTo))
+  }
+
+  try {
+    const tokenBody = new URLSearchParams({
+      code,
+      client_id: config.auth.google.clientId,
+      client_secret: config.auth.google.clientSecret,
+      redirect_uri: config.auth.google.redirectUri,
+      grant_type: 'authorization_code',
+    })
+
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: tokenBody.toString(),
+    })
+
+    if (!tokenResponse.ok) {
+      return res.redirect(buildLoginUrl(returnTo))
+    }
+
+    const tokenPayload = (await tokenResponse.json()) as {
+      access_token?: string
+      id_token?: string
+    }
+    if (!tokenPayload.access_token) {
+      return res.redirect(buildLoginUrl(returnTo))
+    }
+
+    const profileResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokenPayload.access_token}` },
+    })
+    if (!profileResponse.ok) {
+      return res.redirect(buildLoginUrl(returnTo))
+    }
+
+    const profile = (await profileResponse.json()) as {
+      sub: string
+      email?: string
+      name?: string
+      picture?: string
+      hd?: string
+    }
+
+    if (!profile?.sub) {
+      return res.redirect(buildLoginUrl(returnTo))
+    }
+
+    if (
+      config.auth.google.enforceHostedDomain &&
+      profile.hd !== config.auth.google.enforceHostedDomain
+    ) {
+      return res.redirect(buildLoginUrl(returnTo))
+    }
+
+    req.session.user = {
+      sub: profile.sub,
+      email: profile.email,
+      name: profile.name,
+      picture: profile.picture,
+    }
+
+    req.session.save(() => {
+      res.redirect(returnTo)
+    })
+  } catch {
+    return res.redirect(buildLoginUrl(returnTo))
+  }
+})
+
+app.post('/api/auth/logout', (req: Request, res: Response) => {
+  req.session.destroy(() => {
+    res.clearCookie('uptime.sid')
+    res.status(204).send()
+  })
+})
+
 app.get('/api/health', async (_req: Request, res: Response) => {
   const [rows] = await pool.query('SELECT COUNT(*) AS endpoint_count FROM monitor_endpoints')
 
@@ -337,7 +507,7 @@ app.get('/api/groups', async (_req: Request, res: Response) => {
   res.json(rows)
 })
 
-app.post('/api/groups', async (req: Request, res: Response) => {
+app.post('/api/groups', requireAuth, async (req: Request, res: Response) => {
   const name = String(req.body.name ?? '').trim()
   const description = String(req.body.description ?? '').trim() || null
 
@@ -356,7 +526,7 @@ app.post('/api/groups', async (req: Request, res: Response) => {
   return res.status(201).json(createdGroup)
 })
 
-app.put('/api/groups/:id', async (req: Request, res: Response) => {
+app.put('/api/groups/:id', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
   const name = String(req.body.name ?? '').trim()
   const description = String(req.body.description ?? '').trim() || null
@@ -386,7 +556,7 @@ app.put('/api/groups/:id', async (req: Request, res: Response) => {
   return res.json(updatedGroup)
 })
 
-app.delete('/api/groups/:id', async (req: Request, res: Response) => {
+app.delete('/api/groups/:id', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -403,7 +573,7 @@ app.delete('/api/groups/:id', async (req: Request, res: Response) => {
   return res.status(204).send()
 })
 
-app.post('/api/groups/:id/pause', async (req: Request, res: Response) => {
+app.post('/api/groups/:id/pause', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -438,7 +608,7 @@ app.post('/api/groups/:id/pause', async (req: Request, res: Response) => {
   })
 })
 
-app.post('/api/groups/:id/resume', async (req: Request, res: Response) => {
+app.post('/api/groups/:id/resume', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -500,7 +670,7 @@ app.get('/api/endpoints', async (req: Request, res: Response) => {
   res.json(rows.map(mapEndpointRow))
 })
 
-app.post('/api/endpoints', async (req: Request, res: Response) => {
+app.post('/api/endpoints', requireAuth, async (req: Request, res: Response) => {
   let payload
 
   try {
@@ -573,7 +743,7 @@ app.post('/api/endpoints', async (req: Request, res: Response) => {
   return res.status(201).json(createdEndpoint)
 })
 
-app.put('/api/endpoints/:id', async (req: Request, res: Response) => {
+app.put('/api/endpoints/:id', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -652,7 +822,7 @@ app.put('/api/endpoints/:id', async (req: Request, res: Response) => {
   return res.json(updatedEndpoint)
 })
 
-app.delete('/api/endpoints/:id', async (req: Request, res: Response) => {
+app.delete('/api/endpoints/:id', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -669,7 +839,7 @@ app.delete('/api/endpoints/:id', async (req: Request, res: Response) => {
   return res.status(204).send()
 })
 
-app.post('/api/endpoints/:id/check', async (req: Request, res: Response) => {
+app.post('/api/endpoints/:id/check', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -693,7 +863,7 @@ app.post('/api/endpoints/:id/check', async (req: Request, res: Response) => {
   return res.json(result)
 })
 
-app.post('/api/endpoints/:id/pause', async (req: Request, res: Response) => {
+app.post('/api/endpoints/:id/pause', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -720,7 +890,7 @@ app.post('/api/endpoints/:id/pause', async (req: Request, res: Response) => {
   return res.json(endpoint)
 })
 
-app.post('/api/endpoints/:id/resume', async (req: Request, res: Response) => {
+app.post('/api/endpoints/:id/resume', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {
@@ -768,7 +938,7 @@ app.get('/api/endpoints/:id/runs', async (req: Request, res: Response) => {
   res.json(rows)
 })
 
-app.delete('/api/endpoints/:id/runs', async (req: Request, res: Response) => {
+app.delete('/api/endpoints/:id/runs', requireAuth, async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
 
   if (!Number.isInteger(id) || id < 1) {

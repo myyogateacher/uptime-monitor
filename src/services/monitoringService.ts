@@ -7,6 +7,7 @@ type RequestOptions = RequestInit & {
 async function request(path: string, options: RequestOptions = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
     cache: 'no-store',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers ?? {}),
@@ -26,6 +27,14 @@ async function request(path: string, options: RequestOptions = {}) {
 }
 
 export const monitoringService = {
+  getSession() {
+    return request('/api/auth/me')
+  },
+  logout() {
+    return request('/api/auth/logout', {
+      method: 'POST',
+    })
+  },
   getHealth() {
     return request('/api/health')
   },

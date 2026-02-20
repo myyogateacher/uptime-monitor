@@ -390,6 +390,40 @@ function LandingPage() {
   )
 }
 
+function LoginPage({ apiBase, isChecking, error }) {
+  const search =
+    typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams()
+  const requestedReturnTo = search.get('returnTo') || '/monitors'
+  const safeReturnTo =
+    requestedReturnTo.startsWith('/') && !requestedReturnTo.startsWith('//')
+      ? requestedReturnTo
+      : '/monitors'
+  const googleAuthUrl = `${apiBase || ''}/api/auth/google?returnTo=${encodeURIComponent(safeReturnTo)}`
+
+  return (
+    <main className="min-h-screen px-4 py-12 text-slate-900 md:px-8">
+      <div className="mx-auto max-w-xl">
+        <section className="glass-card rounded-2xl p-8 md:p-10">
+          <p className="text-xs uppercase tracking-[0.25em] text-cyan-700">Authentication</p>
+          <h1 className="mt-3 text-3xl font-semibold tracking-tight">Sign in to Control Plane</h1>
+          <p className="mt-3 text-sm text-slate-600">
+            Control plane access requires Google sign-in. Status page remains public.
+          </p>
+
+          <a
+            href={googleAuthUrl}
+            className="mt-6 inline-flex cursor-pointer items-center rounded-lg border border-blue-300/60 bg-gradient-to-r from-blue-600 to-indigo-600 px-5 py-2.5 text-sm font-medium text-white shadow-[0_8px_24px_rgba(37,99,235,0.28)] transition duration-150 ease-out hover:from-blue-500 hover:to-indigo-500 active:scale-[0.98]"
+          >
+            Continue with Google
+          </a>
+          {isChecking ? <p className="mt-3 text-xs text-slate-500">Checking session...</p> : null}
+          {error ? <p className="mt-3 text-xs text-rose-600">{error}</p> : null}
+        </section>
+      </div>
+    </main>
+  )
+}
+
 function AdminPage({
   health,
   groups,
@@ -859,6 +893,8 @@ function App() {
   const pathname = typeof window !== 'undefined' ? window.location.pathname : '/'
   const isHomePage = pathname === '/'
   const isStatusPage = pathname.startsWith('/status')
+  const isLoginPage = pathname.startsWith('/login')
+  const isMonitorsPage = pathname.startsWith('/monitors') || (!isHomePage && !isStatusPage && !isLoginPage)
 
   const [health, setHealth] = useState({ status: 'checking', endpointCount: 0 })
   const [groups, setGroups] = useState([])
@@ -870,6 +906,9 @@ function App() {
   const [isSavingEndpoint, setIsSavingEndpoint] = useState(false)
   const [error, setError] = useState('')
   const [currentTimeMs, setCurrentTimeMs] = useState(Date.now())
+  const [authChecked, setAuthChecked] = useState(false)
+  const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [authError, setAuthError] = useState('')
   const apiBase = import.meta.env.VITE_API_BASE_URL || ''
 
   const groupedEndpoints = useMemo(() => {
@@ -879,6 +918,37 @@ function App() {
       group_status: getGroupStatus(endpoints.filter((endpoint) => endpoint.group_id === group.id)),
     }))
   }, [groups, endpoints])
+
+  useEffect(() => {
+    if (!isMonitorsPage && !isLoginPage) {
+      setAuthChecked(true)
+      return
+    }
+
+    const verifySession = async () => {
+      setAuthError('')
+      try {
+        const sessionState = await monitoringService.getSession()
+        const authenticated = Boolean(sessionState?.authenticated)
+        setIsAuthenticated(authenticated)
+      } catch (requestError) {
+        setIsAuthenticated(false)
+        setAuthError(requestError.message)
+      } finally {
+        setAuthChecked(true)
+      }
+    }
+
+    void verifySession()
+  }, [isLoginPage, isMonitorsPage])
+
+  useEffect(() => {
+    if (!isMonitorsPage) return
+    if (!authChecked) return
+    if (isAuthenticated) return
+    const returnTo = encodeURIComponent(pathname || '/monitors')
+    window.location.replace(`/login?returnTo=${returnTo}`)
+  }, [authChecked, isAuthenticated, isMonitorsPage, pathname])
 
   const loadRuns = useCallback(async (endpointList) => {
     const runEntries = await Promise.all(
@@ -896,6 +966,15 @@ function App() {
   }, [])
 
   const loadData = useCallback(async () => {
+    if (isHomePage || isLoginPage) {
+      setIsLoading(false)
+      return
+    }
+    if (isMonitorsPage && !isAuthenticated) {
+      setIsLoading(false)
+      return
+    }
+
     setError('')
     try {
       const [healthRes, groupsRes, endpointsRes] = await Promise.all([
@@ -920,11 +999,12 @@ function App() {
     } finally {
       setIsLoading(false)
     }
-  }, [isStatusPage, loadRuns])
+  }, [isStatusPage, loadRuns, isHomePage, isLoginPage, isMonitorsPage, isAuthenticated])
 
   useEffect(() => {
+    if ((isMonitorsPage || isLoginPage) && !authChecked) return
     void loadData()
-  }, [isStatusPage, loadData])
+  }, [isStatusPage, isMonitorsPage, isLoginPage, authChecked, loadData])
 
   useEffect(() => {
     setHealth((current) => ({
@@ -942,7 +1022,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (isHomePage) return
+    if (isHomePage || isLoginPage) return
 
     const toWebSocketUrl = () => {
       if (apiBase) {
@@ -1057,7 +1137,7 @@ function App() {
     return () => {
       socket.close()
     }
-  }, [apiBase, isHomePage])
+  }, [apiBase, isHomePage, isLoginPage])
 
   const handleEndpointSubmit = async (event) => {
     event.preventDefault()
@@ -1255,6 +1335,10 @@ function App() {
         isLoading={isLoading}
       />
     )
+  }
+
+  if (isLoginPage || (isMonitorsPage && !isAuthenticated)) {
+    return <LoginPage apiBase={apiBase} isChecking={!authChecked} error={authError} />
   }
 
   return (

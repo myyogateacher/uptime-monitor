@@ -7,6 +7,11 @@ const toNumber = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+const toBoolean = (value, fallback = false) => {
+  if (value == null || value === '') return fallback
+  return String(value).toLowerCase() === 'true'
+}
+
 const parseJson = (value, fallback) => {
   if (!value) return fallback
   try {
@@ -108,5 +113,18 @@ export const config = {
   notifications: {
     enabled: String(process.env.NOTIFICATIONS_ENABLED ?? 'true').toLowerCase() !== 'false',
     targets: parseNotificationTargets(),
+  },
+  auth: {
+    sessionSecret: process.env.SESSION_SECRET ?? 'change-me',
+    sessionMaxAgeMs: toNumber(process.env.SESSION_MAX_AGE_MS, 1000 * 60 * 60 * 24 * 7),
+    google: {
+      clientId: process.env.GOOGLE_CLIENT_ID ?? '',
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
+      redirectUri: process.env.GOOGLE_REDIRECT_URI ?? '',
+      enforceHostedDomain: process.env.GOOGLE_HOSTED_DOMAIN ?? '',
+    },
+    controlPlanePath: process.env.CONTROL_PLANE_PATH ?? '/monitors',
+    loginPath: process.env.LOGIN_PATH ?? '/login',
+    trustProxy: toBoolean(process.env.TRUST_PROXY, false),
   },
 }

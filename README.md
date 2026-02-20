@@ -43,6 +43,8 @@ The backend serves the built frontend (`dist/`) so both control plane and status
   - Retries before marking up
 - Pause/resume monitors
 - Manual "Check now"
+- Google-only login for control plane
+- In-memory backend sessions
 - Rich Slack notifications for up/down transitions
 - Pluggable webhook notifications for any custom endpoint
 - Group monitors by logical groups
@@ -59,6 +61,7 @@ The backend serves the built frontend (`dist/`) so both control plane and status
 - `/` landing page
 - `/monitors` control plane
 - `/status` public status page
+- `/login` Google sign-in page
 
 ## Environment
 
@@ -77,6 +80,15 @@ Use `.env` (see `.env.example`):
 - `REQUEST_TIMEOUT_MS`
 - `CORS_ORIGINS`
 - `VITE_API_BASE_URL`
+- `SESSION_SECRET`
+- `SESSION_MAX_AGE_MS`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI`
+- `GOOGLE_HOSTED_DOMAIN`
+- `CONTROL_PLANE_PATH`
+- `LOGIN_PATH`
+- `TRUST_PROXY`
 - `NOTIFICATIONS_ENABLED`
 - `SLACK_BOT_TOKEN`
 - `SLACK_CHANNEL_ID`
