@@ -2,6 +2,9 @@
 
 Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, and Redis.
 
+![Uptime Control Panel](images/screenshot_control_panel.png)
+![Uptime Control Panel](images/screenshot_status_page.png)
+
 It uses:
 - Frontend: React + Vite + Tailwind
 - Backend: Express on Bun
