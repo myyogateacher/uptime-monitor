@@ -1,0 +1,728 @@
+import path from 'node:path'
+import { existsSync } from 'node:fs'
+import { createServer } from 'node:http'
+
+import cors from 'cors'
+import express from 'express'
+import { WebSocketServer } from 'ws'
+
+import { config } from './config.js'
+import { initDatabase, pool } from './db.js'
+import {
+  ENDPOINT_CREATED_EVENT,
+  ENDPOINT_DELETED_EVENT,
+  ENDPOINT_UPDATED_EVENT,
+  GROUP_CREATED_EVENT,
+  GROUP_DELETED_EVENT,
+  GROUP_UPDATED_EVENT,
+  MONITOR_CHECKED_EVENT,
+  monitorEvents,
+} from './events.js'
+import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService.js'
+
+const app = express()
+const httpServer = createServer(app)
+const wsServer = new WebSocketServer({ server: httpServer, path: '/ws' })
+const wsClients = new Set()
+
+const safeSend = (ws, message) => {
+  if (ws.readyState !== 1) return
+  ws.send(JSON.stringify(message))
+}
+
+wsServer.on('connection', (ws) => {
+  wsClients.add(ws)
+  safeSend(ws, { type: 'connected', timestamp: new Date().toISOString() })
+
+  ws.on('close', () => {
+    wsClients.delete(ws)
+  })
+})
+
+const broadcast = (type, payload) => {
+  const message = { type, payload }
+  for (const client of wsClients) {
+    safeSend(client, message)
+  }
+}
+
+monitorEvents.on(MONITOR_CHECKED_EVENT, (payload) => {
+  broadcast(MONITOR_CHECKED_EVENT, payload)
+})
+
+monitorEvents.on(GROUP_CREATED_EVENT, (payload) => {
+  broadcast(GROUP_CREATED_EVENT, payload)
+})
+
+monitorEvents.on(GROUP_UPDATED_EVENT, (payload) => {
+  broadcast(GROUP_UPDATED_EVENT, payload)
+})
+
+monitorEvents.on(GROUP_DELETED_EVENT, (payload) => {
+  broadcast(GROUP_DELETED_EVENT, payload)
+})
+
+monitorEvents.on(ENDPOINT_CREATED_EVENT, (payload) => {
+  broadcast(ENDPOINT_CREATED_EVENT, payload)
+})
+
+monitorEvents.on(ENDPOINT_UPDATED_EVENT, (payload) => {
+  broadcast(ENDPOINT_UPDATED_EVENT, payload)
+})
+
+monitorEvents.on(ENDPOINT_DELETED_EVENT, (payload) => {
+  broadcast(ENDPOINT_DELETED_EVENT, payload)
+})
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) return callback(null, true)
+    if (config.corsOrigins.includes(origin)) return callback(null, true)
+    return callback(new Error(`Origin ${origin} is not allowed by CORS`))
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}
+
+app.use(cors(corsOptions))
+app.options(/.*/, cors(corsOptions))
+
+app.use(express.json({ limit: '1mb' }))
+
+const MONITOR_TYPES = new Set(['http', 'mysql', 'redis'])
+const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
+
+const toInteger = (value, fallback = null) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.trunc(parsed)
+}
+
+const parseJsonObjectInput = (value, fieldLabel) => {
+  if (value == null || value === '') return {}
+
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value
+  }
+
+  if (typeof value !== 'string') {
+    throw new Error(`${fieldLabel} must be a JSON object or JSON string`)
+  }
+
+  const parsed = JSON.parse(value)
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${fieldLabel} must be a JSON object`)
+  }
+
+  return parsed
+}
+
+const normalizeHttpPayload = (payload) => {
+  const url = String(payload.url ?? '').trim()
+  const method = String(payload.method ?? 'GET').toUpperCase()
+  const bodyText = payload.body_text == null ? null : String(payload.body_text)
+  const expectedStatus = toInteger(payload.expected_status, NaN)
+  const expectedJsonPath = String(payload.expected_json_path ?? '').trim() || null
+  const expectedJsonValue =
+    payload.expected_json_value == null || String(payload.expected_json_value).trim() === ''
+      ? null
+      : String(payload.expected_json_value)
+  const headers = parseJsonObjectInput(payload.headers_json, 'Headers')
+
+  if (!url) throw new Error('URL is required for HTTP monitors')
+
+  try {
+    const parsedUrl = new URL(url)
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      throw new Error('URL must use http or https')
+    }
+  } catch {
+    throw new Error('URL must be a valid absolute URL')
+  }
+
+  if (!ALLOWED_METHODS.has(method)) {
+    throw new Error('Unsupported HTTP method')
+  }
+
+  if (!Number.isInteger(expectedStatus) || expectedStatus < 100 || expectedStatus > 599) {
+    throw new Error('expected_status must be between 100 and 599')
+  }
+
+  if ((expectedJsonPath && !expectedJsonValue) || (!expectedJsonPath && expectedJsonValue)) {
+    throw new Error('expected_json_path and expected_json_value must both be provided together')
+  }
+
+  return {
+    url,
+    method,
+    headers_json: JSON.stringify(headers),
+    body_text: bodyText,
+    expected_status: expectedStatus,
+    expected_json_path: expectedJsonPath,
+    expected_json_value: expectedJsonValue,
+    connection_json: null,
+    probe_command: null,
+    expected_probe_value: null,
+  }
+}
+
+const normalizeMysqlOrRedisPayload = (payload, monitorType) => {
+  const connection = parseJsonObjectInput(payload.connection_json, 'connection_json')
+  const probeCommand = String(payload.probe_command ?? '').trim() || null
+  const expectedProbeValue =
+    payload.expected_probe_value == null || String(payload.expected_probe_value).trim() === ''
+      ? null
+      : String(payload.expected_probe_value)
+
+  const defaultPort = monitorType === 'mysql' ? 3306 : 6379
+  const host = connection.host ?? '127.0.0.1'
+  const port = Number(connection.port ?? defaultPort)
+
+  if (!connection.url && (!host || !Number.isFinite(port))) {
+    throw new Error('connection_json must include a valid host/port or url')
+  }
+
+  return {
+    url: String(payload.url ?? `${monitorType}://${host}:${port}`),
+    method: 'GET',
+    headers_json: JSON.stringify({}),
+    body_text: null,
+    expected_status: 200,
+    expected_json_path: null,
+    expected_json_value: null,
+    connection_json: JSON.stringify(connection),
+    probe_command: probeCommand,
+    expected_probe_value: expectedProbeValue,
+  }
+}
+
+const normalizeEndpointPayload = (payload) => {
+  const name = String(payload.name ?? '').trim()
+  const monitorType = String(payload.monitor_type ?? 'http').trim().toLowerCase()
+  const intervalSeconds = toInteger(payload.interval_seconds, NaN)
+  const downRetries = toInteger(payload.down_retries, NaN)
+  const upRetries = toInteger(payload.up_retries, NaN)
+  const groupId = toInteger(payload.group_id, NaN)
+
+  if (!name) throw new Error('Name is required')
+
+  if (!MONITOR_TYPES.has(monitorType)) {
+    throw new Error('monitor_type must be one of http, mysql, redis')
+  }
+
+  if (!Number.isInteger(intervalSeconds) || intervalSeconds < 5) {
+    throw new Error('interval_seconds must be at least 5 seconds')
+  }
+
+  if (!Number.isInteger(downRetries) || downRetries < 1) {
+    throw new Error('down_retries must be at least 1')
+  }
+
+  if (!Number.isInteger(upRetries) || upRetries < 1) {
+    throw new Error('up_retries must be at least 1')
+  }
+
+  if (!Number.isInteger(groupId) || groupId < 1) {
+    throw new Error('group_id must be a valid group id')
+  }
+
+  const monitorSpecific =
+    monitorType === 'http'
+      ? normalizeHttpPayload(payload)
+      : normalizeMysqlOrRedisPayload(payload, monitorType)
+
+  return {
+    name,
+    monitor_type: monitorType,
+    interval_seconds: intervalSeconds,
+    down_retries: downRetries,
+    up_retries: upRetries,
+    group_id: groupId,
+    ...monitorSpecific,
+  }
+}
+
+const mapEndpointRow = (row) => {
+  const parseOrDefault = (value, fallback = {}) => {
+    if (!value) return fallback
+    if (typeof value === 'object') return value
+
+    try {
+      return JSON.parse(value)
+    } catch {
+      return fallback
+    }
+  }
+
+  return {
+    ...row,
+    is_paused: Number(row.is_paused) === 1,
+    headers_json: parseOrDefault(row.headers_json, {}),
+    connection_json: parseOrDefault(row.connection_json, {}),
+  }
+}
+
+const getMappedEndpointById = async (endpointId) => {
+  const [rows] = await pool.query(
+    `
+      SELECT
+        e.*,
+        g.name AS group_name
+      FROM monitor_endpoints e
+      INNER JOIN monitor_groups g ON g.id = e.group_id
+      WHERE e.id = ?
+      LIMIT 1
+    `,
+    [endpointId],
+  )
+
+  if (!rows.length) return null
+  return mapEndpointRow(rows[0])
+}
+
+app.get('/api/health', async (_req, res) => {
+  const [rows] = await pool.query('SELECT COUNT(*) AS endpoint_count FROM monitor_endpoints')
+
+  res.json({
+    status: 'ok',
+    endpointCount: rows[0]?.endpoint_count ?? 0,
+    timestamp: new Date().toISOString(),
+  })
+})
+
+app.get('/api/groups', async (_req, res) => {
+  const [rows] = await pool.query(`
+    SELECT
+      g.*,
+      COUNT(e.id) AS endpoint_count
+    FROM monitor_groups g
+    LEFT JOIN monitor_endpoints e ON e.group_id = g.id
+    GROUP BY g.id
+    ORDER BY g.name ASC
+  `)
+
+  res.json(rows)
+})
+
+app.post('/api/groups', async (req, res) => {
+  const name = String(req.body.name ?? '').trim()
+  const description = String(req.body.description ?? '').trim() || null
+
+  if (!name) {
+    return res.status(400).json({ error: 'Group name is required' })
+  }
+
+  const [result] = await pool.query(
+    'INSERT INTO monitor_groups (name, description) VALUES (?, ?)',
+    [name, description],
+  )
+
+  const [rows] = await pool.query('SELECT * FROM monitor_groups WHERE id = ?', [result.insertId])
+  const createdGroup = rows[0]
+  monitorEvents.emit(GROUP_CREATED_EVENT, createdGroup)
+  return res.status(201).json(createdGroup)
+})
+
+app.put('/api/groups/:id', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+  const name = String(req.body.name ?? '').trim()
+  const description = String(req.body.description ?? '').trim() || null
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid group id' })
+  }
+
+  if (!name) {
+    return res.status(400).json({ error: 'Group name is required' })
+  }
+
+  await pool.query('UPDATE monitor_groups SET name = ?, description = ? WHERE id = ?', [
+    name,
+    description,
+    id,
+  ])
+
+  const [rows] = await pool.query('SELECT * FROM monitor_groups WHERE id = ?', [id])
+
+  if (!rows.length) {
+    return res.status(404).json({ error: 'Group not found' })
+  }
+
+  const updatedGroup = rows[0]
+  monitorEvents.emit(GROUP_UPDATED_EVENT, updatedGroup)
+  return res.json(updatedGroup)
+})
+
+app.delete('/api/groups/:id', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid group id' })
+  }
+
+  const [result] = await pool.query('DELETE FROM monitor_groups WHERE id = ?', [id])
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'Group not found' })
+  }
+
+  monitorEvents.emit(GROUP_DELETED_EVENT, { id })
+  return res.status(204).send()
+})
+
+app.get('/api/endpoints', async (req, res) => {
+  const groupId = toInteger(req.query.group_id, null)
+
+  const params = []
+  let whereClause = ''
+
+  if (groupId != null) {
+    whereClause = 'WHERE e.group_id = ?'
+    params.push(groupId)
+  }
+
+  const [rows] = await pool.query(
+    `
+      SELECT
+        e.*,
+        g.name AS group_name
+      FROM monitor_endpoints e
+      INNER JOIN monitor_groups g ON g.id = e.group_id
+      ${whereClause}
+      ORDER BY g.name ASC, e.name ASC
+    `,
+    params,
+  )
+
+  res.json(rows.map(mapEndpointRow))
+})
+
+app.post('/api/endpoints', async (req, res) => {
+  let payload
+
+  try {
+    payload = normalizeEndpointPayload(req.body)
+  } catch (error) {
+    return res.status(400).json({ error: error.message })
+  }
+
+  const [groupRows] = await pool.query('SELECT id FROM monitor_groups WHERE id = ?', [payload.group_id])
+  if (!groupRows.length) {
+    return res.status(404).json({ error: 'Group not found' })
+  }
+
+  const [result] = await pool.query(
+    `
+      INSERT INTO monitor_endpoints (
+        group_id,
+        name,
+        monitor_type,
+        url,
+        method,
+        headers_json,
+        body_text,
+        expected_status,
+        expected_json_path,
+        expected_json_value,
+        connection_json,
+        probe_command,
+        expected_probe_value,
+        interval_seconds,
+        down_retries,
+        up_retries,
+        next_check_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    `,
+    [
+      payload.group_id,
+      payload.name,
+      payload.monitor_type,
+      payload.url,
+      payload.method,
+      payload.headers_json,
+      payload.body_text,
+      payload.expected_status,
+      payload.expected_json_path,
+      payload.expected_json_value,
+      payload.connection_json,
+      payload.probe_command,
+      payload.expected_probe_value,
+      payload.interval_seconds,
+      payload.down_retries,
+      payload.up_retries,
+    ],
+  )
+
+  const [rows] = await pool.query(
+    `
+      SELECT
+        e.*,
+        g.name AS group_name
+      FROM monitor_endpoints e
+      INNER JOIN monitor_groups g ON g.id = e.group_id
+      WHERE e.id = ?
+    `,
+    [result.insertId],
+  )
+
+  const createdEndpoint = mapEndpointRow(rows[0])
+  monitorEvents.emit(ENDPOINT_CREATED_EVENT, createdEndpoint)
+  return res.status(201).json(createdEndpoint)
+})
+
+app.put('/api/endpoints/:id', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  let payload
+  try {
+    payload = normalizeEndpointPayload(req.body)
+  } catch (error) {
+    return res.status(400).json({ error: error.message })
+  }
+
+  const [result] = await pool.query(
+    `
+      UPDATE monitor_endpoints
+      SET
+        group_id = ?,
+        name = ?,
+        monitor_type = ?,
+        url = ?,
+        method = ?,
+        headers_json = ?,
+        body_text = ?,
+        expected_status = ?,
+        expected_json_path = ?,
+        expected_json_value = ?,
+        connection_json = ?,
+        probe_command = ?,
+        expected_probe_value = ?,
+        interval_seconds = ?,
+        down_retries = ?,
+        up_retries = ?,
+        next_check_at = NOW()
+      WHERE id = ?
+    `,
+    [
+      payload.group_id,
+      payload.name,
+      payload.monitor_type,
+      payload.url,
+      payload.method,
+      payload.headers_json,
+      payload.body_text,
+      payload.expected_status,
+      payload.expected_json_path,
+      payload.expected_json_value,
+      payload.connection_json,
+      payload.probe_command,
+      payload.expected_probe_value,
+      payload.interval_seconds,
+      payload.down_retries,
+      payload.up_retries,
+      id,
+    ],
+  )
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Endpoint not found' })
+  }
+
+  const [rows] = await pool.query(
+    `
+      SELECT
+        e.*,
+        g.name AS group_name
+      FROM monitor_endpoints e
+      INNER JOIN monitor_groups g ON g.id = e.group_id
+      WHERE e.id = ?
+    `,
+    [id],
+  )
+
+  const updatedEndpoint = mapEndpointRow(rows[0])
+  monitorEvents.emit(ENDPOINT_UPDATED_EVENT, updatedEndpoint)
+  return res.json(updatedEndpoint)
+})
+
+app.delete('/api/endpoints/:id', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  const [result] = await pool.query('DELETE FROM monitor_endpoints WHERE id = ?', [id])
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Endpoint not found' })
+  }
+
+  monitorEvents.emit(ENDPOINT_DELETED_EVENT, { id })
+  return res.status(204).send()
+})
+
+app.post('/api/endpoints/:id/check', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  const endpoint = await getMappedEndpointById(id)
+  if (!endpoint) {
+    return res.status(404).json({ error: 'Endpoint not found' })
+  }
+
+  if (endpoint.is_paused) {
+    return res.status(409).json({ error: 'Endpoint is paused. Resume it before checking.' })
+  }
+
+  const result = await triggerCheckNow(id)
+  if (!result) {
+    return res.status(500).json({ error: 'Failed to run check' })
+  }
+
+  return res.json(result)
+})
+
+app.post('/api/endpoints/:id/pause', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  const [result] = await pool.query(
+    `
+      UPDATE monitor_endpoints
+      SET
+        is_paused = 1,
+        next_check_at = DATE_ADD(NOW(), INTERVAL interval_seconds SECOND)
+      WHERE id = ?
+    `,
+    [id],
+  )
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Endpoint not found' })
+  }
+
+  const endpoint = await getMappedEndpointById(id)
+  monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint)
+  return res.json(endpoint)
+})
+
+app.post('/api/endpoints/:id/resume', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  const [result] = await pool.query(
+    `
+      UPDATE monitor_endpoints
+      SET
+        is_paused = 0,
+        next_check_at = NOW()
+      WHERE id = ?
+    `,
+    [id],
+  )
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Endpoint not found' })
+  }
+
+  const endpoint = await getMappedEndpointById(id)
+  monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint)
+  return res.json(endpoint)
+})
+
+app.get('/api/endpoints/:id/runs', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  const [rows] = await pool.query(
+    `
+      SELECT *
+      FROM monitor_check_runs
+      WHERE endpoint_id = ?
+      ORDER BY checked_at DESC
+      LIMIT 50
+    `,
+    [id],
+  )
+
+  res.json(rows)
+})
+
+app.delete('/api/endpoints/:id/runs', async (req, res) => {
+  const id = toInteger(req.params.id, NaN)
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Invalid endpoint id' })
+  }
+
+  const [endpointRows] = await pool.query('SELECT id FROM monitor_endpoints WHERE id = ? LIMIT 1', [id])
+  if (!endpointRows.length) {
+    return res.status(404).json({ error: 'Endpoint not found' })
+  }
+
+  const [result] = await pool.query('DELETE FROM monitor_check_runs WHERE endpoint_id = ?', [id])
+
+  return res.json({
+    endpointId: id,
+    deletedRuns: result.affectedRows ?? 0,
+  })
+})
+
+app.use('/api', (err, _req, res, next) => {
+  void next
+  const message = err instanceof Error ? err.message : 'Internal server error'
+  console.error(err)
+  res.status(500).json({ error: message })
+})
+
+const distPath = path.resolve(process.cwd(), 'dist')
+if (existsSync(distPath)) {
+  app.use(express.static(distPath))
+
+  app.get(/^\/(?!api).*/, (_req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'))
+  })
+}
+
+async function start() {
+  await initDatabase()
+  startMonitor()
+
+  httpServer.listen(config.port, () => {
+    console.log(`Express server listening on http://localhost:${config.port}`)
+  })
+}
+
+start().catch((error) => {
+  console.error('Failed to start server:', error)
+  process.exit(1)
+})
+
+const shutdown = async () => {
+  stopMonitor()
+  await new Promise((resolve) => wsServer.close(resolve))
+  await new Promise((resolve) => httpServer.close(resolve))
+  await pool.end()
+  process.exit(0)
+}
+
+process.on('SIGINT', shutdown)
+process.on('SIGTERM', shutdown)
