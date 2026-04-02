@@ -4,6 +4,14 @@ type RequestOptions = RequestInit & {
   headers?: Record<string, string>
 }
 
+export type StatsGranularity = 'minute' | 'hour' | 'day'
+
+type EndpointRunsOptions = {
+  mode?: 'aggregate' | 'raw'
+  granularity?: StatsGranularity
+  rangeDays?: number
+}
+
 async function request(path: string, options: RequestOptions = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
     cache: 'no-store',
@@ -87,8 +95,23 @@ export const monitoringService = {
       method: 'POST',
     })
   },
-  getEndpointRuns(endpointId) {
-    return request(`/api/endpoints/${endpointId}/runs`)
+  getEndpointRuns(endpointId: number, options: EndpointRunsOptions = {}) {
+    const params = new URLSearchParams()
+
+    if (options.granularity) {
+      params.set('granularity', options.granularity)
+    }
+
+    if (options.mode) {
+      params.set('mode', options.mode)
+    }
+
+    if (options.rangeDays) {
+      params.set('range_days', String(options.rangeDays))
+    }
+
+    const query = params.toString()
+    return request(`/api/endpoints/${endpointId}/runs${query ? `?${query}` : ''}`)
   },
   deleteEndpoint(endpointId) {
     return request(`/api/endpoints/${endpointId}`, {

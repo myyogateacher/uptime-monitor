@@ -76,6 +76,11 @@ interface MonitorCheckedPayload {
 
 let timer: ReturnType<typeof setInterval> | null = null
 let isTickRunning = false
+let lastRetentionCleanupAt = 0
+
+const HISTORY_RETENTION_DAYS = 90
+const HISTORY_RETENTION_MS = HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+const RETENTION_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000
 
 const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
   let timeoutId: ReturnType<typeof setTimeout> | undefined
@@ -646,6 +651,17 @@ async function tick() {
   isTickRunning = true
 
   try {
+    if (Date.now() - lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
+      await pool.query(
+        `
+          DELETE FROM monitor_check_runs
+          WHERE checked_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+        `,
+        [HISTORY_RETENTION_DAYS],
+      )
+      lastRetentionCleanupAt = Date.now()
+    }
+
     const [endpoints] = await pool.query(
       `
         SELECT
@@ -668,6 +684,7 @@ async function tick() {
 export function startMonitor() {
   if (timer) return
 
+  lastRetentionCleanupAt = Date.now() - HISTORY_RETENTION_MS
   timer = setInterval(() => {
     void tick()
   }, config.monitorPollMs)

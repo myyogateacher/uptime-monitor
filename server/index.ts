@@ -26,6 +26,8 @@ import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService'
 type JsonObject = Record<string, unknown>
 type WsFrame = { type: string; payload?: unknown; timestamp?: string }
 type MonitorType = 'http' | 'mysql' | 'redis' | 'nats' | 'tcp'
+type StatsGranularity = 'minute' | 'hour' | 'day'
+type StatsMode = 'aggregate' | 'raw'
 
 const app = express()
 const httpServer = createServer(app)
@@ -132,6 +134,13 @@ app.use(express.json({ limit: '1mb' }))
 
 const MONITOR_TYPES = new Set(['http', 'mysql', 'redis', 'nats', 'tcp'])
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
+const ALLOWED_STATS_GRANULARITIES = new Set<StatsGranularity>(['minute', 'hour', 'day'])
+const ALLOWED_STATS_MODES = new Set<StatsMode>(['aggregate', 'raw'])
+const MAX_RANGE_DAYS_BY_GRANULARITY: Record<StatsGranularity, number> = {
+  minute: 2,
+  hour: 30,
+  day: 90,
+}
 
 const toInteger = (value: unknown, fallback: number | null = null): number | null => {
   const parsed = Number(value)
@@ -313,6 +322,34 @@ const mapEndpointRow = (row: Record<string, any>): Record<string, any> => {
     headers_json: parseOrDefault(row.headers_json, {}),
     connection_json: parseOrDefault(row.connection_json, {}),
   }
+}
+
+const getStatsBucketSql = (granularity: StatsGranularity): string => {
+  if (granularity === 'minute') {
+    return "DATE_FORMAT(CONVERT_TZ(checked_at, '+00:00', '+00:00'), '%Y-%m-%d %H:%i:00')"
+  }
+
+  if (granularity === 'hour') {
+    return "DATE_FORMAT(CONVERT_TZ(checked_at, '+00:00', '+00:00'), '%Y-%m-%d %H:00:00')"
+  }
+
+  return "DATE_FORMAT(CONVERT_TZ(checked_at, '+00:00', '+00:00'), '%Y-%m-%d 00:00:00')"
+}
+
+const parseStatsGranularity = (value: unknown): StatsGranularity => {
+  const normalized = String(value ?? 'hour').trim().toLowerCase() as StatsGranularity
+  return ALLOWED_STATS_GRANULARITIES.has(normalized) ? normalized : 'hour'
+}
+
+const parseStatsRangeDays = (value: unknown, granularity: StatsGranularity): number => {
+  const maxRangeDays = MAX_RANGE_DAYS_BY_GRANULARITY[granularity]
+  const parsed = toInteger(value, maxRangeDays) ?? maxRangeDays
+  return Math.max(1, Math.min(parsed, maxRangeDays))
+}
+
+const parseStatsMode = (value: unknown): StatsMode => {
+  const normalized = String(value ?? 'aggregate').trim().toLowerCase() as StatsMode
+  return ALLOWED_STATS_MODES.has(normalized) ? normalized : 'aggregate'
 }
 
 const getMappedEndpointById = async (endpointId: number): Promise<Record<string, any> | null> => {
@@ -949,23 +986,66 @@ app.post('/api/endpoints/:id/resume', requireEditor, async (req: Request, res: R
 
 app.get('/api/endpoints/:id/runs', async (req: Request, res: Response) => {
   const id = toInteger(req.params.id, NaN)
+  const mode = parseStatsMode(req.query.mode)
+  const granularity = parseStatsGranularity(req.query.granularity)
+  const rangeDays = parseStatsRangeDays(req.query.range_days, granularity)
 
   if (!Number.isInteger(id) || id < 1) {
     return res.status(400).json({ error: 'Invalid endpoint id' })
   }
 
+  if (mode === 'raw') {
+    const [rows] = await pool.query(
+      `
+        SELECT
+          id,
+          status,
+          response_code,
+          matched_value,
+          error_message,
+          response_time_ms,
+          checked_at
+        FROM monitor_check_runs
+        WHERE endpoint_id = ?
+        ORDER BY checked_at DESC
+        LIMIT 50
+      `,
+      [id],
+    )
+
+    return res.json({
+      mode,
+      retention_days: 90,
+      points: rows,
+    })
+  }
+
+  const bucketSql = getStatsBucketSql(granularity)
   const [rows] = await pool.query(
     `
-      SELECT *
+      SELECT
+        ${bucketSql} AS bucket_start,
+        ROUND(AVG(response_time_ms)) AS avg_response_time_ms,
+        COUNT(*) AS check_count,
+        SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) AS up_count,
+        SUM(CASE WHEN status = 'down' THEN 1 ELSE 0 END) AS down_count,
+        MAX(checked_at) AS latest_checked_at
       FROM monitor_check_runs
       WHERE endpoint_id = ?
-      ORDER BY checked_at DESC
-      LIMIT 50
+        AND checked_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+      GROUP BY bucket_start
+      ORDER BY bucket_start ASC
     `,
-    [id],
+    [id, rangeDays],
   )
 
-  res.json(rows)
+  res.json({
+    mode,
+    granularity,
+    range_days: rangeDays,
+    retention_days: 90,
+    points: rows,
+  })
 })
 
 app.delete('/api/endpoints/:id/runs', requireEditor, async (req: Request, res: Response) => {

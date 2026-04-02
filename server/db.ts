@@ -83,7 +83,17 @@ const MIGRATIONS = [
         )
       `)
     },
-  }
+  },
+  {
+    version: 4,
+    name: 'add_monitor_check_runs_indexes',
+    up: async () => {
+      await pool.query(`
+        CREATE INDEX idx_monitor_check_runs_endpoint_checked_at
+        ON monitor_check_runs (endpoint_id, checked_at)
+      `)
+    },
+  },
 ]
 
 async function ensureSchemaMigrationsTable() {

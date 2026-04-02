@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FaChevronDown, FaChevronRight } from "react-icons/fa";
-import { monitoringService } from "./services/monitoringService";
+import {
+    monitoringService,
+    type StatsGranularity,
+} from "./services/monitoringService";
 
 const METHOD_OPTIONS = [
     "GET",
@@ -44,6 +47,35 @@ const INITIAL_ENDPOINT_FORM = {
     interval_seconds: 60,
     down_retries: 3,
     up_retries: 1,
+};
+
+const STATUS_GRANULARITY_OPTIONS: Array<{
+    value: StatsGranularity;
+    label: string;
+}> = [
+    { value: "minute", label: "Minute" },
+    { value: "hour", label: "Hour" },
+    { value: "day", label: "Day" },
+];
+
+const STATUS_RANGE_OPTIONS: Record<
+    StatsGranularity,
+    Array<{ value: number; label: string }>
+> = {
+    minute: [
+        { value: 1, label: "Last 24h" },
+        { value: 2, label: "Last 48h" },
+    ],
+    hour: [
+        { value: 1, label: "Last 24h" },
+        { value: 7, label: "Last 7d" },
+        { value: 30, label: "Last 30d" },
+    ],
+    day: [
+        { value: 7, label: "Last 7d" },
+        { value: 30, label: "Last 30d" },
+        { value: 90, label: "Last 90d" },
+    ],
 };
 
 function formatRelativeTime(input, nowMs = Date.now()) {
@@ -104,17 +136,131 @@ function getGroupStatus(endpoints) {
     return "pending";
 }
 
-function LatencySparkline({ runs }) {
+function getBucketStart(input, granularity) {
+    const date = new Date(input);
+    if (Number.isNaN(date.getTime())) return null;
+
+    if (granularity === "day") {
+        date.setUTCHours(0, 0, 0, 0);
+        return date.toISOString();
+    }
+
+    if (granularity === "hour") {
+        date.setUTCMinutes(0, 0, 0);
+        return date.toISOString();
+    }
+
+    date.setUTCSeconds(0, 0);
+    return date.toISOString();
+}
+
+function clampRunsToRange(runs, rangeDays) {
+    const cutoff = Date.now() - rangeDays * 24 * 60 * 60 * 1000;
+    return runs.filter((run) => {
+        const timestamp = new Date(
+            run.bucket_start ?? run.checked_at ?? run.latest_checked_at,
+        ).getTime();
+        return Number.isFinite(timestamp) && timestamp >= cutoff;
+    });
+}
+
+function mergeRealtimeRun(
+    existingRuns,
+    payload,
+    statusViewMode,
+    statusGranularity,
+    statusRangeDays,
+) {
+    if (statusViewMode === "raw") {
+        const nextRun = {
+            response_time_ms: payload.responseTimeMs ?? 0,
+            checked_at: payload.lastCheckedAt ?? new Date().toISOString(),
+            response_code: payload.responseCode ?? null,
+            status: payload.status ?? null,
+            error_message: payload.lastError ?? null,
+        };
+
+        return [nextRun, ...(existingRuns ?? [])].slice(0, 50);
+    }
+
+    const bucketStart = getBucketStart(payload.lastCheckedAt, statusGranularity);
+    if (!bucketStart) return existingRuns ?? [];
+
+    const nextRuns = [...(existingRuns ?? [])];
+    const bucketIndex = nextRuns.findIndex(
+        (run) => run.bucket_start === bucketStart,
+    );
+
+    if (bucketIndex >= 0) {
+        const currentBucket = nextRuns[bucketIndex];
+        const currentCount = Number(currentBucket.check_count ?? 0);
+        const nextCount = currentCount + 1;
+        const currentAverage = Number(currentBucket.avg_response_time_ms ?? 0);
+        const nextAverage = Math.round(
+            (currentAverage * currentCount +
+                Number(payload.responseTimeMs ?? 0)) /
+                nextCount,
+        );
+
+        nextRuns[bucketIndex] = {
+            ...currentBucket,
+            avg_response_time_ms: nextAverage,
+            check_count: nextCount,
+            up_count:
+                Number(currentBucket.up_count ?? 0) +
+                (payload.status === "up" ? 1 : 0),
+            down_count:
+                Number(currentBucket.down_count ?? 0) +
+                (payload.status === "down" ? 1 : 0),
+            latest_checked_at: payload.lastCheckedAt ?? bucketStart,
+        };
+    } else {
+        nextRuns.push({
+            bucket_start: bucketStart,
+            avg_response_time_ms: Number(payload.responseTimeMs ?? 0),
+            check_count: 1,
+            up_count: payload.status === "up" ? 1 : 0,
+            down_count: payload.status === "down" ? 1 : 0,
+            latest_checked_at: payload.lastCheckedAt ?? bucketStart,
+        });
+    }
+
+    return clampRunsToRange(
+        nextRuns.sort(
+            (left, right) =>
+                new Date(left.bucket_start).getTime() -
+                new Date(right.bucket_start).getTime(),
+        ),
+        statusRangeDays,
+    );
+}
+
+function LatencySparkline({ runs, granularity, statusViewMode }) {
     const containerRef = useRef(null);
     const [hoveredPoint, setHoveredPoint] = useState(null);
 
     const points = useMemo(() => {
         return (runs ?? [])
-            .slice(0, 24)
-            .reverse()
             .map((run) => ({
-                latency: Number(run.response_time_ms) || 0,
-                checkedAt: run.checked_at,
+                latency:
+                    Number(
+                        run.avg_response_time_ms ?? run.response_time_ms,
+                    ) || 0,
+                checkedAt:
+                    run.bucket_start ??
+                    run.checked_at ??
+                    run.latest_checked_at,
+                checkCount: Number(run.check_count ?? 1) || 1,
+                upCount: Number(run.up_count ?? 0) || 0,
+                downCount: Number(run.down_count ?? 0) || 0,
+            }))
+            .sort(
+                (left, right) =>
+                    new Date(left.checkedAt).getTime() -
+                    new Date(right.checkedAt).getTime(),
+            )
+            .map((run) => ({
+                ...run,
             }));
     }, [runs]);
 
@@ -261,9 +407,21 @@ function LatencySparkline({ runs }) {
                         {hoveredPoint.latency} ms
                     </p>
                     <p className="mt-0.5 text-slate-600">
-                        Triggered:{" "}
+                        {statusViewMode === "raw"
+                            ? "Triggered"
+                            : granularity === "minute"
+                              ? "Minute bucket"
+                              : granularity === "hour"
+                                ? "Hour bucket"
+                                : "Day bucket"}
+                        :{" "}
                         {formatFriendlyDateTime(hoveredPoint.checkedAt)}
                     </p>
+                    {statusViewMode === "raw" ? null : (
+                        <p className="mt-0.5 text-slate-600">
+                            Checks: {hoveredPoint.checkCount}
+                        </p>
+                    )}
                 </div>
             )}
             <div className="mt-1 flex items-center justify-between text-[11px] text-slate-500">
@@ -274,7 +432,19 @@ function LatencySparkline({ runs }) {
     );
 }
 
-function StatusPage({ groups, endpoints, runsByEndpoint, health, isLoading }) {
+function StatusPage({
+    groups,
+    endpoints,
+    runsByEndpoint,
+    health,
+    isLoading,
+    statusViewMode,
+    statusGranularity,
+    statusRangeDays,
+    onViewModeChange,
+    onGranularityChange,
+    onRangeChange,
+}) {
     const groupedEndpoints = useMemo(() => {
         return groups.map((group) => ({
             ...group,
@@ -359,6 +529,102 @@ function StatusPage({ groups, endpoints, runsByEndpoint, health, isLoading }) {
                             </p>
                         </div>
                     </div>
+                    <div className="mt-5 flex flex-wrap items-center gap-3">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
+                                View
+                            </span>
+                            <div className="flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur">
+                                {[
+                                    {
+                                        value: "aggregate",
+                                        label: "Trend",
+                                    },
+                                    { value: "raw", label: "Last 50 checks" },
+                                ].map((option) => (
+                                    <button
+                                        key={option.value}
+                                        type="button"
+                                        onClick={() =>
+                                            onViewModeChange(option.value)
+                                        }
+                                        className={`cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                                            statusViewMode === option.value
+                                                ? "bg-slate-900 text-white shadow"
+                                                : "text-slate-600 hover:bg-white/75"
+                                        }`}
+                                    >
+                                        {option.label}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        <div
+                            className={`flex items-center gap-2 ${
+                                statusViewMode === "raw" ? "opacity-50" : ""
+                            }`}
+                        >
+                            <span className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
+                                Resolution
+                            </span>
+                            <div className="flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur">
+                                {STATUS_GRANULARITY_OPTIONS.map((option) => (
+                                    <button
+                                        key={option.value}
+                                        type="button"
+                                        onClick={() =>
+                                            onGranularityChange(option.value)
+                                        }
+                                        disabled={statusViewMode === "raw"}
+                                        className={`cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                                            statusGranularity === option.value
+                                                ? "bg-slate-900 text-white shadow"
+                                                : "text-slate-600 hover:bg-white/75"
+                                        }`}
+                                    >
+                                        {option.label}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        <div
+                            className={`flex items-center gap-2 ${
+                                statusViewMode === "raw" ? "opacity-50" : ""
+                            }`}
+                        >
+                            <label
+                                htmlFor="status-range"
+                                className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500"
+                            >
+                                Window
+                            </label>
+                            <select
+                                id="status-range"
+                                value={statusRangeDays}
+                                onChange={(event) =>
+                                    onRangeChange(Number(event.target.value))
+                                }
+                                disabled={statusViewMode === "raw"}
+                                className="cursor-pointer rounded-full border border-white/70 bg-white/65 px-4 py-2 text-sm text-slate-700 backdrop-blur focus:outline-none focus:ring-2 focus:ring-cyan-300/70"
+                            >
+                                {STATUS_RANGE_OPTIONS[statusGranularity].map(
+                                    (option) => (
+                                        <option
+                                            key={option.value}
+                                            value={option.value}
+                                        >
+                                            {option.label}
+                                        </option>
+                                    ),
+                                )}
+                            </select>
+                        </div>
+                        <p className="text-xs text-slate-500">
+                            {statusViewMode === "raw"
+                                ? "Showing the latest 50 raw checks."
+                                : "History retained for the last 90 days."}
+                        </p>
+                    </div>
                 </header>
 
                 {isLoading ? (
@@ -442,6 +708,12 @@ function StatusPage({ groups, endpoints, runsByEndpoint, health, isLoading }) {
                                                     runsByEndpoint[
                                                         endpoint.id
                                                     ] ?? []
+                                                }
+                                                granularity={
+                                                    statusGranularity
+                                                }
+                                                statusViewMode={
+                                                    statusViewMode
                                                 }
                                             />
                                         </article>
@@ -1472,6 +1744,10 @@ function App() {
     const [groups, setGroups] = useState([]);
     const [endpoints, setEndpoints] = useState([]);
     const [runsByEndpoint, setRunsByEndpoint] = useState({});
+    const [statusViewMode, setStatusViewMode] = useState("aggregate");
+    const [statusGranularity, setStatusGranularity] =
+        useState<StatsGranularity>("hour");
+    const [statusRangeDays, setStatusRangeDays] = useState(7);
     const [endpointForm, setEndpointForm] = useState(INITIAL_ENDPOINT_FORM);
     const [editingEndpointId, setEditingEndpointId] = useState(null);
     const [isLoading, setIsLoading] = useState(true);
@@ -1529,14 +1805,15 @@ function App() {
         window.location.replace(`/login?returnTo=${returnTo}`);
     }, [authChecked, isAuthenticated, isMonitorsPage, pathname]);
 
-    const loadRuns = useCallback(async (endpointList) => {
+    const loadRuns = useCallback(async (endpointList, options = {}) => {
         const runEntries = await Promise.all(
             endpointList.map(async (endpoint) => {
                 try {
-                    const runs = await monitoringService.getEndpointRuns(
+                    const response = await monitoringService.getEndpointRuns(
                         endpoint.id,
+                        options,
                     );
-                    return [endpoint.id, runs];
+                    return [endpoint.id, response?.points ?? []];
                 } catch {
                     return [endpoint.id, []];
                 }
@@ -1575,7 +1852,11 @@ function App() {
             );
 
             if (isStatusPage) {
-                await loadRuns(endpointsRes);
+                await loadRuns(endpointsRes, {
+                    mode: statusViewMode,
+                    granularity: statusGranularity,
+                    rangeDays: statusRangeDays,
+                });
             }
         } catch (requestError) {
             setError(requestError.message);
@@ -1585,11 +1866,23 @@ function App() {
     }, [
         isStatusPage,
         loadRuns,
+        statusGranularity,
+        statusRangeDays,
+        statusViewMode,
         isHomePage,
         isLoginPage,
         isMonitorsPage,
         isAuthenticated,
     ]);
+
+    useEffect(() => {
+        const allowedRanges = STATUS_RANGE_OPTIONS[statusGranularity];
+        if (
+            !allowedRanges.some((option) => option.value === statusRangeDays)
+        ) {
+            setStatusRangeDays(allowedRanges[0].value);
+        }
+    }, [statusGranularity, statusRangeDays]);
 
     useEffect(() => {
         if ((isMonitorsPage || isLoginPage) && !authChecked) return;
@@ -1674,22 +1967,14 @@ function App() {
                         const endpointId = payload.endpointId;
                         if (!endpointId) return current;
 
-                        const existingRuns = current[endpointId] ?? [];
-                        const nextRun = {
-                            response_time_ms: payload.responseTimeMs ?? 0,
-                            checked_at:
-                                payload.lastCheckedAt ??
-                                new Date().toISOString(),
-                            response_code: payload.responseCode ?? null,
-                            status: payload.status ?? null,
-                            error_message: payload.lastError ?? null,
-                        };
-
                         return {
                             ...current,
-                            [endpointId]: [nextRun, ...existingRuns].slice(
-                                0,
-                                50,
+                            [endpointId]: mergeRealtimeRun(
+                                current[endpointId] ?? [],
+                                payload,
+                                statusViewMode,
+                                statusGranularity,
+                                statusRangeDays,
                             ),
                         };
                     });
@@ -1759,7 +2044,14 @@ function App() {
         return () => {
             socket.close();
         };
-    }, [apiBase, isHomePage, isLoginPage]);
+    }, [
+        apiBase,
+        isHomePage,
+        isLoginPage,
+        statusGranularity,
+        statusRangeDays,
+        statusViewMode,
+    ]);
 
     const handleEndpointSubmit = async (event) => {
         event.preventDefault();
@@ -2038,6 +2330,12 @@ function App() {
                 runsByEndpoint={runsByEndpoint}
                 health={health}
                 isLoading={isLoading}
+                statusViewMode={statusViewMode}
+                statusGranularity={statusGranularity}
+                statusRangeDays={statusRangeDays}
+                onViewModeChange={setStatusViewMode}
+                onGranularityChange={setStatusGranularity}
+                onRangeChange={setStatusRangeDays}
             />
         );
     }
