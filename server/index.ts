@@ -148,6 +148,54 @@ const toInteger = (value: unknown, fallback: number | null = null): number | nul
   return Math.trunc(parsed)
 }
 
+const SENSITIVE_JSON_KEYS = new Set(['password', 'pass', 'pwd'])
+const MASKED_JSON_VALUE = '*****'
+
+const isSensitiveJsonKey = (key: string): boolean =>
+  SENSITIVE_JSON_KEYS.has(String(key).trim().toLowerCase())
+
+const maskSensitiveJson = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => maskSensitiveJson(item))
+  }
+
+  if (value && typeof value === 'object') {
+    const masked: JsonObject = {}
+    for (const [key, val] of Object.entries(value as JsonObject)) {
+      if (isSensitiveJsonKey(key) && val != null && val !== '') {
+        masked[key] = MASKED_JSON_VALUE
+      } else {
+        masked[key] = maskSensitiveJson(val)
+      }
+    }
+    return masked
+  }
+
+  return value
+}
+
+const restoreMaskedJson = (incoming: unknown, existing: unknown): unknown => {
+  if (Array.isArray(incoming)) return incoming
+
+  if (incoming && typeof incoming === 'object') {
+    const existingObj =
+      existing && typeof existing === 'object' && !Array.isArray(existing)
+        ? (existing as JsonObject)
+        : {}
+    const result: JsonObject = {}
+    for (const [key, val] of Object.entries(incoming as JsonObject)) {
+      if (isSensitiveJsonKey(key) && val === MASKED_JSON_VALUE && key in existingObj) {
+        result[key] = existingObj[key]
+      } else {
+        result[key] = val
+      }
+    }
+    return result
+  }
+
+  return incoming
+}
+
 const parseJsonObjectInput = (value: unknown, fieldLabel: string): JsonObject => {
   if (value == null || value === '') return {}
 
@@ -320,7 +368,7 @@ const mapEndpointRow = (row: Record<string, any>): Record<string, any> => {
     ...row,
     is_paused: Number(row.is_paused) === 1,
     headers_json: parseOrDefault(row.headers_json, {}),
-    connection_json: parseOrDefault(row.connection_json, {}),
+    connection_json: maskSensitiveJson(parseOrDefault(row.connection_json, {})) as JsonObject,
   }
 }
 
@@ -817,9 +865,43 @@ app.put('/api/endpoints/:id', requireEditor, async (req: Request, res: Response)
     return res.status(400).json({ error: 'Invalid endpoint id' })
   }
 
+  const [existingRows] = await pool.query(
+    'SELECT connection_json FROM monitor_endpoints WHERE id = ? LIMIT 1',
+    [id],
+  )
+  const existingConnection: JsonObject = existingRows.length
+    ? (() => {
+        const raw = existingRows[0].connection_json
+        if (!raw) return {}
+        if (typeof raw === 'object') return raw as JsonObject
+        try {
+          const parsed = JSON.parse(String(raw))
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as JsonObject)
+            : {}
+        } catch {
+          return {}
+        }
+      })()
+    : {}
+
+  const incomingBody: JsonObject = { ...(req.body ?? {}) }
+  if (incomingBody.connection_json != null && incomingBody.connection_json !== '') {
+    try {
+      const incomingConnection = parseJsonObjectInput(
+        incomingBody.connection_json,
+        'connection_json',
+      )
+      const restored = restoreMaskedJson(incomingConnection, existingConnection) as JsonObject
+      incomingBody.connection_json = JSON.stringify(restored)
+    } catch {
+      // Leave as-is; normalizeEndpointPayload will surface the parse error.
+    }
+  }
+
   let payload
   try {
-    payload = normalizeEndpointPayload(req.body)
+    payload = normalizeEndpointPayload(incomingBody)
   } catch (error) {
     return res.status(400).json({ error: error.message })
   }
