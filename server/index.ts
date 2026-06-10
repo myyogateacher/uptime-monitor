@@ -12,6 +12,9 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { config } from './config'
 import { initDatabase, pool } from './db'
 import {
+  CRON_CREATED_EVENT,
+  CRON_DELETED_EVENT,
+  CRON_UPDATED_EVENT,
   ENDPOINT_CREATED_EVENT,
   ENDPOINT_DELETED_EVENT,
   ENDPOINT_UPDATED_EVENT,
@@ -93,6 +96,18 @@ monitorEvents.on(ENDPOINT_UPDATED_EVENT, (payload) => {
 
 monitorEvents.on(ENDPOINT_DELETED_EVENT, (payload) => {
   broadcast(ENDPOINT_DELETED_EVENT, payload)
+})
+
+monitorEvents.on(CRON_CREATED_EVENT, (payload) => {
+  broadcast(CRON_CREATED_EVENT, payload)
+})
+
+monitorEvents.on(CRON_UPDATED_EVENT, (payload) => {
+  broadcast(CRON_UPDATED_EVENT, payload)
+})
+
+monitorEvents.on(CRON_DELETED_EVENT, (payload) => {
+  broadcast(CRON_DELETED_EVENT, payload)
 })
 
 const corsOptions: CorsOptions = {
@@ -370,6 +385,94 @@ const mapEndpointRow = (row: Record<string, any>): Record<string, any> => {
     headers_json: parseOrDefault(row.headers_json, {}),
     connection_json: maskSensitiveJson(parseOrDefault(row.connection_json, {})) as JsonObject,
   }
+}
+
+const CRON_TRIGGER_TYPES = new Set(['nats', 'http'])
+const CRON_HTTP_METHODS = new Set(['GET', 'POST', 'NONE'])
+const CRON_NAME_PATTERN = /^[A-Za-z0-9_.:-]+$/
+
+const normalizeCronPayload = (payload: JsonObject): JsonObject => {
+  const cron = String(payload.cron ?? '').trim()
+  const expression = String(payload.expression ?? '').trim()
+  const service = String(payload.service ?? '').trim()
+  const endpoint = String(payload.endpoint ?? '').trim()
+  const triggerType = String(payload.trigger_type ?? 'nats').trim().toLowerCase()
+  const httpMethod = String(payload.http_method ?? 'NONE').trim().toUpperCase()
+  const startWindowSeconds = toInteger(payload.start_window_seconds, NaN)
+  const pingWindowSeconds = toInteger(payload.ping_window_seconds, NaN)
+  const status = Number(payload.status ?? 1) ? 1 : 0
+  const trackRun = Number(payload.track_run ?? 1) ? 1 : 0
+
+  if (!cron) throw new Error('Cron name is required')
+  if (cron.length > 100) throw new Error('Cron name must be at most 100 characters')
+  if (!CRON_NAME_PATTERN.test(cron)) {
+    throw new Error('Cron name may only contain letters, numbers, "_", "-", "." and ":"')
+  }
+
+  if (!expression) throw new Error('Cron expression is required')
+  if (expression.length > 100) throw new Error('Cron expression must be at most 100 characters')
+  if (expression.split(/\s+/).length !== 5) {
+    throw new Error('Cron expression must have 5 fields (minute hour day month weekday)')
+  }
+
+  if (service.length > 255) throw new Error('Service must be at most 255 characters')
+  if (endpoint.length > 256) throw new Error('Endpoint must be at most 256 characters')
+
+  if (!CRON_TRIGGER_TYPES.has(triggerType)) {
+    throw new Error('trigger_type must be one of nats, http')
+  }
+
+  if (!CRON_HTTP_METHODS.has(httpMethod)) {
+    throw new Error('http_method must be one of GET, POST, NONE')
+  }
+
+  if (triggerType === 'http') {
+    if (!endpoint) throw new Error('Endpoint is required for HTTP triggers')
+    try {
+      const parsedUrl = new URL(endpoint)
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('invalid protocol')
+      }
+    } catch {
+      throw new Error('Endpoint must be a valid absolute http(s) URL')
+    }
+    if (httpMethod === 'NONE') {
+      throw new Error('http_method must be GET or POST for HTTP triggers')
+    }
+  }
+
+  if (!Number.isInteger(startWindowSeconds) || startWindowSeconds < 0) {
+    throw new Error('start_window_seconds must be a non-negative integer')
+  }
+
+  if (!Number.isInteger(pingWindowSeconds) || pingWindowSeconds < 0) {
+    throw new Error('ping_window_seconds must be a non-negative integer')
+  }
+
+  return {
+    cron,
+    expression,
+    service,
+    endpoint,
+    trigger_type: triggerType,
+    http_method: triggerType === 'http' ? httpMethod : 'NONE',
+    start_window_seconds: startWindowSeconds,
+    ping_window_seconds: pingWindowSeconds,
+    status,
+    track_run: trackRun,
+  }
+}
+
+const mapCronRow = (row: Record<string, any>): Record<string, any> => ({
+  ...row,
+  status: Number(row.status) === 1,
+  track_run: Number(row.track_run) === 1,
+})
+
+const getMappedCronByName = async (cronName: string): Promise<Record<string, any> | null> => {
+  const [rows] = await pool.query('SELECT * FROM cron_monitoring WHERE cron = ? LIMIT 1', [cronName])
+  if (!rows.length) return null
+  return mapCronRow(rows[0])
 }
 
 const getStatsBucketSql = (granularity: StatsGranularity): string => {
@@ -1148,6 +1251,131 @@ app.delete('/api/endpoints/:id/runs', requireEditor, async (req: Request, res: R
     endpointId: id,
     deletedRuns: result.affectedRows ?? 0,
   })
+})
+
+app.get('/api/crons', async (_req: Request, res: Response) => {
+  const [rows] = await pool.query('SELECT * FROM cron_monitoring ORDER BY cron ASC')
+  res.json(rows.map(mapCronRow))
+})
+
+app.post('/api/crons', requireEditor, async (req: Request, res: Response) => {
+  let payload
+
+  try {
+    payload = normalizeCronPayload(req.body)
+  } catch (error) {
+    return res.status(400).json({ error: error.message })
+  }
+
+  try {
+    await pool.query(
+      `
+        INSERT INTO cron_monitoring (
+          cron,
+          expression,
+          service,
+          endpoint,
+          trigger_type,
+          http_method,
+          start_window_seconds,
+          ping_window_seconds,
+          status,
+          track_run
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        payload.cron,
+        payload.expression,
+        payload.service,
+        payload.endpoint,
+        payload.trigger_type,
+        payload.http_method,
+        payload.start_window_seconds,
+        payload.ping_window_seconds,
+        payload.status,
+        payload.track_run,
+      ],
+    )
+  } catch (error) {
+    if (error?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: `Cron "${payload.cron}" already exists` })
+    }
+    throw error
+  }
+
+  const createdCron = await getMappedCronByName(String(payload.cron))
+  monitorEvents.emit(CRON_CREATED_EVENT, createdCron)
+  return res.status(201).json(createdCron)
+})
+
+app.put('/api/crons/:cron', requireEditor, async (req: Request, res: Response) => {
+  const cronName = String(req.params.cron ?? '').trim()
+
+  if (!cronName) {
+    return res.status(400).json({ error: 'Invalid cron name' })
+  }
+
+  let payload
+  try {
+    // The cron name is the primary key; renames are not supported.
+    payload = normalizeCronPayload({ ...(req.body ?? {}), cron: cronName })
+  } catch (error) {
+    return res.status(400).json({ error: error.message })
+  }
+
+  const [result] = await pool.query(
+    `
+      UPDATE cron_monitoring
+      SET
+        expression = ?,
+        service = ?,
+        endpoint = ?,
+        trigger_type = ?,
+        http_method = ?,
+        start_window_seconds = ?,
+        ping_window_seconds = ?,
+        status = ?,
+        track_run = ?
+      WHERE cron = ?
+    `,
+    [
+      payload.expression,
+      payload.service,
+      payload.endpoint,
+      payload.trigger_type,
+      payload.http_method,
+      payload.start_window_seconds,
+      payload.ping_window_seconds,
+      payload.status,
+      payload.track_run,
+      cronName,
+    ],
+  )
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Cron not found' })
+  }
+
+  const updatedCron = await getMappedCronByName(cronName)
+  monitorEvents.emit(CRON_UPDATED_EVENT, updatedCron)
+  return res.json(updatedCron)
+})
+
+app.delete('/api/crons/:cron', requireEditor, async (req: Request, res: Response) => {
+  const cronName = String(req.params.cron ?? '').trim()
+
+  if (!cronName) {
+    return res.status(400).json({ error: 'Invalid cron name' })
+  }
+
+  const [result] = await pool.query('DELETE FROM cron_monitoring WHERE cron = ?', [cronName])
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Cron not found' })
+  }
+
+  monitorEvents.emit(CRON_DELETED_EVENT, { cron: cronName })
+  return res.status(204).send()
 })
 
 app.use('/api', (err: unknown, _req: Request, res: Response, next: NextFunction) => {
