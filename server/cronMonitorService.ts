@@ -488,6 +488,11 @@ async function tick() {
   isTickRunning = true
 
   try {
+    // Master switch persisted in app_settings: when off, nothing fires, no
+    // sweeping and no missed-run alerts. Stale occurrences accumulated while
+    // off are skipped by the catch-up grace logic once re-enabled.
+    if (!(await isCronMonitorEnabled())) return
+
     if (Date.now() - lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
       await pool.query(
         'DELETE FROM cron_runs WHERE triggered_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)',

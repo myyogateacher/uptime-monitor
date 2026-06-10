@@ -143,6 +143,15 @@ export const monitoringService = {
       method: 'DELETE',
     })
   },
+  getCronSettings() {
+    return request('/api/crons/settings')
+  },
+  updateCronSettings(input: { enabled: boolean }) {
+    return request('/api/crons/settings', {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    })
+  },
   getCronRuns(cronName, options: { limit?: number; rangeDays?: number } = {}) {
     const params = new URLSearchParams()
     if (options.limit) params.set('limit', String(options.limit))

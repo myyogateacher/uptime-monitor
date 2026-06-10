@@ -1196,6 +1196,8 @@ function AdminPage({
     handleCancelCronEdit,
     handleStartEditCron,
     handleDeleteCron,
+    cronMonitorEnabled,
+    handleToggleCronMonitor,
     currentTimeMs,
     error,
 }) {
@@ -2081,6 +2083,39 @@ function AdminPage({
                         <h2 className="text-lg font-semibold">
                             Cron Health
                         </h2>
+                        <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-white/60 bg-white/45 px-3 py-2.5 backdrop-blur">
+                            <div>
+                                <p className="text-sm font-medium text-slate-700">
+                                    Cron trigger + health monitoring
+                                </p>
+                                <p className="text-xs text-slate-500">
+                                    {cronMonitorEnabled
+                                        ? "Enabled — crons are triggered on schedule and runs are tracked."
+                                        : "Disabled — no triggers fire and run health is not tracked."}
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                role="switch"
+                                aria-checked={cronMonitorEnabled}
+                                aria-label="Toggle cron trigger and health monitoring"
+                                onClick={handleToggleCronMonitor}
+                                disabled={!canEdit}
+                                className={`relative h-6 w-11 shrink-0 cursor-pointer rounded-full transition ${
+                                    cronMonitorEnabled
+                                        ? "bg-emerald-500"
+                                        : "bg-slate-300"
+                                } disabled:cursor-not-allowed disabled:opacity-60`}
+                            >
+                                <span
+                                    className={`absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                                        cronMonitorEnabled
+                                            ? "translate-x-5"
+                                            : ""
+                                    }`}
+                                />
+                            </button>
+                        </div>
                         {!canEdit ? (
                             <p className="mt-2 rounded-md border border-amber-200/80 bg-amber-50/75 px-3 py-2 text-xs text-amber-700">
                                 You have read-only access. Editing actions are
@@ -2599,6 +2634,7 @@ function App() {
     const [editingCronName, setEditingCronName] = useState(null);
     const [isSavingCron, setIsSavingCron] = useState(false);
     const [statusTab, setStatusTab] = useState("services");
+    const [cronMonitorEnabled, setCronMonitorEnabled] = useState(false);
     const [cronRunsByName, setCronRunsByName] = useState({});
     const [cronRunsMode, setCronRunsMode] = useState("recent");
     const [cronWindowDays, setCronWindowDays] = useState(7);
@@ -2731,6 +2767,15 @@ function App() {
                     ? { ...current, group_name: groupsRes[0].name }
                     : current,
             );
+
+            if (isMonitorsPage) {
+                try {
+                    const settings = await monitoringService.getCronSettings();
+                    setCronMonitorEnabled(Boolean(settings?.enabled));
+                } catch {
+                    setCronMonitorEnabled(false);
+                }
+            }
 
             if (isMonitorsPage || isStatusPage) {
                 try {
@@ -3360,6 +3405,22 @@ function App() {
         window.scrollTo({ top: 0, behavior: "smooth" });
     };
 
+    const handleToggleCronMonitor = async () => {
+        setError("");
+        if (!canEdit) {
+            setError("You do not have permission to edit crons");
+            return;
+        }
+        try {
+            const response = await monitoringService.updateCronSettings({
+                enabled: !cronMonitorEnabled,
+            });
+            setCronMonitorEnabled(Boolean(response?.enabled));
+        } catch (requestError) {
+            setError(requestError.message);
+        }
+    };
+
     const handleCancelCronEdit = () => {
         setEditingCronName(null);
         setCronForm(INITIAL_CRON_FORM);
@@ -3456,6 +3517,8 @@ function App() {
             handleCancelCronEdit={handleCancelCronEdit}
             handleStartEditCron={handleStartEditCron}
             handleDeleteCron={handleDeleteCron}
+            cronMonitorEnabled={cronMonitorEnabled}
+            handleToggleCronMonitor={handleToggleCronMonitor}
             currentTimeMs={currentTimeMs}
             error={error}
         />
