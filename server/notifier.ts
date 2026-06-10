@@ -1,9 +1,47 @@
-import { config } from './config'
+import { config, type NotificationTarget } from './config'
 
-const isValidEvent = (status) => status === "up" || status === "down";
+export type MonitorStatusChangeEvent = {
+    endpointId: number;
+    endpointName: string;
+    groupId: number;
+    groupName: string | null;
+    monitorType: string;
+    url: string;
+    previousStatus: string | null;
+    currentStatus: string;
+    responseCode: number | null;
+    responseTimeMs: number | null;
+    checkedAt: string;
+    errorMessage: string | null;
+    matchedValue: string | null;
+};
+
+export type CronRunNotificationEvent = {
+    cron: string;
+    runId: string;
+    outcome: string;
+    expression: string | null;
+    service: string | null;
+    triggerType: string | null;
+    pings: number;
+    triggeredAt: string | Date | null;
+    firstPingAt: string | Date | null;
+    lastPingAt: string | Date | null;
+    durationMs: number | null;
+    reason: string | null;
+};
+
+type JsonPayload = Record<string, unknown>;
+
+const isValidEvent = (status: unknown): boolean =>
+    status === "up" || status === "down";
 const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
 
-const postJson = async (url, payload, headers = {}) => {
+const postJson = async (
+    url: string,
+    payload: JsonPayload,
+    headers: Record<string, string> = {},
+): Promise<void> => {
     const response = await fetch(url, {
         method: "POST",
         headers: {
@@ -21,7 +59,7 @@ const postJson = async (url, payload, headers = {}) => {
     }
 };
 
-const buildSlackPayload = (event) => {
+const buildSlackPayload = (event: MonitorStatusChangeEvent): JsonPayload => {
     const isUp = event.currentStatus === "up";
     const title = isUp ? "Monitor UP" : "Monitor DOWN";
     const color = isUp ? "#16a34a" : "#dc2626";
@@ -97,7 +135,7 @@ const buildSlackPayload = (event) => {
     };
 };
 
-const buildWebhookPayload = (event) => {
+const buildWebhookPayload = (event: MonitorStatusChangeEvent): JsonPayload => {
     return {
         source: "uptime-monitor",
         eventType: "monitor.status_changed",
@@ -121,7 +159,10 @@ const buildWebhookPayload = (event) => {
     };
 };
 
-const notifyTarget = async (target, event) => {
+const notifyTarget = async (
+    target: NotificationTarget,
+    event: MonitorStatusChangeEvent,
+): Promise<void> => {
     if (target.type === "slack") {
         const response = await fetch(SLACK_POST_MESSAGE_URL, {
             method: "POST",
@@ -148,7 +189,190 @@ const notifyTarget = async (target, event) => {
     await postJson(target.url, buildWebhookPayload(event), target.headers);
 };
 
-export async function notifyStatusChange(event) {
+const formatCronTimestamp = (
+    value: string | number | Date | null | undefined,
+): string => {
+    if (!value) return "n/a";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "n/a";
+    return date.toISOString();
+};
+
+const buildCronSlackPayload = (event: CronRunNotificationEvent): JsonPayload => {
+    const title = `Cron ${String(event.outcome ?? "failed").toUpperCase()}`;
+    const environment = String(config.nodeEnv ?? "unknown");
+    const duration =
+        event.durationMs == null
+            ? "n/a"
+            : `${(Number(event.durationMs) / 1000).toFixed(2)}s`;
+
+    return {
+        text: `[${environment}] ${title}: ${event.cron}`,
+        attachments: [
+            {
+                color: "#dc2626",
+                title: `[${environment}] ${title}: ${event.cron}`,
+                fields: [
+                    {
+                        title: "Cron",
+                        value: String(event.cron ?? "n/a"),
+                        short: true,
+                    },
+                    {
+                        title: "Outcome",
+                        value: String(event.outcome ?? "n/a").toUpperCase(),
+                        short: true,
+                    },
+                    {
+                        title: "Run ID",
+                        value: String(event.runId ?? "n/a"),
+                        short: false,
+                    },
+                    {
+                        title: "Expression",
+                        value: String(event.expression ?? "n/a"),
+                        short: true,
+                    },
+                    {
+                        title: "Trigger",
+                        value: String(event.triggerType ?? "n/a").toUpperCase(),
+                        short: true,
+                    },
+                    {
+                        title: "Duration",
+                        value: duration,
+                        short: true,
+                    },
+                    {
+                        title: "Pings",
+                        value: String(event.pings ?? 0),
+                        short: true,
+                    },
+                    {
+                        title: "First Ping",
+                        value: formatCronTimestamp(event.firstPingAt),
+                        short: true,
+                    },
+                    {
+                        title: "Last Ping",
+                        value: formatCronTimestamp(event.lastPingAt),
+                        short: true,
+                    },
+                    ...(event.service
+                        ? [
+                              {
+                                  title: "Service",
+                                  value: String(event.service),
+                                  short: true,
+                              },
+                          ]
+                        : []),
+                    {
+                        title: "Reason",
+                        value: String(event.reason ?? "unknown"),
+                        short: false,
+                    },
+                ],
+            },
+        ],
+    };
+};
+
+const buildCronWebhookPayload = (
+    event: CronRunNotificationEvent,
+): JsonPayload => {
+    return {
+        source: "uptime-monitor",
+        eventType: "cron.run_failed",
+        outcome: event.outcome,
+        cron: {
+            name: event.cron,
+            expression: event.expression ?? null,
+            service: event.service ?? null,
+            triggerType: event.triggerType ?? null,
+        },
+        run: {
+            runId: event.runId,
+            pings: event.pings ?? 0,
+            triggeredAt: event.triggeredAt ?? null,
+            firstPingAt: event.firstPingAt ?? null,
+            lastPingAt: event.lastPingAt ?? null,
+            durationMs: event.durationMs ?? null,
+            reason: event.reason ?? null,
+        },
+    };
+};
+
+const notifyCronTarget = async (
+    target: NotificationTarget,
+    event: CronRunNotificationEvent,
+): Promise<void> => {
+    if (target.type === "slack") {
+        const response = await fetch(SLACK_POST_MESSAGE_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${target.token}`,
+            },
+            body: JSON.stringify({
+                channel: target.channel,
+                ...buildCronSlackPayload(event),
+            }),
+        });
+
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload?.ok) {
+            const reason = payload?.error ?? "unknown_error";
+            throw new Error(
+                `Slack chat.postMessage failed (${response.status}): ${reason}`,
+            );
+        }
+        return;
+    }
+
+    await postJson(target.url, buildCronWebhookPayload(event), target.headers);
+};
+
+export async function notifyCronRun(
+    event: CronRunNotificationEvent,
+): Promise<void> {
+    console.log(
+        `[notify] cron run outcome cron=${event.cron} run=${event.runId} outcome=${event.outcome}`,
+    );
+    if (!config.notifications.enabled) return;
+    if (
+        !Array.isArray(config.notifications.targets) ||
+        !config.notifications.targets.length
+    )
+        return;
+
+    // Failed/missed runs map to 'down' for the existing per-target event filter.
+    const mappedEvent = event.outcome === "success" ? "up" : "down";
+
+    await Promise.all(
+        config.notifications.targets.map(async (target) => {
+            if (
+                Array.isArray(target.events) &&
+                !target.events.includes(mappedEvent)
+            )
+                return;
+
+            try {
+                await notifyCronTarget(target, event);
+            } catch (error) {
+                const message =
+                    error instanceof Error ? error.message : String(error);
+                console.error(
+                    `[notify] target=${target.name || target.type} cron=${event.cron} failed: ${message}`,
+                );
+            }
+        }),
+    );
+}
+
+export async function notifyStatusChange(
+    event: MonitorStatusChangeEvent,
+): Promise<void> {
     console.log(
         `[notify] status change detected for endpoint=${event.endpointId} status=${event.currentStatus}`,
     );
@@ -164,7 +388,7 @@ export async function notifyStatusChange(event) {
         config.notifications.targets.map(async (target) => {
             if (
                 Array.isArray(target.events) &&
-                !target.events.includes(event.currentStatus)
+                !target.events.includes(event.currentStatus as "up" | "down")
             )
                 return;
 

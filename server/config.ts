@@ -2,17 +2,45 @@ import dotenv from 'dotenv'
 
 dotenv.config()
 
-const toNumber = (value, fallback) => {
+type NotificationEvent = 'up' | 'down'
+
+type SlackTarget = {
+  name: string
+  type: 'slack'
+  token: string
+  channel: string
+  events: NotificationEvent[]
+  headers: Record<string, string>
+}
+
+type WebhookTarget = {
+  name: string
+  type: 'webhook'
+  url: string
+  events: NotificationEvent[]
+  headers: Record<string, string>
+}
+
+export type NotificationTarget = SlackTarget | WebhookTarget
+
+export type NatsClientConfig = {
+  servers: string[]
+  user: string | undefined
+  pass: string | undefined
+  token: string | undefined
+}
+
+const toNumber = (value: unknown, fallback: number): number => {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
-const toBoolean = (value, fallback = false) => {
+const toBoolean = (value: unknown, fallback = false): boolean => {
   if (value == null || value === '') return fallback
   return String(value).toLowerCase() === 'true'
 }
 
-const parseJson = (value, fallback) => {
+const parseJson = <T>(value: string | undefined, fallback: T): T => {
   if (!value) return fallback
   try {
     return JSON.parse(value)
@@ -21,7 +49,7 @@ const parseJson = (value, fallback) => {
   }
 }
 
-const normalizeNotificationTarget = (target) => {
+const normalizeNotificationTarget = (target: Record<string, any> | null): NotificationTarget | null => {
   if (!target || typeof target !== 'object') return null
 
   const type = String(target.type ?? 'webhook').trim().toLowerCase()
@@ -29,7 +57,7 @@ const normalizeNotificationTarget = (target) => {
   const events = Array.isArray(target.events)
     ? target.events
         .map((event) => String(event).trim().toLowerCase())
-        .filter((event) => event === 'up' || event === 'down')
+        .filter((event): event is NotificationEvent => event === 'up' || event === 'down')
     : null
 
   const headers =
@@ -64,9 +92,13 @@ const normalizeNotificationTarget = (target) => {
   }
 }
 
-const parseNotificationTargets = () => {
+const parseNotificationTargets = (): NotificationTarget[] => {
   const fromJson = parseJson(process.env.NOTIFICATION_TARGETS_JSON, [])
-  const jsonTargets = Array.isArray(fromJson) ? fromJson.map(normalizeNotificationTarget).filter(Boolean) : []
+  const jsonTargets = Array.isArray(fromJson)
+    ? fromJson
+        .map(normalizeNotificationTarget)
+        .filter((target): target is NotificationTarget => Boolean(target))
+    : []
 
   const slackToken = String(process.env.SLACK_BOT_TOKEN ?? '').trim()
   const slackChannel = String(process.env.SLACK_CHANNEL_ID ?? '').trim()
@@ -105,6 +137,26 @@ const parseLagThresholds = (rawValue: string | undefined): Record<string, number
   return thresholds
 }
 
+const parseNatsClient = (rawValue: string | undefined): NatsClientConfig | null => {
+  const parsed = parseJson<Record<string, any> | null>(rawValue, null)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+
+  const address = String(parsed.address ?? '').trim()
+  if (!address) return null
+
+  const servers = address.startsWith('nats://') ? [address] : [`nats://${address}`]
+  const user = String(parsed.username ?? parsed.user ?? '').trim()
+  const pass = String(parsed.password ?? parsed.pass ?? '').trim()
+  const token = String(parsed.token ?? '').trim()
+
+  return {
+    servers,
+    user: user || undefined,
+    pass: pass || undefined,
+    token: token || undefined,
+  }
+}
+
 const parseEmailAllowlist = (rawValue: string | undefined): string[] =>
   String(rawValue ?? '')
     .split(',')
@@ -119,6 +171,14 @@ export const config = {
   monitorPollMs: toNumber(process.env.MONITOR_POLL_MS, 1000),
   requestTimeoutMs: toNumber(process.env.REQUEST_TIMEOUT_MS, 10000),
   natsLagThresholds: parseLagThresholds(process.env.NATS_LAG_THRESHOLDS),
+  nats: parseNatsClient(process.env.NATS_CLIENT),
+  cron: {
+    pollMs: toNumber(process.env.CRON_POLL_MS, 1000),
+    sweepIntervalMs: toNumber(process.env.CRON_SWEEP_INTERVAL_MS, 30000),
+    catchupGraceMs: toNumber(process.env.CRON_CATCHUP_GRACE_MS, 120000),
+    notifyToken: String(process.env.CRON_NOTIFY_TOKEN ?? '').trim(),
+    runRetentionDays: toNumber(process.env.CRON_RUN_RETENTION_DAYS, 90),
+  },
   corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://localhost:5173')
     .split(',')
     .map((origin) => origin.trim())

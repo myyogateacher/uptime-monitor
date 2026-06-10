@@ -77,6 +77,22 @@ const ADMIN_TAB_OPTIONS = [
     { value: "crons", label: "Cron Health" },
 ];
 
+const STATUS_TAB_OPTIONS = [
+    { value: "services", label: "Monitored Services" },
+    { value: "crons", label: "Cron Health" },
+];
+
+const CRON_RUNS_MODE_OPTIONS = [
+    { value: "recent", label: "Last 50 runs" },
+    { value: "window", label: "Window" },
+];
+
+const CRON_STATUS_WINDOW_OPTIONS = [
+    { value: 1, label: "Last 24h" },
+    { value: 7, label: "Last 7d" },
+    { value: 30, label: "Last 30d" },
+];
+
 const STATUS_GRANULARITY_OPTIONS: Array<{
     value: StatsGranularity;
     label: string;
@@ -155,6 +171,114 @@ function formatFriendlyDateTime(input) {
         dateStyle: "medium",
         timeStyle: "short",
     }).format(date);
+}
+
+function renderCronRunBadge(status) {
+    if (status === "success") return "bg-emerald-100/85 text-emerald-700";
+    if (status === "failed" || status === "missed")
+        return "bg-rose-100/85 text-rose-700";
+    return "bg-amber-100/85 text-amber-700";
+}
+
+function cronRunStripColor(status) {
+    if (status === "success") return "bg-emerald-500 hover:bg-emerald-400";
+    if (status === "failed" || status === "missed")
+        return "bg-rose-500 hover:bg-rose-400";
+    return "bg-amber-400 hover:bg-amber-300";
+}
+
+function CronRunGrid({ runs }) {
+    const containerRef = useRef(null);
+    const [hoveredRun, setHoveredRun] = useState(null);
+
+    // Latest run first, down to the oldest we have recorded.
+    const orderedRuns = useMemo(() => {
+        return [...(runs ?? [])].sort(
+            (left, right) =>
+                new Date(right.triggered_at).getTime() -
+                new Date(left.triggered_at).getTime(),
+        );
+    }, [runs]);
+
+    if (!orderedRuns.length) {
+        return <p className="text-xs text-slate-500">No runs recorded yet.</p>;
+    }
+
+    const handleHover = (event, run) => {
+        if (!containerRef.current) return;
+        const containerRect = containerRef.current.getBoundingClientRect();
+        const targetRect = event.currentTarget.getBoundingClientRect();
+
+        setHoveredRun({
+            run,
+            x: targetRect.left - containerRect.left + targetRect.width / 2,
+            y: targetRect.top - containerRect.top,
+        });
+    };
+
+    return (
+        <div ref={containerRef} className="relative">
+            <div className="flex flex-wrap gap-1">
+                {orderedRuns.map((run, index) => (
+                    <span
+                        key={run.run_id ?? index}
+                        onMouseEnter={(event) => handleHover(event, run)}
+                        onMouseLeave={() => setHoveredRun(null)}
+                        className={`h-3.5 w-3.5 cursor-pointer rounded-sm transition ${cronRunStripColor(run.status)}`}
+                    />
+                ))}
+            </div>
+            {hoveredRun && (
+                <div
+                    className="pointer-events-none absolute z-20 min-w-56 max-w-72 rounded-lg border border-slate-200/90 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow-lg backdrop-blur"
+                    style={{
+                        left: `${hoveredRun.x}px`,
+                        top: `${hoveredRun.y - 8}px`,
+                        transform: "translate(-50%, -100%)",
+                    }}
+                >
+                    <p className="font-semibold uppercase text-slate-900">
+                        {hoveredRun.run.status}
+                    </p>
+                    <p className="mt-0.5 text-slate-600">
+                        Triggered:{" "}
+                        {formatFriendlyDateTime(hoveredRun.run.triggered_at)}
+                    </p>
+                    {hoveredRun.run.completed_at ? (
+                        <p className="mt-0.5 text-slate-600">
+                            Completed:{" "}
+                            {formatFriendlyDateTime(
+                                hoveredRun.run.completed_at,
+                            )}
+                        </p>
+                    ) : null}
+                    <p className="mt-0.5 break-all font-mono text-[10px] text-slate-500">
+                        {hoveredRun.run.run_id}
+                    </p>
+                    <div className="mt-0.5 flex flex-wrap gap-x-3 text-slate-600">
+                        {hoveredRun.run.duration_ms != null ? (
+                            <span>
+                                Duration:{" "}
+                                {(
+                                    Number(hoveredRun.run.duration_ms) / 1000
+                                ).toFixed(2)}
+                                s
+                            </span>
+                        ) : null}
+                        <span>Pings: {hoveredRun.run.pings ?? 0}</span>
+                        {hoveredRun.run.response_code != null ? (
+                            <span>HTTP: {hoveredRun.run.response_code}</span>
+                        ) : null}
+                    </div>
+                    {hoveredRun.run.error_message ? (
+                        <p className="mt-1 break-words rounded border border-rose-200/80 bg-rose-50/80 px-1.5 py-1 text-[11px] text-rose-700">
+                            {hoveredRun.run.error_message}
+                        </p>
+                    ) : null}
+                </div>
+            )}
+        </div>
+    );
 }
 
 function getGroupStatus(endpoints) {
@@ -472,6 +596,15 @@ function StatusPage({
     onViewModeChange,
     onGranularityChange,
     onRangeChange,
+    statusTab,
+    onStatusTabChange,
+    crons,
+    cronRunsByName,
+    cronRunsMode,
+    onCronRunsModeChange,
+    cronWindowDays,
+    onCronWindowDaysChange,
+    currentTimeMs,
 }) {
     const groupedEndpoints = useMemo(() => {
         return groups.map((group) => ({
@@ -557,6 +690,87 @@ function StatusPage({
                             </p>
                         </div>
                     </div>
+                    <div className="mt-5 flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur md:max-w-fit">
+                        {STATUS_TAB_OPTIONS.map((tab) => (
+                            <button
+                                key={tab.value}
+                                type="button"
+                                onClick={() => onStatusTabChange(tab.value)}
+                                className={`cursor-pointer rounded-full px-4 py-2 text-sm font-medium transition ${
+                                    statusTab === tab.value
+                                        ? "bg-slate-900 text-white shadow"
+                                        : "text-slate-600 hover:bg-white/75"
+                                }`}
+                            >
+                                {tab.label}
+                            </button>
+                        ))}
+                    </div>
+                    {statusTab === "crons" ? (
+                        <div className="mt-5 flex flex-wrap items-center gap-3">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
+                                    View
+                                </span>
+                                <div className="flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur">
+                                    {CRON_RUNS_MODE_OPTIONS.map((option) => (
+                                        <button
+                                            key={option.value}
+                                            type="button"
+                                            onClick={() =>
+                                                onCronRunsModeChange(
+                                                    option.value,
+                                                )
+                                            }
+                                            className={`cursor-pointer rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                                                cronRunsMode === option.value
+                                                    ? "bg-slate-900 text-white shadow"
+                                                    : "text-slate-600 hover:bg-white/75"
+                                            }`}
+                                        >
+                                            {option.label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                            {cronRunsMode === "window" ? (
+                                <div className="flex items-center gap-2">
+                                    <label
+                                        htmlFor="cron-status-window"
+                                        className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500"
+                                    >
+                                        Window
+                                    </label>
+                                    <select
+                                        id="cron-status-window"
+                                        value={cronWindowDays}
+                                        onChange={(event) =>
+                                            onCronWindowDaysChange(
+                                                Number(event.target.value),
+                                            )
+                                        }
+                                        className="cursor-pointer rounded-full border border-white/70 bg-white/65 px-4 py-2 text-sm text-slate-700 backdrop-blur focus:outline-none focus:ring-2 focus:ring-cyan-300/70"
+                                    >
+                                        {CRON_STATUS_WINDOW_OPTIONS.map(
+                                            (option) => (
+                                                <option
+                                                    key={option.value}
+                                                    value={option.value}
+                                                >
+                                                    {option.label}
+                                                </option>
+                                            ),
+                                        )}
+                                    </select>
+                                </div>
+                            ) : null}
+                            <p className="text-xs text-slate-500">
+                                {cronRunsMode === "recent"
+                                    ? "Showing the latest 50 runs per cron."
+                                    : "Run history retained for the last 90 days."}
+                            </p>
+                        </div>
+                    ) : (
                     <div className="mt-5 flex flex-wrap items-center gap-3">
                         <div className="flex items-center gap-2">
                             <span className="text-xs font-medium uppercase tracking-[0.2em] text-slate-500">
@@ -653,12 +867,92 @@ function StatusPage({
                                 : "History retained for the last 90 days."}
                         </p>
                     </div>
+                    )}
                 </header>
 
                 {isLoading ? (
                     <div className="glass-card rounded-xl p-6 text-sm text-slate-600">
                         Loading status...
                     </div>
+                ) : statusTab === "crons" ? (
+                    <section className="space-y-4">
+                        {!crons.length && (
+                            <div className="glass-card rounded-xl p-6 text-sm text-slate-600">
+                                No crons configured yet.
+                            </div>
+                        )}
+                        <div className="grid gap-4 lg:grid-cols-2">
+                            {crons.map((cronJob) => {
+                                const runs =
+                                    cronRunsByName[cronJob.cron] ?? [];
+                                const successCount = runs.filter(
+                                    (run) => run.status === "success",
+                                ).length;
+                                const failureCount = runs.filter(
+                                    (run) =>
+                                        run.status === "failed" ||
+                                        run.status === "missed",
+                                ).length;
+
+                                return (
+                                    <article
+                                        key={cronJob.cron}
+                                        className="glass-card rounded-2xl p-5"
+                                    >
+                                        <div className="flex flex-wrap items-center justify-between gap-3">
+                                            <div className="flex items-center gap-2">
+                                                <span
+                                                    className={`h-2.5 w-2.5 rounded-full ${
+                                                        cronJob.status
+                                                            ? "bg-emerald-500"
+                                                            : "bg-slate-400"
+                                                    }`}
+                                                />
+                                                <h3 className="font-semibold">
+                                                    {cronJob.cron}
+                                                </h3>
+                                                <span className="rounded bg-white/70 px-2 py-0.5 text-[10px] uppercase text-slate-600 backdrop-blur">
+                                                    {cronJob.trigger_type}
+                                                </span>
+                                                {!cronJob.status ? (
+                                                    <span className="rounded bg-slate-200/85 px-2 py-0.5 text-[10px] font-semibold uppercase text-slate-700 backdrop-blur">
+                                                        disabled
+                                                    </span>
+                                                ) : null}
+                                            </div>
+                                            {cronJob.last_run_status ? (
+                                                <span
+                                                    className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase backdrop-blur ${renderCronRunBadge(cronJob.last_run_status)}`}
+                                                >
+                                                    {cronJob.last_run_status}
+                                                </span>
+                                            ) : null}
+                                        </div>
+                                        <p className="mt-1 font-mono text-xs text-slate-600">
+                                            {cronJob.expression}
+                                        </p>
+                                        <div className="mt-3">
+                                            <CronRunGrid runs={runs} />
+                                        </div>
+                                        <div className="mt-3 flex items-center justify-between text-[11px] text-slate-500">
+                                            <span>
+                                                {successCount} ok /{" "}
+                                                {failureCount} failed of{" "}
+                                                {runs.length} runs
+                                            </span>
+                                            <span>
+                                                Last run:{" "}
+                                                {formatRelativeTime(
+                                                    cronJob.last_run_at,
+                                                    currentTimeMs,
+                                                )}
+                                            </span>
+                                        </div>
+                                    </article>
+                                );
+                            })}
+                        </div>
+                    </section>
                 ) : (
                     <section className="space-y-6">
                         {groupedEndpoints.map((group) => (
@@ -1830,6 +2124,16 @@ function AdminPage({
                                                             disabled
                                                         </span>
                                                     ) : null}
+                                                    {cronJob.last_run_status ? (
+                                                        <span
+                                                            className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase backdrop-blur ${renderCronRunBadge(cronJob.last_run_status)}`}
+                                                        >
+                                                            run{" "}
+                                                            {
+                                                                cronJob.last_run_status
+                                                            }
+                                                        </span>
+                                                    ) : null}
                                                 </div>
                                                 <p className="mt-1 break-all font-mono text-xs text-slate-600">
                                                     {cronJob.expression}
@@ -1897,7 +2201,19 @@ function AdminPage({
                                                     {cronJob.endpoint}
                                                 </p>
                                             ) : null}
+                                            <p className="md:col-span-2">
+                                                Last run:{" "}
+                                                {formatRelativeTime(
+                                                    cronJob.last_run_at,
+                                                    currentTimeMs,
+                                                )}
+                                            </p>
                                         </div>
+                                        {cronJob.last_run_error ? (
+                                            <p className="mt-2 rounded border border-rose-200/80 bg-rose-50/80 px-2 py-1 text-xs text-rose-700 backdrop-blur">
+                                                {cronJob.last_run_error}
+                                            </p>
+                                        ) : null}
                                     </article>
                                 ))}
                             </div>
@@ -2282,6 +2598,10 @@ function App() {
     const [cronForm, setCronForm] = useState(INITIAL_CRON_FORM);
     const [editingCronName, setEditingCronName] = useState(null);
     const [isSavingCron, setIsSavingCron] = useState(false);
+    const [statusTab, setStatusTab] = useState("services");
+    const [cronRunsByName, setCronRunsByName] = useState({});
+    const [cronRunsMode, setCronRunsMode] = useState("recent");
+    const [cronWindowDays, setCronWindowDays] = useState(7);
     const [isLoading, setIsLoading] = useState(true);
     const [isSavingEndpoint, setIsSavingEndpoint] = useState(false);
     const [error, setError] = useState("");
@@ -2355,6 +2675,35 @@ function App() {
         setRunsByEndpoint(Object.fromEntries(runEntries));
     }, []);
 
+    const loadCronRuns = useCallback(
+        async (cronList) => {
+            const options =
+                cronRunsMode === "window"
+                    ? { rangeDays: cronWindowDays, limit: 500 }
+                    : { limit: 50 };
+
+            const entries = await Promise.all(
+                cronList.map(async (cronJob) => {
+                    try {
+                        const rows = await monitoringService.getCronRuns(
+                            cronJob.cron,
+                            options,
+                        );
+                        return [
+                            cronJob.cron,
+                            Array.isArray(rows) ? rows : [],
+                        ];
+                    } catch {
+                        return [cronJob.cron, []];
+                    }
+                }),
+            );
+
+            setCronRunsByName(Object.fromEntries(entries));
+        },
+        [cronRunsMode, cronWindowDays],
+    );
+
     const loadData = useCallback(async () => {
         if (isHomePage || isLoginPage) {
             setIsLoading(false);
@@ -2383,19 +2732,21 @@ function App() {
                     : current,
             );
 
-            if (isMonitorsPage) {
-                // Cron API lands in the next step; don't fail the page if absent.
+            if (isMonitorsPage || isStatusPage) {
                 try {
                     const cronsRes = await monitoringService.getCrons();
-                    setCrons(
-                        Array.isArray(cronsRes)
-                            ? [...cronsRes].sort((left, right) =>
-                                  String(left.cron).localeCompare(
-                                      String(right.cron),
-                                  ),
-                              )
-                            : [],
-                    );
+                    const sortedCrons = Array.isArray(cronsRes)
+                        ? [...cronsRes].sort((left, right) =>
+                              String(left.cron).localeCompare(
+                                  String(right.cron),
+                              ),
+                          )
+                        : [];
+                    setCrons(sortedCrons);
+
+                    if (isStatusPage) {
+                        await loadCronRuns(sortedCrons);
+                    }
                 } catch {
                     setCrons([]);
                 }
@@ -2416,6 +2767,7 @@ function App() {
     }, [
         isStatusPage,
         loadRuns,
+        loadCronRuns,
         statusGranularity,
         statusRangeDays,
         statusViewMode,
@@ -2584,6 +2936,53 @@ function App() {
                         const next = { ...current };
                         delete next[payload.id];
                         return next;
+                    });
+                    return;
+                }
+
+                if (message?.type === "cron:run") {
+                    setCrons((current) =>
+                        current.map((cronJob) =>
+                            cronJob.cron === payload.cron
+                                ? {
+                                      ...cronJob,
+                                      last_run_status:
+                                          payload.status ??
+                                          cronJob.last_run_status,
+                                      last_run_at:
+                                          payload.triggeredAt ??
+                                          cronJob.last_run_at,
+                                      last_run_error:
+                                          payload.errorMessage ?? null,
+                                  }
+                                : cronJob,
+                        ),
+                    );
+                    setCronRunsByName((current) => {
+                        const existing = current[payload.cron];
+                        if (!existing) return current;
+
+                        const updatedRun = {
+                            run_id: payload.runId,
+                            status: payload.status,
+                            trigger_type: payload.triggerType ?? null,
+                            triggered_at: payload.triggeredAt ?? null,
+                            completed_at: payload.completedAt ?? null,
+                            pings: payload.pings ?? 0,
+                            duration_ms: payload.durationMs ?? null,
+                            response_code: payload.responseCode ?? null,
+                            error_message: payload.errorMessage ?? null,
+                        };
+
+                        return {
+                            ...current,
+                            [payload.cron]: [
+                                updatedRun,
+                                ...existing.filter(
+                                    (run) => run.run_id !== payload.runId,
+                                ),
+                            ].slice(0, 500),
+                        };
                     });
                 }
             } catch {
@@ -3006,6 +3405,15 @@ function App() {
                 onViewModeChange={setStatusViewMode}
                 onGranularityChange={setStatusGranularity}
                 onRangeChange={setStatusRangeDays}
+                statusTab={statusTab}
+                onStatusTabChange={setStatusTab}
+                crons={crons}
+                cronRunsByName={cronRunsByName}
+                cronRunsMode={cronRunsMode}
+                onCronRunsModeChange={setCronRunsMode}
+                cronWindowDays={cronWindowDays}
+                onCronWindowDaysChange={setCronWindowDays}
+                currentTimeMs={currentTimeMs}
             />
         );
     }

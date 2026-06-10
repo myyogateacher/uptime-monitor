@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 
 import cors, { type CorsOptions } from 'cors'
+import { CronExpressionParser } from 'cron-parser'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import session from 'express-session'
 import createMySqlSession from 'express-mysql-session'
@@ -14,6 +15,7 @@ import { initDatabase, pool } from './db'
 import {
   CRON_CREATED_EVENT,
   CRON_DELETED_EVENT,
+  CRON_RUN_EVENT,
   CRON_UPDATED_EVENT,
   ENDPOINT_CREATED_EVENT,
   ENDPOINT_DELETED_EVENT,
@@ -25,6 +27,12 @@ import {
   monitorEvents,
 } from './events'
 import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService'
+import {
+  recordCronRunStatus,
+  resetCronSchedule,
+  startCronMonitor,
+  stopCronMonitor,
+} from './cronMonitorService'
 
 type JsonObject = Record<string, unknown>
 type WsFrame = { type: string; payload?: unknown; timestamp?: string }
@@ -110,6 +118,10 @@ monitorEvents.on(CRON_DELETED_EVENT, (payload) => {
   broadcast(CRON_DELETED_EVENT, payload)
 })
 
+monitorEvents.on(CRON_RUN_EVENT, (payload) => {
+  broadcast(CRON_RUN_EVENT, payload)
+})
+
 const corsOptions: CorsOptions = {
   origin(origin, callback) {
     if (!origin) return callback(null, true)
@@ -162,6 +174,9 @@ const toInteger = (value: unknown, fallback: number | null = null): number | nul
   if (!Number.isFinite(parsed)) return fallback
   return Math.trunc(parsed)
 }
+
+const toErrorMessage = (error: unknown, fallback = 'Unexpected error'): string =>
+  error instanceof Error ? error.message : fallback
 
 const SENSITIVE_JSON_KEYS = new Set(['password', 'pass', 'pwd'])
 const MASKED_JSON_VALUE = '*****'
@@ -422,6 +437,11 @@ const normalizeCronPayload = (payload: JsonObject): JsonObject => {
   if (expression.length > 100) throw new Error('Cron expression must be at most 100 characters')
   if (expression.split(/\s+/).length !== 5) {
     throw new Error('Cron expression must have 5 fields (minute hour day month weekday)')
+  }
+  try {
+    CronExpressionParser.parse(expression, { tz: 'UTC' })
+  } catch {
+    throw new Error('Cron expression is invalid')
   }
 
   if (service.length > 255) throw new Error('Service must be at most 255 characters')
@@ -905,7 +925,7 @@ app.post('/api/groups/:id/resume', requireEditor, async (req: Request, res: Resp
 app.get('/api/endpoints', async (req: Request, res: Response) => {
   const groupId = toInteger(req.query.group_id, null)
 
-  const params = []
+  const params: number[] = []
   let whereClause = ''
 
   if (groupId != null) {
@@ -930,12 +950,12 @@ app.get('/api/endpoints', async (req: Request, res: Response) => {
 })
 
 app.post('/api/endpoints', requireEditor, async (req: Request, res: Response) => {
-  let payload
+  let payload: JsonObject
 
   try {
     payload = normalizeEndpointPayload(req.body)
   } catch (error) {
-    return res.status(400).json({ error: error.message })
+    return res.status(400).json({ error: toErrorMessage(error, 'Invalid payload') })
   }
 
   const [groupRows] = await pool.query('SELECT id FROM monitor_groups WHERE id = ?', [payload.group_id])
@@ -1043,11 +1063,11 @@ app.put('/api/endpoints/:id', requireEditor, async (req: Request, res: Response)
     }
   }
 
-  let payload
+  let payload: JsonObject
   try {
     payload = normalizeEndpointPayload(incomingBody)
   } catch (error) {
-    return res.status(400).json({ error: error.message })
+    return res.status(400).json({ error: toErrorMessage(error, 'Invalid payload') })
   }
 
   const [result] = await pool.query(
@@ -1295,17 +1315,102 @@ app.delete('/api/endpoints/:id/runs', requireEditor, async (req: Request, res: R
 })
 
 app.get('/api/crons', async (_req: Request, res: Response) => {
-  const [rows] = await pool.query('SELECT * FROM cron_monitoring ORDER BY cron ASC')
+  const [rows] = await pool.query(`
+    SELECT
+      c.*,
+      r.status AS last_run_status,
+      r.triggered_at AS last_run_at,
+      r.error_message AS last_run_error
+    FROM cron_monitoring c
+    LEFT JOIN cron_runs r ON r.id = (
+      SELECT r2.id FROM cron_runs r2 WHERE r2.cron = c.cron ORDER BY r2.id DESC LIMIT 1
+    )
+    ORDER BY c.cron ASC
+  `)
   res.json(rows.map(mapCronRow))
 })
 
+// Run-status reports come from external services, so session auth doesn't apply.
+// For now only the presence of a bearer token is checked; value validation
+// against CRON_NOTIFY_TOKEN comes later.
+const requireCronRunReportAuth = (req: Request, res: Response, next: NextFunction) => {
+  const authHeader = String(req.headers.authorization ?? '')
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : ''
+  if (!token) {
+    return res.status(401).json({ error: 'Bearer token required' })
+  }
+  return next()
+}
+
+const CRON_RUN_REPORT_STATUSES = new Set(['start', 'ping', 'fail', 'stop'])
+
+app.post('/api/crons/notify', requireCronRunReportAuth, async (req: Request, res: Response) => {
+  const runId = String(req.body?.run_id ?? '').trim()
+  const cronName = String(req.body?.cron ?? '').trim()
+  const status = String(req.body?.status ?? '').trim().toLowerCase()
+  const errorMessage = req.body?.error == null ? null : String(req.body.error)
+
+  if (!runId || runId.length > 36) {
+    return res.status(400).json({ error: 'run_id is required (max 36 chars)' })
+  }
+  if (!cronName) {
+    return res.status(400).json({ error: 'cron is required' })
+  }
+  if (!CRON_RUN_REPORT_STATUSES.has(status)) {
+    return res.status(400).json({ error: 'status must be one of start, ping, fail, stop' })
+  }
+
+  const result = await recordCronRunStatus({
+    runId,
+    cron: cronName,
+    status: status as 'start' | 'ping' | 'fail' | 'stop',
+    error: errorMessage,
+  })
+
+  return res.json(result)
+})
+
+app.get('/api/crons/:cron/runs', async (req: Request, res: Response) => {
+  const cronName = String(req.params.cron ?? '').trim()
+  const limitRaw = toInteger(req.query.limit, 100) ?? 100
+  const limit = Math.max(1, Math.min(limitRaw, 500))
+  const rangeDaysRaw = toInteger(req.query.range_days, null)
+  const rangeDays = rangeDaysRaw == null ? null : Math.max(1, Math.min(rangeDaysRaw, 90))
+
+  const cron = await getMappedCronByName(cronName)
+  if (!cron) {
+    return res.status(404).json({ error: 'Cron not found' })
+  }
+
+  const params: Array<string | number> = [cronName]
+  let rangeClause = ''
+  if (rangeDays != null) {
+    rangeClause = 'AND triggered_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)'
+    params.push(rangeDays)
+  }
+  params.push(limit)
+
+  const [rows] = await pool.query(
+    `
+      SELECT *
+      FROM cron_runs
+      WHERE cron = ? ${rangeClause}
+      ORDER BY triggered_at DESC, id DESC
+      LIMIT ?
+    `,
+    params,
+  )
+
+  return res.json(rows)
+})
+
 app.post('/api/crons', requireEditor, async (req: Request, res: Response) => {
-  let payload
+  let payload: JsonObject
 
   try {
     payload = normalizeCronPayload(req.body)
   } catch (error) {
-    return res.status(400).json({ error: error.message })
+    return res.status(400).json({ error: toErrorMessage(error, 'Invalid payload') })
   }
 
   try {
@@ -1344,7 +1449,7 @@ app.post('/api/crons', requireEditor, async (req: Request, res: Response) => {
       ],
     )
   } catch (error) {
-    if (error?.code === 'ER_DUP_ENTRY') {
+    if ((error as { code?: string } | null)?.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ error: `Cron "${payload.cron}" already exists` })
     }
     throw error
@@ -1362,12 +1467,12 @@ app.put('/api/crons/:cron', requireEditor, async (req: Request, res: Response) =
     return res.status(400).json({ error: 'Invalid cron name' })
   }
 
-  let payload
+  let payload: JsonObject
   try {
     // The cron name is the primary key; renames are not supported.
     payload = normalizeCronPayload({ ...(req.body ?? {}), cron: cronName })
   } catch (error) {
-    return res.status(400).json({ error: error.message })
+    return res.status(400).json({ error: toErrorMessage(error, 'Invalid payload') })
   }
 
   const [result] = await pool.query(
@@ -1408,6 +1513,9 @@ app.put('/api/crons/:cron', requireEditor, async (req: Request, res: Response) =
   if (!result.affectedRows) {
     return res.status(404).json({ error: 'Cron not found' })
   }
+
+  // Expression/config may have changed; let the scheduler recompute from scratch.
+  await resetCronSchedule(cronName)
 
   const updatedCron = await getMappedCronByName(cronName)
   monitorEvents.emit(CRON_UPDATED_EVENT, updatedCron)
@@ -1450,6 +1558,7 @@ if (existsSync(distPath)) {
 async function start() {
   await initDatabase()
   startMonitor()
+  startCronMonitor()
 
   httpServer.listen(config.port, () => {
     console.log(`Express server listening on http://localhost:${config.port}`)
@@ -1463,6 +1572,7 @@ start().catch((error: unknown) => {
 
 const shutdown = async () => {
   stopMonitor()
+  await stopCronMonitor()
   await new Promise<void>((resolve) => wsServer.close(() => resolve()))
   await new Promise<void>((resolve) => httpServer.close(() => resolve()))
   await new Promise<void>((resolve) => sessionStore.close().then(() => resolve()).catch(() => resolve()))

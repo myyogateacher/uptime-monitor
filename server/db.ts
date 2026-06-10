@@ -205,7 +205,71 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 9,
+    name: "add_cron_scheduling_and_runs",
+    up: async () => {
+      await pool.query(`
+        ALTER TABLE cron_monitoring
+          ADD COLUMN next_run_at DATETIME NULL
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS cron_runs (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          run_id CHAR(36) NOT NULL,
+          cron VARCHAR(100) NOT NULL,
+          trigger_type ENUM('nats','http') NOT NULL,
+          status VARCHAR(16) NOT NULL DEFAULT 'triggered',
+          triggered_at DATETIME NOT NULL,
+          deadline_at DATETIME NULL,
+          first_ping_at DATETIME NULL,
+          last_ping_at DATETIME NULL,
+          completed_at DATETIME NULL,
+          pings INT NOT NULL DEFAULT 0,
+          duration_ms INT NULL,
+          response_code INT NULL,
+          error_message TEXT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_cron_runs_run_id (run_id),
+          KEY idx_cron_runs_cron_triggered (cron, triggered_at),
+          KEY idx_cron_runs_status_deadline (status, deadline_at),
+          CONSTRAINT fk_cron_runs_cron FOREIGN KEY (cron)
+            REFERENCES cron_monitoring(cron) ON DELETE CASCADE
+        )
+      `);
+    },
+  },
+  {
+    version: 10,
+    name: "create_app_settings",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS app_settings (
+          name VARCHAR(100) NOT NULL PRIMARY KEY,
+          value VARCHAR(255) NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
+      await pool.query(`
+        INSERT IGNORE INTO app_settings (name, value)
+        VALUES ('cron_monitor_enabled', '0')
+      `);
+    },
+  },
 ];
+
+export async function getAppSetting(name: string): Promise<string | null> {
+  const [rows] = await pool.query("SELECT value FROM app_settings WHERE name = ? LIMIT 1", [name]);
+  if (!rows.length) return null;
+  return String(rows[0].value);
+}
+
+export async function setAppSetting(name: string, value: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO app_settings (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    [name, value],
+  );
+}
 
 async function ensureSchemaMigrationsTable() {
   await pool.query(`

@@ -143,4 +143,11 @@ export const monitoringService = {
       method: 'DELETE',
     })
   },
+  getCronRuns(cronName, options: { limit?: number; rangeDays?: number } = {}) {
+    const params = new URLSearchParams()
+    if (options.limit) params.set('limit', String(options.limit))
+    if (options.rangeDays) params.set('range_days', String(options.rangeDays))
+    const query = params.toString()
+    return request(`/api/crons/${encodeURIComponent(cronName)}/runs${query ? `?${query}` : ''}`)
+  },
 }
