@@ -33,6 +33,10 @@ The backend serves the built frontend (`dist/`) so both control plane and status
 - NATS JetStream monitor support:
   - Connection JSON
   - JetStream probe command support (`jetstream.info`, `stream.info:<name>`)
+  - JetStream consumer lag checks (`consumers.lag[:<threshold>]` for all consumers, `consumer.lag:<stream>:<consumer>[:<threshold>]` for one)
+    - Flags consumers whose `num_ack_pending`, `num_pending`, or `num_waiting` exceeds the threshold (default 128)
+    - Per-consumer overrides via `"lag_thresholds": { "my_consumer": 1024, "default": 128 }` in Connection JSON, or globally via the `NATS_LAG_THRESHOLDS` env var (same JSON shape; Connection JSON wins)
+    - A lagging consumer that is draining (backlog lower than the previous check) is not flagged
   - Optional expected probe value matching
 - TCP port monitor support:
   - Host/port connection check
@@ -79,6 +83,7 @@ Use `.env` (see `.env.example`):
 - `MYSQL_CONNECTION_LIMIT`
 - `MONITOR_POLL_MS`
 - `REQUEST_TIMEOUT_MS`
+- `NATS_LAG_THRESHOLDS`
 - `CORS_ORIGINS`
 - `VITE_API_BASE_URL`
 - `SESSION_SECRET`

@@ -1603,7 +1603,7 @@ function AdminPage({
                                                           ? 'PING or ["GET","health:key"]'
                                                           : endpointForm.monitor_type ===
                                                               "nats"
-                                                            ? "jetstream.info or stream.info:ORDERS"
+                                                            ? "jetstream.info, stream.info:ORDERS, consumers.lag:128, consumer.lag:ORDERS:worker:512"
                                                             : endpointForm.monitor_type ===
                                                                 "tcp"
                                                               ? "Optional (default checks open port)"

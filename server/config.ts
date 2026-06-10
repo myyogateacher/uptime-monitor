@@ -93,6 +93,18 @@ const parseNotificationTargets = () => {
   ]
 }
 
+const parseLagThresholds = (rawValue: string | undefined): Record<string, number> => {
+  const parsed = parseJson(rawValue, {})
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+  const thresholds: Record<string, number> = {}
+  for (const [name, value] of Object.entries(parsed)) {
+    const threshold = Number(value)
+    if (Number.isFinite(threshold) && threshold >= 0) thresholds[name] = threshold
+  }
+  return thresholds
+}
+
 const parseEmailAllowlist = (rawValue: string | undefined): string[] =>
   String(rawValue ?? '')
     .split(',')
@@ -106,6 +118,7 @@ export const config = {
   port: toNumber(process.env.PORT, 3001),
   monitorPollMs: toNumber(process.env.MONITOR_POLL_MS, 1000),
   requestTimeoutMs: toNumber(process.env.REQUEST_TIMEOUT_MS, 10000),
+  natsLagThresholds: parseLagThresholds(process.env.NATS_LAG_THRESHOLDS),
   corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://localhost:5173')
     .split(',')
     .map((origin) => origin.trim())

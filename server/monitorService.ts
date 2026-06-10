@@ -421,6 +421,73 @@ async function runRedisCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
   }
 }
 
+interface NatsConsumerLagInfo {
+  stream_name: string
+  name: string
+  num_ack_pending: number
+  num_waiting: number
+  num_pending: number
+}
+
+// Previous over-threshold readings per endpoint, keyed by stream:consumer:metric.
+// A consumer above threshold but draining (value lower than last check) is not flagged.
+const natsLagHistory = new Map<number, Map<string, number>>()
+
+const lookupLagThreshold = (overrides: unknown, key: string): number | null => {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return null
+  const value = Number((overrides as JsonObject)[key])
+  return Number.isFinite(value) && value >= 0 ? value : null
+}
+
+// Precedence: per-consumer (connection JSON, then NATS_LAG_THRESHOLDS env),
+// then probe command threshold, then "default" key (connection JSON, then env), then 128.
+const resolveLagThreshold = (
+  consumerName: string,
+  connection: JsonObject,
+  commandThreshold: number | null,
+): number =>
+  lookupLagThreshold(connection.lag_thresholds, consumerName) ??
+  lookupLagThreshold(config.natsLagThresholds, consumerName) ??
+  commandThreshold ??
+  lookupLagThreshold(connection.lag_thresholds, 'default') ??
+  lookupLagThreshold(config.natsLagThresholds, 'default') ??
+  128
+
+const evaluateConsumerLag = (
+  endpoint: MonitorEndpoint,
+  connection: JsonObject,
+  commandThreshold: number | null,
+  infos: NatsConsumerLagInfo[],
+): string[] => {
+  const previous = natsLagHistory.get(endpoint.id) ?? new Map<string, number>()
+  const nextHistory = new Map<string, number>()
+  const lagging: string[] = []
+
+  for (const info of infos) {
+    const threshold = resolveLagThreshold(info.name, connection, commandThreshold)
+    const metrics: Array<[string, number]> = [
+      ['ack_pending', Number(info.num_ack_pending ?? 0)],
+      ['pending', Number(info.num_pending ?? 0)],
+      ['waiting', Number(info.num_waiting ?? 0)],
+    ]
+
+    for (const [metric, value] of metrics) {
+      if (value <= threshold) continue
+
+      const key = `${info.stream_name}:${info.name}:${metric}`
+      nextHistory.set(key, value)
+
+      const prior = previous.get(key)
+      if (prior !== undefined && prior > value) continue
+
+      lagging.push(`${info.stream_name}/${info.name} ${metric}=${value} (threshold ${threshold})`)
+    }
+  }
+
+  natsLagHistory.set(endpoint.id, nextHistory)
+  return lagging
+}
+
 async function runNatsCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
   const connection = parseConnection(endpoint.connection_json)
   const serversRaw = connection.servers ?? connection.server ?? connection.url ?? 'nats://127.0.0.1:4222'
@@ -429,8 +496,6 @@ async function runNatsCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
     : [String(serversRaw)]
 
   let nc: Awaited<ReturnType<typeof connectNats>> | null = null
-
-  console.log(`Connecting to NATS servers: ${JSON.stringify(connection)}`)
   try {
     nc = await withTimeout(
       connectNats({
@@ -468,6 +533,77 @@ async function runNatsCheck(endpoint: MonitorEndpoint): Promise<CheckResult> {
         'JetStream stream info',
       )
       actualValue = streamInfo?.config?.name ?? null
+    } else if (command === 'consumers.lag' || command.startsWith('consumers.lag:') || command.startsWith('consumer.lag:')) {
+      const jsm = await nc.jetstreamManager()
+      let commandThreshold: number | null = null
+      let gather: () => Promise<NatsConsumerLagInfo[]>
+
+      if (command.startsWith('consumer.lag:')) {
+        const [streamName, consumerName, thresholdRaw] = command
+          .slice('consumer.lag:'.length)
+          .split(':')
+          .map((part) => part.trim())
+
+        if (!streamName || !consumerName) {
+          return {
+            checkPassed: false,
+            responseCode: 500,
+            matchedValue: null,
+            errorMessage: 'consumer.lag requires consumer.lag:STREAM:CONSUMER[:THRESHOLD]',
+          }
+        }
+
+        if (thresholdRaw) {
+          commandThreshold = Number(thresholdRaw)
+          if (!Number.isFinite(commandThreshold) || commandThreshold < 0) {
+            return {
+              checkPassed: false,
+              responseCode: 500,
+              matchedValue: null,
+              errorMessage: 'consumer.lag threshold must be a non-negative number',
+            }
+          }
+        }
+
+        gather = async () => [await jsm.consumers.info(streamName, consumerName)]
+      } else {
+        const thresholdRaw = command.slice('consumers.lag'.length).replace(/^:/, '').trim()
+        if (thresholdRaw) {
+          commandThreshold = Number(thresholdRaw)
+          if (!Number.isFinite(commandThreshold) || commandThreshold < 0) {
+            return {
+              checkPassed: false,
+              responseCode: 500,
+              matchedValue: null,
+              errorMessage: 'consumers.lag threshold must be a non-negative number',
+            }
+          }
+        }
+
+        gather = async () => {
+          const infos: NatsConsumerLagInfo[] = []
+          for await (const stream of jsm.streams.list()) {
+            for await (const consumer of jsm.consumers.list(stream.config.name)) {
+              infos.push(consumer)
+            }
+          }
+          return infos
+        }
+      }
+
+      const infos = await withTimeout(gather(), config.requestTimeoutMs, 'JetStream consumer info')
+      const lagging = evaluateConsumerLag(endpoint, connection, commandThreshold, infos)
+
+      if (lagging.length) {
+        return {
+          checkPassed: false,
+          responseCode: 500,
+          matchedValue: 'lagging',
+          errorMessage: `Consumer lag: ${lagging.join('; ')}`,
+        }
+      }
+
+      actualValue = 'ok'
     }
 
     const expectedRaw = endpoint.expected_probe_value ?? '"ok"'
