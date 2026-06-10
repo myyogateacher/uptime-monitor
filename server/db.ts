@@ -256,7 +256,24 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 11,
+    name: "add_app_settings_updated_by",
+    up: async () => {
+      await pool.query(`
+        ALTER TABLE app_settings
+          ADD COLUMN updated_by VARCHAR(255) NULL
+      `);
+    },
+  },
 ];
+
+export type AppSettingRecord = {
+  name: string;
+  value: string;
+  updated_by: string | null;
+  updated_at: Date | string | null;
+};
 
 export async function getAppSetting(name: string): Promise<string | null> {
   const [rows] = await pool.query("SELECT value FROM app_settings WHERE name = ? LIMIT 1", [name]);
@@ -264,10 +281,24 @@ export async function getAppSetting(name: string): Promise<string | null> {
   return String(rows[0].value);
 }
 
-export async function setAppSetting(name: string, value: string): Promise<void> {
+export async function getAppSettingRecord(name: string): Promise<AppSettingRecord | null> {
+  const [rows] = await pool.query("SELECT * FROM app_settings WHERE name = ? LIMIT 1", [name]);
+  if (!rows.length) return null;
+  return rows[0] as AppSettingRecord;
+}
+
+export async function setAppSetting(
+  name: string,
+  value: string,
+  updatedBy: string | null = null,
+): Promise<void> {
   await pool.query(
-    "INSERT INTO app_settings (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
-    [name, value],
+    `
+      INSERT INTO app_settings (name, value, updated_by)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_by = VALUES(updated_by)
+    `,
+    [name, value, updatedBy],
   );
 }
 

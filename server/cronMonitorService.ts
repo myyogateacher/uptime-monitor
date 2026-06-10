@@ -4,7 +4,7 @@ import { CronExpressionParser } from 'cron-parser'
 import { connect as connectNats, type NatsConnection } from 'nats'
 
 import { config } from './config'
-import { getAppSetting, pool, setAppSetting } from './db'
+import { getAppSetting, getAppSettingRecord, pool, setAppSetting } from './db'
 import { CRON_RUN_EVENT, monitorEvents } from './events'
 import { notifyCronRun } from './notifier'
 
@@ -41,13 +41,31 @@ const INVALID_EXPRESSION_RETRY_MINUTES = 5
 const DEFAULT_NATS_SUBJECT = 'crons.uptime_monitor'
 const CRON_MONITOR_ENABLED_SETTING = 'cron_monitor_enabled'
 
+export type CronMonitorSettings = {
+  enabled: boolean
+  updatedBy: string | null
+  updatedAt: Date | string | null
+}
+
 export async function isCronMonitorEnabled(): Promise<boolean> {
   const value = await getAppSetting(CRON_MONITOR_ENABLED_SETTING)
   return value === '1' || value === 'true'
 }
 
-export async function setCronMonitorEnabled(enabled: boolean): Promise<void> {
-  await setAppSetting(CRON_MONITOR_ENABLED_SETTING, enabled ? '1' : '0')
+export async function getCronMonitorSettings(): Promise<CronMonitorSettings> {
+  const record = await getAppSettingRecord(CRON_MONITOR_ENABLED_SETTING)
+  return {
+    enabled: record?.value === '1' || record?.value === 'true',
+    updatedBy: record?.updated_by ?? null,
+    updatedAt: record?.updated_at ?? null,
+  }
+}
+
+export async function setCronMonitorEnabled(
+  enabled: boolean,
+  updatedBy: string | null = null,
+): Promise<void> {
+  await setAppSetting(CRON_MONITOR_ENABLED_SETTING, enabled ? '1' : '0', updatedBy)
 }
 
 const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {

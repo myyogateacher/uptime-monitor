@@ -624,6 +624,14 @@ function StatusPage({
     const downCount = endpoints.filter(
         (endpoint) => endpoint.status === "down",
     ).length;
+    const cronHealthyCount = crons.filter(
+        (cronJob) => cronJob.last_run_status === "success",
+    ).length;
+    const cronFailingCount = crons.filter(
+        (cronJob) =>
+            cronJob.last_run_status === "failed" ||
+            cronJob.last_run_status === "missed",
+    ).length;
 
     const renderStatus = (endpoint) => {
         if (endpoint.is_paused) return "bg-slate-400";
@@ -664,32 +672,6 @@ function StatusPage({
                             Open Admin
                         </a>
                     </div>
-                    <div className="mt-5 grid gap-3 sm:grid-cols-4">
-                        <div className="rounded-xl border border-white/60 bg-white/55 p-3 backdrop-blur">
-                            <p className="text-xs text-slate-500">System</p>
-                            <p className="text-lg font-semibold">
-                                {health.status}
-                            </p>
-                        </div>
-                        <div className="rounded-xl border border-white/60 bg-white/55 p-3 backdrop-blur">
-                            <p className="text-xs text-slate-500">Monitors</p>
-                            <p className="text-lg font-semibold">
-                                {endpoints.length}
-                            </p>
-                        </div>
-                        <div className="rounded-xl border border-emerald-200/60 bg-emerald-50/70 p-3 backdrop-blur">
-                            <p className="text-xs text-emerald-700">Up</p>
-                            <p className="text-lg font-semibold text-emerald-800">
-                                {upCount}
-                            </p>
-                        </div>
-                        <div className="rounded-xl border border-rose-200/60 bg-rose-50/70 p-3 backdrop-blur">
-                            <p className="text-xs text-rose-700">Down</p>
-                            <p className="text-lg font-semibold text-rose-800">
-                                {downCount}
-                            </p>
-                        </div>
-                    </div>
                     <div className="mt-5 flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur md:max-w-fit">
                         {STATUS_TAB_OPTIONS.map((tab) => (
                             <button
@@ -706,6 +688,71 @@ function StatusPage({
                             </button>
                         ))}
                     </div>
+                    {statusTab === "crons" ? (
+                        <div className="mt-5 grid gap-3 sm:grid-cols-4">
+                            <div className="rounded-xl border border-white/60 bg-white/55 p-3 backdrop-blur">
+                                <p className="text-xs text-slate-500">
+                                    System
+                                </p>
+                                <p className="text-lg font-semibold">
+                                    {health.status}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-white/60 bg-white/55 p-3 backdrop-blur">
+                                <p className="text-xs text-slate-500">Crons</p>
+                                <p className="text-lg font-semibold">
+                                    {crons.length}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-emerald-200/60 bg-emerald-50/70 p-3 backdrop-blur">
+                                <p className="text-xs text-emerald-700">
+                                    Healthy
+                                </p>
+                                <p className="text-lg font-semibold text-emerald-800">
+                                    {cronHealthyCount}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-rose-200/60 bg-rose-50/70 p-3 backdrop-blur">
+                                <p className="text-xs text-rose-700">
+                                    Failing
+                                </p>
+                                <p className="text-lg font-semibold text-rose-800">
+                                    {cronFailingCount}
+                                </p>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="mt-5 grid gap-3 sm:grid-cols-4">
+                            <div className="rounded-xl border border-white/60 bg-white/55 p-3 backdrop-blur">
+                                <p className="text-xs text-slate-500">
+                                    System
+                                </p>
+                                <p className="text-lg font-semibold">
+                                    {health.status}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-white/60 bg-white/55 p-3 backdrop-blur">
+                                <p className="text-xs text-slate-500">
+                                    Monitors
+                                </p>
+                                <p className="text-lg font-semibold">
+                                    {endpoints.length}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-emerald-200/60 bg-emerald-50/70 p-3 backdrop-blur">
+                                <p className="text-xs text-emerald-700">Up</p>
+                                <p className="text-lg font-semibold text-emerald-800">
+                                    {upCount}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-rose-200/60 bg-rose-50/70 p-3 backdrop-blur">
+                                <p className="text-xs text-rose-700">Down</p>
+                                <p className="text-lg font-semibold text-rose-800">
+                                    {downCount}
+                                </p>
+                            </div>
+                        </div>
+                    )}
                     {statusTab === "crons" ? (
                         <div className="mt-5 flex flex-wrap items-center gap-3">
                             <div className="flex items-center gap-2">
@@ -1197,6 +1244,7 @@ function AdminPage({
     handleStartEditCron,
     handleDeleteCron,
     cronMonitorEnabled,
+    cronMonitorMeta,
     handleToggleCronMonitor,
     currentTimeMs,
     error,
@@ -2093,6 +2141,16 @@ function AdminPage({
                                         ? "Enabled — crons are triggered on schedule and runs are tracked."
                                         : "Disabled — no triggers fire and run health is not tracked."}
                                 </p>
+                                {cronMonitorMeta?.updatedBy ? (
+                                    <p className="mt-0.5 text-[11px] text-slate-400">
+                                        Last changed by{" "}
+                                        {cronMonitorMeta.updatedBy}{" "}
+                                        {formatRelativeTime(
+                                            cronMonitorMeta.updatedAt,
+                                            currentTimeMs,
+                                        )}
+                                    </p>
+                                ) : null}
                             </div>
                             <button
                                 type="button"
@@ -2635,6 +2693,10 @@ function App() {
     const [isSavingCron, setIsSavingCron] = useState(false);
     const [statusTab, setStatusTab] = useState("services");
     const [cronMonitorEnabled, setCronMonitorEnabled] = useState(false);
+    const [cronMonitorMeta, setCronMonitorMeta] = useState({
+        updatedBy: null,
+        updatedAt: null,
+    });
     const [cronRunsByName, setCronRunsByName] = useState({});
     const [cronRunsMode, setCronRunsMode] = useState("recent");
     const [cronWindowDays, setCronWindowDays] = useState(7);
@@ -2772,6 +2834,10 @@ function App() {
                 try {
                     const settings = await monitoringService.getCronSettings();
                     setCronMonitorEnabled(Boolean(settings?.enabled));
+                    setCronMonitorMeta({
+                        updatedBy: settings?.updatedBy ?? null,
+                        updatedAt: settings?.updatedAt ?? null,
+                    });
                 } catch {
                     setCronMonitorEnabled(false);
                 }
@@ -3416,6 +3482,10 @@ function App() {
                 enabled: !cronMonitorEnabled,
             });
             setCronMonitorEnabled(Boolean(response?.enabled));
+            setCronMonitorMeta({
+                updatedBy: response?.updatedBy ?? null,
+                updatedAt: response?.updatedAt ?? null,
+            });
         } catch (requestError) {
             setError(requestError.message);
         }
@@ -3518,6 +3588,7 @@ function App() {
             handleStartEditCron={handleStartEditCron}
             handleDeleteCron={handleDeleteCron}
             cronMonitorEnabled={cronMonitorEnabled}
+            cronMonitorMeta={cronMonitorMeta}
             handleToggleCronMonitor={handleToggleCronMonitor}
             currentTimeMs={currentTimeMs}
             error={error}

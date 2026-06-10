@@ -28,7 +28,7 @@ import {
 } from './events'
 import { startMonitor, stopMonitor, triggerCheckNow } from './monitorService'
 import {
-  isCronMonitorEnabled,
+  getCronMonitorSettings,
   recordCronRunStatus,
   resetCronSchedule,
   setCronMonitorEnabled,
@@ -1335,13 +1335,14 @@ app.get('/api/crons', async (_req: Request, res: Response) => {
 // Registered before the /api/crons/:cron routes so "settings" is never
 // captured as a cron name.
 app.get('/api/crons/settings', async (_req: Request, res: Response) => {
-  res.json({ enabled: await isCronMonitorEnabled() })
+  res.json(await getCronMonitorSettings())
 })
 
 app.put('/api/crons/settings', requireEditor, async (req: Request, res: Response) => {
   const enabled = Boolean(req.body?.enabled)
-  await setCronMonitorEnabled(enabled)
-  return res.json({ enabled })
+  const updatedBy = getSessionEmail(req) || null
+  await setCronMonitorEnabled(enabled, updatedBy)
+  return res.json(await getCronMonitorSettings())
 })
 
 // Run-status reports come from external services, so session auth doesn't apply.
