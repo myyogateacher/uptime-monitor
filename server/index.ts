@@ -742,10 +742,12 @@ app.post('/api/auth/logout', (req: Request, res: Response) => {
 
 app.get('/api/health', async (_req: Request, res: Response) => {
   const [rows] = await pool.query('SELECT COUNT(*) AS endpoint_count FROM monitor_endpoints')
+  const [cronRows] = await pool.query('SELECT COUNT(*) AS cron_count FROM cron_monitoring')
 
   res.json({
     status: 'ok',
     endpointCount: rows[0]?.endpoint_count ?? 0,
+    cronCount: cronRows[0]?.cron_count ?? 0,
     timestamp: new Date().toISOString(),
   })
 })

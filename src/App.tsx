@@ -959,18 +959,22 @@ function AdminPage({
                             Open Status Page
                         </a>
                     </div>
-                    <div className="mt-4 grid grid-cols-2 gap-3 text-sm md:max-w-xl">
+                    <div className="mt-4 grid grid-cols-2 gap-3 text-sm md:max-w-3xl md:grid-cols-3">
                         <div className="rounded-lg border border-white/60 bg-white/45 p-3">
                             <p className="text-slate-500">Service Status</p>
                             <p className="font-semibold">{health.status}</p>
                         </div>
                         <div className="rounded-lg border border-white/60 bg-white/45 p-3">
                             <p className="text-slate-500">
-                                Configured Monitors
+                                Configured Services
                             </p>
                             <p className="font-semibold">
                                 {health.endpointCount ?? 0}
                             </p>
+                        </div>
+                        <div className="rounded-lg border border-white/60 bg-white/45 p-3">
+                            <p className="text-slate-500">Configured Crons</p>
+                            <p className="font-semibold">{crons.length}</p>
                         </div>
                     </div>
                     <div className="mt-5 flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur md:max-w-fit">
