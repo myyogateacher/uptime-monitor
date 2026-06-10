@@ -123,4 +123,24 @@ export const monitoringService = {
       method: 'DELETE',
     })
   },
+  getCrons() {
+    return request('/api/crons')
+  },
+  createCron(input) {
+    return request('/api/crons', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  },
+  updateCron(cronName, input) {
+    return request(`/api/crons/${encodeURIComponent(cronName)}`, {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    })
+  },
+  deleteCron(cronName) {
+    return request(`/api/crons/${encodeURIComponent(cronName)}`, {
+      method: 'DELETE',
+    })
+  },
 }

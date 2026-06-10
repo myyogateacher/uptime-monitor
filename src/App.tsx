@@ -49,6 +49,31 @@ const INITIAL_ENDPOINT_FORM = {
     up_retries: 1,
 };
 
+const CRON_TRIGGER_TYPE_OPTIONS = [
+    { value: "nats", label: "NATS" },
+    { value: "http", label: "HTTP" },
+];
+
+const CRON_HTTP_METHOD_OPTIONS = ["NONE", "GET", "POST"];
+
+const INITIAL_CRON_FORM = {
+    cron: "",
+    expression: "",
+    service: "apis",
+    endpoint: "",
+    trigger_type: "nats",
+    http_method: "NONE",
+    start_window_seconds: 60,
+    ping_window_seconds: 60,
+    track_run: true,
+    status: true,
+};
+
+const ADMIN_TAB_OPTIONS = [
+    { value: "routes", label: "Monitored Routes" },
+    { value: "crons", label: "Cron Scheduled" },
+];
+
 const STATUS_GRANULARITY_OPTIONS: Array<{
     value: StatsGranularity;
     label: string;
@@ -865,10 +890,20 @@ function AdminPage({
     handleTogglePause,
     handleToggleGroupPause,
     handleStartEdit,
+    crons,
+    cronForm,
+    setCronForm,
+    editingCronName,
+    isSavingCron,
+    handleCronSubmit,
+    handleCancelCronEdit,
+    handleStartEditCron,
+    handleDeleteCron,
     currentTimeMs,
     error,
 }) {
     const isHttpType = endpointForm.monitor_type === "http";
+    const [activeTab, setActiveTab] = useState("routes");
     const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false);
     const [collapsedGroups, setCollapsedGroups] = useState<
         Record<number, boolean>
@@ -935,8 +970,25 @@ function AdminPage({
                             </p>
                         </div>
                     </div>
+                    <div className="mt-5 flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur md:max-w-fit">
+                        {ADMIN_TAB_OPTIONS.map((tab) => (
+                            <button
+                                key={tab.value}
+                                type="button"
+                                onClick={() => setActiveTab(tab.value)}
+                                className={`cursor-pointer rounded-full px-4 py-2 text-sm font-medium transition ${
+                                    activeTab === tab.value
+                                        ? "bg-slate-900 text-white shadow"
+                                        : "text-slate-600 hover:bg-white/75"
+                                }`}
+                            >
+                                {tab.label}
+                            </button>
+                        ))}
+                    </div>
                 </section>
 
+                {activeTab === "routes" ? (
                 <section className="grid gap-6 lg:grid-cols-[1.35fr_1fr]">
                     <section className="glass-card rounded-xl p-5">
                         <h2 className="text-lg font-semibold">
@@ -1722,6 +1774,370 @@ function AdminPage({
                         )}
                     </section>
                 </section>
+                ) : (
+                <section className="grid gap-6 lg:grid-cols-[1.35fr_1fr]">
+                    <section className="glass-card rounded-xl p-5">
+                        <h2 className="text-lg font-semibold">
+                            Scheduled Crons
+                        </h2>
+                        {!canEdit ? (
+                            <p className="mt-2 rounded-md border border-amber-200/80 bg-amber-50/75 px-3 py-2 text-xs text-amber-700">
+                                You have read-only access. Editing actions are
+                                restricted to allowed editor emails.
+                            </p>
+                        ) : null}
+                        {isLoading ? (
+                            <p className="mt-3 text-sm text-slate-500">
+                                Loading...
+                            </p>
+                        ) : (
+                            <div className="mt-4 space-y-3">
+                                {!crons.length && (
+                                    <p className="text-sm text-slate-500">
+                                        No crons configured yet.
+                                    </p>
+                                )}
+                                {crons.map((cronJob) => (
+                                    <article
+                                        key={cronJob.cron}
+                                        className="rounded-lg border border-white/60 bg-white/50 p-3 backdrop-blur"
+                                    >
+                                        <div className="flex flex-wrap items-center justify-between gap-3">
+                                            <div>
+                                                <div className="flex items-center gap-2">
+                                                    <span
+                                                        className={`h-2.5 w-2.5 rounded-full ${
+                                                            cronJob.status
+                                                                ? "bg-emerald-500"
+                                                                : "bg-slate-400"
+                                                        }`}
+                                                    />
+                                                    <p className="font-medium">
+                                                        {cronJob.cron}
+                                                    </p>
+                                                    <span className="rounded bg-white/65 px-2 py-0.5 font-mono text-xs uppercase backdrop-blur">
+                                                        {cronJob.trigger_type}
+                                                    </span>
+                                                    {!cronJob.status ? (
+                                                        <span className="rounded bg-slate-200/85 px-2 py-0.5 text-[10px] font-semibold uppercase text-slate-700 backdrop-blur">
+                                                            disabled
+                                                        </span>
+                                                    ) : null}
+                                                </div>
+                                                <p className="mt-1 break-all font-mono text-xs text-slate-600">
+                                                    {cronJob.expression}
+                                                </p>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                        handleStartEditCron(
+                                                            cronJob,
+                                                        )
+                                                    }
+                                                    className="cursor-pointer rounded border border-slate-300/70 bg-white/70 px-3 py-1.5 text-xs text-slate-700 transition duration-150 ease-out hover:bg-white active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300/80"
+                                                >
+                                                    Edit
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    disabled={!canEdit}
+                                                    onClick={() =>
+                                                        handleDeleteCron(
+                                                            cronJob.cron,
+                                                        )
+                                                    }
+                                                    className="cursor-pointer rounded border border-rose-300/70 bg-gradient-to-r from-rose-500 to-pink-500 px-3 py-1.5 text-xs text-white shadow-[0_6px_16px_rgba(244,63,94,0.24)] transition duration-150 ease-out hover:from-rose-400 hover:to-pink-400 active:scale-[0.97] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/80 disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100"
+                                                >
+                                                    Delete
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div className="mt-3 grid gap-2 text-xs text-slate-600 md:grid-cols-2">
+                                            <p>
+                                                Service:{" "}
+                                                {cronJob.service || "n/a"}
+                                            </p>
+                                            <p>
+                                                Start/Ping window:{" "}
+                                                {cronJob.start_window_seconds}
+                                                s/
+                                                {cronJob.ping_window_seconds}
+                                                s
+                                            </p>
+                                            <p>
+                                                HTTP method:{" "}
+                                                {cronJob.http_method ?? "NONE"}
+                                            </p>
+                                            <p>
+                                                Track run:{" "}
+                                                {cronJob.track_run
+                                                    ? "yes"
+                                                    : "no"}
+                                            </p>
+                                            {cronJob.endpoint ? (
+                                                <p className="break-all font-mono md:col-span-2">
+                                                    Endpoint:{" "}
+                                                    {cronJob.endpoint}
+                                                </p>
+                                            ) : null}
+                                        </div>
+                                    </article>
+                                ))}
+                            </div>
+                        )}
+                    </section>
+
+                    <section className="space-y-4">
+                        <form
+                            onSubmit={handleCronSubmit}
+                            className="glass-card rounded-xl p-5"
+                        >
+                            <div className="flex items-center justify-between gap-3">
+                                <h2 className="text-lg font-semibold">
+                                    {editingCronName
+                                        ? "Edit Cron"
+                                        : "Add Cron"}
+                                </h2>
+                                {editingCronName ? (
+                                    <button
+                                        type="button"
+                                        onClick={handleCancelCronEdit}
+                                        disabled={!canEdit}
+                                        className="cursor-pointer rounded border border-slate-300/70 bg-white/70 px-3 py-1.5 text-xs text-slate-700 transition duration-150 ease-out hover:bg-white active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100"
+                                    >
+                                        Cancel Edit
+                                    </button>
+                                ) : null}
+                            </div>
+                            <fieldset
+                                disabled={!canEdit || isSavingCron}
+                                className="contents"
+                            >
+                                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                    <label className="text-sm font-medium text-slate-700">
+                                        Cron Name
+                                        <input
+                                            required
+                                            value={cronForm.cron}
+                                            disabled={Boolean(editingCronName)}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    cron: event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-sm focus:border-slate-500 focus:outline-none disabled:bg-slate-100 disabled:text-slate-500"
+                                            placeholder="update_finish_sessions"
+                                        />
+                                    </label>
+                                    <label className="text-sm font-medium text-slate-700">
+                                        Cron Expression
+                                        <input
+                                            required
+                                            value={cronForm.expression}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    expression:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-sm focus:border-slate-500 focus:outline-none"
+                                            placeholder="*/5 * * * *"
+                                        />
+                                    </label>
+                                </div>
+
+                                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                    <label className="text-sm font-medium text-slate-700">
+                                        Service
+                                        <input
+                                            value={cronForm.service}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    service:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+                                            placeholder="apis"
+                                        />
+                                    </label>
+                                    <label className="text-sm font-medium text-slate-700">
+                                        Trigger Type
+                                        <select
+                                            value={cronForm.trigger_type}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    trigger_type:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+                                        >
+                                            {CRON_TRIGGER_TYPE_OPTIONS.map(
+                                                (option) => (
+                                                    <option
+                                                        key={option.value}
+                                                        value={option.value}
+                                                    >
+                                                        {option.label}
+                                                    </option>
+                                                ),
+                                            )}
+                                        </select>
+                                    </label>
+                                </div>
+
+                                {cronForm.trigger_type === "http" ? (
+                                    <div className="mt-3 grid gap-3 md:grid-cols-[1fr_8rem]">
+                                        <label className="text-sm font-medium text-slate-700">
+                                            Endpoint
+                                            <input
+                                                value={cronForm.endpoint}
+                                                onChange={(event) =>
+                                                    setCronForm(
+                                                        (current) => ({
+                                                            ...current,
+                                                            endpoint:
+                                                                event.target
+                                                                    .value,
+                                                        }),
+                                                    )
+                                                }
+                                                className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-xs focus:border-slate-500 focus:outline-none"
+                                                placeholder="https://example.com/cron/run"
+                                            />
+                                        </label>
+                                        <label className="text-sm font-medium text-slate-700">
+                                            HTTP Method
+                                            <select
+                                                value={cronForm.http_method}
+                                                onChange={(event) =>
+                                                    setCronForm(
+                                                        (current) => ({
+                                                            ...current,
+                                                            http_method:
+                                                                event.target
+                                                                    .value,
+                                                        }),
+                                                    )
+                                                }
+                                                className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+                                            >
+                                                {CRON_HTTP_METHOD_OPTIONS.map(
+                                                    (method) => (
+                                                        <option
+                                                            key={method}
+                                                            value={method}
+                                                        >
+                                                            {method}
+                                                        </option>
+                                                    ),
+                                                )}
+                                            </select>
+                                        </label>
+                                    </div>
+                                ) : null}
+
+                                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                    <label className="text-sm font-medium text-slate-700">
+                                        Start Window (seconds)
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            value={
+                                                cronForm.start_window_seconds
+                                            }
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    start_window_seconds:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+                                        />
+                                    </label>
+                                    <label className="text-sm font-medium text-slate-700">
+                                        Ping Window (seconds)
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            value={
+                                                cronForm.ping_window_seconds
+                                            }
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    ping_window_seconds:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+                                        />
+                                    </label>
+                                </div>
+
+                                <div className="mt-4 flex flex-wrap gap-5">
+                                    <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-700">
+                                        <input
+                                            type="checkbox"
+                                            checked={cronForm.track_run}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    track_run:
+                                                        event.target.checked,
+                                                }))
+                                            }
+                                            className="h-4 w-4 cursor-pointer rounded border-slate-300"
+                                        />
+                                        Track run
+                                    </label>
+                                    <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-slate-700">
+                                        <input
+                                            type="checkbox"
+                                            checked={cronForm.status}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    status: event.target
+                                                        .checked,
+                                                }))
+                                            }
+                                            className="h-4 w-4 cursor-pointer rounded border-slate-300"
+                                        />
+                                        Active
+                                    </label>
+                                </div>
+
+                                <button
+                                    type="submit"
+                                    disabled={isSavingCron || !canEdit}
+                                    className="mt-4 cursor-pointer rounded-lg border border-blue-300/60 bg-gradient-to-r from-blue-600 to-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-[0_8px_24px_rgba(37,99,235,0.28)] transition duration-150 ease-out hover:from-blue-500 hover:to-indigo-500 hover:shadow-[0_10px_28px_rgba(37,99,235,0.35)] active:scale-[0.98] active:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300/80 disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100"
+                                >
+                                    {isSavingCron
+                                        ? "Saving..."
+                                        : editingCronName
+                                          ? "Update Cron"
+                                          : "Create Cron"}
+                                </button>
+                            </fieldset>
+                        </form>
+
+                        {error && (
+                            <p className="rounded-lg border border-rose-200/80 bg-rose-50/80 px-4 py-3 text-sm text-rose-700 backdrop-blur">
+                                {error}
+                            </p>
+                        )}
+                    </section>
+                </section>
+                )}
             </div>
         </main>
     );
@@ -1750,6 +2166,10 @@ function App() {
     const [statusRangeDays, setStatusRangeDays] = useState(7);
     const [endpointForm, setEndpointForm] = useState(INITIAL_ENDPOINT_FORM);
     const [editingEndpointId, setEditingEndpointId] = useState(null);
+    const [crons, setCrons] = useState([]);
+    const [cronForm, setCronForm] = useState(INITIAL_CRON_FORM);
+    const [editingCronName, setEditingCronName] = useState(null);
+    const [isSavingCron, setIsSavingCron] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
     const [isSavingEndpoint, setIsSavingEndpoint] = useState(false);
     const [error, setError] = useState("");
@@ -1850,6 +2270,24 @@ function App() {
                     ? { ...current, group_name: groupsRes[0].name }
                     : current,
             );
+
+            if (isMonitorsPage) {
+                // Cron API lands in the next step; don't fail the page if absent.
+                try {
+                    const cronsRes = await monitoringService.getCrons();
+                    setCrons(
+                        Array.isArray(cronsRes)
+                            ? [...cronsRes].sort((left, right) =>
+                                  String(left.cron).localeCompare(
+                                      String(right.cron),
+                                  ),
+                              )
+                            : [],
+                    );
+                } catch {
+                    setCrons([]);
+                }
+            }
 
             if (isStatusPage) {
                 await loadRuns(endpointsRes, {
@@ -2318,6 +2756,117 @@ function App() {
         }
     };
 
+    const handleCronSubmit = async (event) => {
+        event.preventDefault();
+        setError("");
+        if (!canEdit) {
+            setError("You do not have permission to edit crons");
+            return;
+        }
+        setIsSavingCron(true);
+
+        try {
+            const normalizedCronName = cronForm.cron.trim();
+            if (!normalizedCronName) throw new Error("Cron name is required");
+            if (!cronForm.expression.trim())
+                throw new Error("Cron expression is required");
+
+            const payload = {
+                ...cronForm,
+                cron: normalizedCronName,
+                expression: cronForm.expression.trim(),
+                service: cronForm.service.trim(),
+                endpoint: cronForm.endpoint.trim(),
+                start_window_seconds: Number(cronForm.start_window_seconds),
+                ping_window_seconds: Number(cronForm.ping_window_seconds),
+                track_run: cronForm.track_run ? 1 : 0,
+                status: cronForm.status ? 1 : 0,
+            };
+
+            if (editingCronName) {
+                const updatedCron = await monitoringService.updateCron(
+                    editingCronName,
+                    payload,
+                );
+                setCrons((current) =>
+                    current.map((cronJob) =>
+                        cronJob.cron === editingCronName
+                            ? { ...cronJob, ...(updatedCron ?? payload) }
+                            : cronJob,
+                    ),
+                );
+            } else {
+                const createdCron =
+                    await monitoringService.createCron(payload);
+                setCrons((current) =>
+                    [
+                        createdCron ?? payload,
+                        ...current.filter(
+                            (cronJob) => cronJob.cron !== normalizedCronName,
+                        ),
+                    ].sort((left, right) =>
+                        String(left.cron).localeCompare(String(right.cron)),
+                    ),
+                );
+            }
+
+            setCronForm(INITIAL_CRON_FORM);
+            setEditingCronName(null);
+        } catch (requestError) {
+            setError(requestError.message);
+        } finally {
+            setIsSavingCron(false);
+        }
+    };
+
+    const handleStartEditCron = (cronJob) => {
+        if (!canEdit) {
+            setError("You do not have permission to edit crons");
+            return;
+        }
+        setCronForm({
+            cron: cronJob.cron ?? "",
+            expression: cronJob.expression ?? "",
+            service: cronJob.service ?? "",
+            endpoint: cronJob.endpoint ?? "",
+            trigger_type: cronJob.trigger_type ?? "nats",
+            http_method: cronJob.http_method ?? "NONE",
+            start_window_seconds: cronJob.start_window_seconds ?? 60,
+            ping_window_seconds: cronJob.ping_window_seconds ?? 60,
+            track_run: Boolean(cronJob.track_run),
+            status: Boolean(cronJob.status),
+        });
+        setEditingCronName(cronJob.cron);
+        window.scrollTo({ top: 0, behavior: "smooth" });
+    };
+
+    const handleCancelCronEdit = () => {
+        setEditingCronName(null);
+        setCronForm(INITIAL_CRON_FORM);
+    };
+
+    const handleDeleteCron = async (cronName) => {
+        setError("");
+        if (!canEdit) {
+            setError("You do not have permission to edit crons");
+            return;
+        }
+        if (!window.confirm(`Delete cron "${cronName}"?`)) return;
+
+        try {
+            await monitoringService.deleteCron(cronName);
+            setCrons((current) =>
+                current.filter((cronJob) => cronJob.cron !== cronName),
+            );
+            if (editingCronName === cronName) {
+                setEditingCronName(null);
+                setCronForm(INITIAL_CRON_FORM);
+            }
+        } catch (requestError) {
+            setError(requestError.message);
+        }
+    };
+
     if (isHomePage) {
         return <LandingPage />;
     }
@@ -2369,6 +2918,15 @@ function App() {
             handleTogglePause={handleTogglePause}
             handleToggleGroupPause={handleToggleGroupPause}
             handleStartEdit={handleStartEdit}
+            crons={crons}
+            cronForm={cronForm}
+            setCronForm={setCronForm}
+            editingCronName={editingCronName}
+            isSavingCron={isSavingCron}
+            handleCronSubmit={handleCronSubmit}
+            handleCancelCronEdit={handleCancelCronEdit}
+            handleStartEditCron={handleStartEditCron}
+            handleDeleteCron={handleDeleteCron}
             currentTimeMs={currentTimeMs}
             error={error}
         />

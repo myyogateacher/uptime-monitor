@@ -1,15 +1,15 @@
-import mysql from 'mysql2/promise'
-import { config } from './config'
+import mysql from "mysql2/promise";
+import { config } from "./config";
 
 export const pool: any = mysql.createPool({
   ...config.mysql,
   waitForConnections: true,
-})
+});
 
 const MIGRATIONS = [
   {
     version: 1,
-    name: 'create_monitor_groups',
+    name: "create_monitor_groups",
     up: async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS monitor_groups (
@@ -19,12 +19,12 @@ const MIGRATIONS = [
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )
-      `)
+      `);
     },
   },
   {
     version: 2,
-    name: 'create_monitor_endpoints',
+    name: "create_monitor_endpoints",
     up: async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS monitor_endpoints (
@@ -60,12 +60,12 @@ const MIGRATIONS = [
             FOREIGN KEY (group_id) REFERENCES monitor_groups(id)
             ON DELETE CASCADE
         )
-      `)
+      `);
     },
   },
   {
     version: 3,
-    name: 'create_monitor_check_runs',
+    name: "create_monitor_check_runs",
     up: async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS monitor_check_runs (
@@ -81,20 +81,110 @@ const MIGRATIONS = [
             FOREIGN KEY (endpoint_id) REFERENCES monitor_endpoints(id)
             ON DELETE CASCADE
         )
-      `)
+      `);
     },
   },
   {
     version: 4,
-    name: 'add_monitor_check_runs_indexes',
+    name: "add_monitor_check_runs_indexes",
     up: async () => {
       await pool.query(`
         CREATE INDEX idx_monitor_check_runs_endpoint_checked_at
         ON monitor_check_runs (endpoint_id, checked_at)
-      `)
+      `);
     },
   },
-]
+  {
+    version: 5,
+    name: "create_cron_monitoring",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS cron_monitoring (
+          cron VARCHAR(100) NOT NULL,
+          expression VARCHAR(100) NOT NULL,
+          start_window_seconds INT NOT NULL DEFAULT 300,
+          ping_window_seconds INT NOT NULL DEFAULT 300,
+          status TINYINT(1) NOT NULL DEFAULT 1,
+          created_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          modified_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          service VARCHAR(255) NOT NULL DEFAULT '',
+          endpoint VARCHAR(256) NOT NULL DEFAULT '',
+          trigger_type ENUM('nats','http') DEFAULT 'nats',
+          track_run TINYINT(1) NOT NULL DEFAULT 1,
+          http_method ENUM('GET','POST','NONE') NOT NULL DEFAULT 'NONE',
+          PRIMARY KEY (cron)
+        )
+      `);
+    },
+  },
+  {
+    version: 6,
+    name: "seed_cron_monitoring",
+    up: async () => {
+      // Imported from docs/cron-trigger-monitor.sql: [cron, expression, status].
+      // All seed rows share service 'apis', nats trigger, 60s windows, track_run on.
+      const seedCrons: Array<[string, string]> = [
+        ["change_reqest_replacement_status", "*/5 * * * *"],
+        ["charge_instalment", "45 8 * * *"],
+        ["charge_subscription", "22 * * * *"],
+        ["check_teacher_session_join", "3,33 * * * *"],
+        ["concierge_per_day_limit_change", "05 14 * * *"],
+        ["daily_group_session_mail_list", "0 * * * *"],
+        ["daily_reports", "5 7 * * *"],
+        ["daily_sales_leads_reports", "15 8 * * *"],
+        ["daily_summary_teacher", "0 * * * *"],
+        ["membership_paused", "0 * * * *"],
+        ["no_show_first_session", "*/30 * * * *"],
+        ["pause_complete_reminder", "0 0 * * *"],
+        ["prepaid_recharge_reminder", "0 6 * * *"],
+        ["reminder_session_one_day", "*/30 * * * *"],
+        ["reminder_session_one_hour", "*/30 * * * *"],
+        ["reminders_for_yoga_consults", "*/10 * * * *"],
+        ["renew_failed_recurring_transactions", "0 8 * * *"],
+        ["repeat_group_session", "0 14 * * *"],
+        ["repeat_session", "0 * * * *"],
+        ["repeat_session_popup_and_create_roadmap", "*/13 * * * *"],
+        ["send_10min_reminder_push", "*/10 * * * *"],
+        ["send_gifting_email", "0 * * * *"],
+        ["send_session_rating_emails", "*/30 * * * *"],
+        ["session_status_reports", "0 */5 * * *"],
+        ["single_email_for_session_rating", "*/10 * * * *"],
+        ["sort_teacher_availability_by_timezone", "*/6 * * * *"],
+        ["start_future_membership", "2 * * * *"],
+        ["student_referral", "0 * * * *"],
+        ["update_1_day_cron", "5 2 * * *"],
+        ["update_1_hour_cron", "15 * * * *"],
+        ["update_15_min_cron", "*/15 * * * *"],
+        ["update_20_min_cron", "*/20 * * * *"],
+        ["update_blast_subject", "0 1 * * *"],
+        ["update_daily_teacher_availability_score", "*/30 * * * *"],
+        ["update_finish_sessions", "*/5 * * * *"],
+        ["weekly_reports", "5 7 * * MON"],
+        ["zendesk_sync_profiles", "*/50 */1 * * *"],
+      ];
+
+      const values = seedCrons.map(([cron, expression]) => [
+        cron,
+        expression,
+        60,
+        60,
+        1,
+        "apis",
+        "",
+        "nats",
+        1,
+        "NONE",
+      ]);
+
+      await pool.query(
+        `INSERT IGNORE INTO cron_monitoring
+          (cron, expression, start_window_seconds, ping_window_seconds, status, service, endpoint, trigger_type, track_run, http_method)
+         VALUES ?`,
+        [values],
+      );
+    },
+  },
+];
 
 async function ensureSchemaMigrationsTable() {
   await pool.query(`
@@ -103,25 +193,27 @@ async function ensureSchemaMigrationsTable() {
       name VARCHAR(128) NOT NULL,
       applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
-  `)
+  `);
 }
 
 async function getAppliedVersions() {
-  const [rows] = await pool.query('SELECT version FROM schema_migrations')
-  return new Set((rows as { version: number }[]).map((row) => Number(row.version)))
+  const [rows] = await pool.query("SELECT version FROM schema_migrations");
+  return new Set(
+    (rows as { version: number }[]).map((row) => Number(row.version)),
+  );
 }
 
 export async function initDatabase() {
-  await ensureSchemaMigrationsTable()
-  const appliedVersions = await getAppliedVersions()
+  await ensureSchemaMigrationsTable();
+  const appliedVersions = await getAppliedVersions();
 
   for (const migration of MIGRATIONS) {
-    if (appliedVersions.has(migration.version)) continue
+    if (appliedVersions.has(migration.version)) continue;
 
-    await migration.up()
-    await pool.query('INSERT INTO schema_migrations (version, name) VALUES (?, ?)', [
-      migration.version,
-      migration.name,
-    ])
+    await migration.up();
+    await pool.query(
+      "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+      [migration.version, migration.name],
+    );
   }
 }
