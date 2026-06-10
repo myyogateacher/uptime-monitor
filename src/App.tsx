@@ -54,7 +54,7 @@ const CRON_TRIGGER_TYPE_OPTIONS = [
     { value: "http", label: "HTTP" },
 ];
 
-const CRON_HTTP_METHOD_OPTIONS = ["NONE", "GET", "POST"];
+const CRON_HTTP_METHOD_OPTIONS = ["GET", "POST"];
 
 const INITIAL_CRON_FORM = {
     cron: "",
@@ -63,6 +63,9 @@ const INITIAL_CRON_FORM = {
     endpoint: "",
     trigger_type: "nats",
     http_method: "NONE",
+    headers_json: "",
+    body_text: "",
+    nats_subject: "crons.uptime_monitor",
     start_window_seconds: 60,
     ping_window_seconds: 60,
     track_run: true,
@@ -70,8 +73,8 @@ const INITIAL_CRON_FORM = {
 };
 
 const ADMIN_TAB_OPTIONS = [
-    { value: "routes", label: "Monitored Routes" },
-    { value: "crons", label: "Cron Scheduled" },
+    { value: "routes", label: "Monitored Services" },
+    { value: "crons", label: "Cron Health" },
 ];
 
 const STATUS_GRANULARITY_OPTIONS: Array<{
@@ -1778,7 +1781,7 @@ function AdminPage({
                 <section className="grid gap-6 lg:grid-cols-[1.35fr_1fr]">
                     <section className="glass-card rounded-xl p-5">
                         <h2 className="text-lg font-semibold">
-                            Scheduled Crons
+                            Cron Health
                         </h2>
                         {!canEdit ? (
                             <p className="mt-2 rounded-md border border-amber-200/80 bg-amber-50/75 px-3 py-2 text-xs text-amber-700">
@@ -1876,6 +1879,14 @@ function AdminPage({
                                                     ? "yes"
                                                     : "no"}
                                             </p>
+                                            {cronJob.trigger_type ===
+                                            "nats" ? (
+                                                <p className="break-all font-mono md:col-span-2">
+                                                    Subject:{" "}
+                                                    {cronJob.nats_subject ||
+                                                        "crons.uptime_monitor"}
+                                                </p>
+                                            ) : null}
                                             {cronJob.endpoint ? (
                                                 <p className="break-all font-mono md:col-span-2">
                                                     Endpoint:{" "}
@@ -1975,6 +1986,14 @@ function AdminPage({
                                                     ...current,
                                                     trigger_type:
                                                         event.target.value,
+                                                    http_method:
+                                                        event.target.value ===
+                                                        "http"
+                                                            ? current.http_method ===
+                                                              "NONE"
+                                                                ? "GET"
+                                                                : current.http_method
+                                                            : "NONE",
                                                 }))
                                             }
                                             className="mt-1 w-full rounded-lg border px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
@@ -1992,6 +2011,58 @@ function AdminPage({
                                         </select>
                                     </label>
                                 </div>
+
+                                {cronForm.trigger_type === "nats" ? (
+                                    <>
+                                        <label className="mt-3 block text-sm font-medium text-slate-700">
+                                            Publish Subject
+                                            <input
+                                                required
+                                                value={cronForm.nats_subject}
+                                                onChange={(event) =>
+                                                    setCronForm(
+                                                        (current) => ({
+                                                            ...current,
+                                                            nats_subject:
+                                                                event.target
+                                                                    .value,
+                                                        }),
+                                                    )
+                                                }
+                                                className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-sm focus:border-slate-500 focus:outline-none"
+                                                placeholder="crons.uptime_monitor"
+                                            />
+                                        </label>
+                                        <div className="mt-3 rounded-lg border border-cyan-200/80 bg-cyan-50/70 px-3 py-2.5 text-xs text-slate-700 backdrop-blur">
+                                            <p>
+                                                On each scheduled run, this
+                                                payload is published to NATS
+                                                subject{" "}
+                                                <code className="rounded bg-white/80 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-cyan-800">
+                                                    {cronForm.nats_subject.trim() ||
+                                                        "crons.uptime_monitor"}
+                                                </code>
+                                                :
+                                            </p>
+                                            <pre className="mt-2 overflow-x-auto rounded-md bg-slate-900/90 px-3 py-2 font-mono text-[11px] leading-relaxed text-slate-100">
+                                                {JSON.stringify(
+                                                    {
+                                                        run_id: "6bdc709d-0e2c-4f67-a5cd-a3c5ef5618c1",
+                                                        cron:
+                                                            cronForm.cron.trim() ||
+                                                            "your_cron_name",
+                                                    },
+                                                    null,
+                                                    2,
+                                                )}
+                                            </pre>
+                                            <p className="mt-1.5 text-slate-500">
+                                                run_id is a fresh UUIDv4
+                                                generated for every trigger.
+                                            </p>
+                                        </div>
+                                    </>
+                                ) : null}
 
                                 {cronForm.trigger_type === "http" ? (
                                     <div className="mt-3 grid gap-3 md:grid-cols-[1fr_8rem]">
@@ -2042,6 +2113,43 @@ function AdminPage({
                                             </select>
                                         </label>
                                     </div>
+                                ) : null}
+
+                                {cronForm.trigger_type === "http" ? (
+                                    <label className="mt-3 block text-sm font-medium text-slate-700">
+                                        Headers (JSON, optional)
+                                        <textarea
+                                            value={cronForm.headers_json}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    headers_json:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 min-h-20 w-full rounded-lg border px-3 py-2 font-mono text-xs focus:border-slate-500 focus:outline-none"
+                                            placeholder='{"Authorization":"Bearer <token>"}'
+                                        />
+                                    </label>
+                                ) : null}
+
+                                {cronForm.trigger_type === "http" &&
+                                cronForm.http_method === "POST" ? (
+                                    <label className="mt-3 block text-sm font-medium text-slate-700">
+                                        Body (Optional)
+                                        <textarea
+                                            value={cronForm.body_text}
+                                            onChange={(event) =>
+                                                setCronForm((current) => ({
+                                                    ...current,
+                                                    body_text:
+                                                        event.target.value,
+                                                }))
+                                            }
+                                            className="mt-1 min-h-24 w-full rounded-lg border px-3 py-2 font-mono text-xs focus:border-slate-500 focus:outline-none"
+                                            placeholder='{"source":"uptime-monitor"}'
+                                        />
+                                    </label>
                                 ) : null}
 
                                 <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -2830,7 +2938,16 @@ function App() {
             service: cronJob.service ?? "",
             endpoint: cronJob.endpoint ?? "",
             trigger_type: cronJob.trigger_type ?? "nats",
-            http_method: cronJob.http_method ?? "NONE",
+            http_method:
+                cronJob.trigger_type === "http" &&
+                cronJob.http_method !== "NONE"
+                    ? cronJob.http_method
+                    : cronJob.trigger_type === "http"
+                      ? "GET"
+                      : "NONE",
+            headers_json: stringifyJson(cronJob.headers_json, ""),
+            body_text: cronJob.body_text ?? "",
+            nats_subject: cronJob.nats_subject || "crons.uptime_monitor",
             start_window_seconds: cronJob.start_window_seconds ?? 60,
             ping_window_seconds: cronJob.ping_window_seconds ?? 60,
             track_run: Boolean(cronJob.track_run),

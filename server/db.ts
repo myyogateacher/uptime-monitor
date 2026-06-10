@@ -184,6 +184,27 @@ const MIGRATIONS = [
       );
     },
   },
+  {
+    version: 7,
+    name: "add_cron_monitoring_http_request_fields",
+    up: async () => {
+      await pool.query(`
+        ALTER TABLE cron_monitoring
+          ADD COLUMN headers_json JSON NULL,
+          ADD COLUMN body_text TEXT NULL
+      `);
+    },
+  },
+  {
+    version: 8,
+    name: "add_cron_monitoring_nats_subject",
+    up: async () => {
+      await pool.query(`
+        ALTER TABLE cron_monitoring
+          ADD COLUMN nats_subject VARCHAR(255) NOT NULL DEFAULT 'crons.uptime_monitor'
+      `);
+    },
+  },
 ];
 
 async function ensureSchemaMigrationsTable() {

@@ -390,6 +390,9 @@ const mapEndpointRow = (row: Record<string, any>): Record<string, any> => {
 const CRON_TRIGGER_TYPES = new Set(['nats', 'http'])
 const CRON_HTTP_METHODS = new Set(['GET', 'POST', 'NONE'])
 const CRON_NAME_PATTERN = /^[A-Za-z0-9_.:-]+$/
+const DEFAULT_CRON_NATS_SUBJECT = 'crons.uptime_monitor'
+// Concrete publish subject: dot-separated tokens, no wildcards or whitespace.
+const NATS_SUBJECT_PATTERN = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/
 
 const normalizeCronPayload = (payload: JsonObject): JsonObject => {
   const cron = String(payload.cron ?? '').trim()
@@ -402,6 +405,12 @@ const normalizeCronPayload = (payload: JsonObject): JsonObject => {
   const pingWindowSeconds = toInteger(payload.ping_window_seconds, NaN)
   const status = Number(payload.status ?? 1) ? 1 : 0
   const trackRun = Number(payload.track_run ?? 1) ? 1 : 0
+  const headers = parseJsonObjectInput(payload.headers_json, 'Headers')
+  const bodyText =
+    payload.body_text == null || String(payload.body_text).trim() === ''
+      ? null
+      : String(payload.body_text)
+  const natsSubject = String(payload.nats_subject ?? '').trim() || DEFAULT_CRON_NATS_SUBJECT
 
   if (!cron) throw new Error('Cron name is required')
   if (cron.length > 100) throw new Error('Cron name must be at most 100 characters')
@@ -424,6 +433,17 @@ const normalizeCronPayload = (payload: JsonObject): JsonObject => {
 
   if (!CRON_HTTP_METHODS.has(httpMethod)) {
     throw new Error('http_method must be one of GET, POST, NONE')
+  }
+
+  if (triggerType === 'nats') {
+    if (natsSubject.length > 255) {
+      throw new Error('Publish subject must be at most 255 characters')
+    }
+    if (!NATS_SUBJECT_PATTERN.test(natsSubject)) {
+      throw new Error(
+        'Publish subject must be dot-separated tokens (letters, numbers, "_", "-"), e.g. crons.uptime_monitor',
+      )
+    }
   }
 
   if (triggerType === 'http') {
@@ -456,6 +476,9 @@ const normalizeCronPayload = (payload: JsonObject): JsonObject => {
     endpoint,
     trigger_type: triggerType,
     http_method: triggerType === 'http' ? httpMethod : 'NONE',
+    headers_json: triggerType === 'http' ? JSON.stringify(headers) : null,
+    body_text: triggerType === 'http' && httpMethod === 'POST' ? bodyText : null,
+    nats_subject: triggerType === 'nats' ? natsSubject : DEFAULT_CRON_NATS_SUBJECT,
     start_window_seconds: startWindowSeconds,
     ping_window_seconds: pingWindowSeconds,
     status,
@@ -463,11 +486,27 @@ const normalizeCronPayload = (payload: JsonObject): JsonObject => {
   }
 }
 
-const mapCronRow = (row: Record<string, any>): Record<string, any> => ({
-  ...row,
-  status: Number(row.status) === 1,
-  track_run: Number(row.track_run) === 1,
-})
+const mapCronRow = (row: Record<string, any>): Record<string, any> => {
+  let headers: JsonObject = {}
+  if (row.headers_json) {
+    if (typeof row.headers_json === 'object') {
+      headers = row.headers_json as JsonObject
+    } else {
+      try {
+        headers = JSON.parse(String(row.headers_json))
+      } catch {
+        headers = {}
+      }
+    }
+  }
+
+  return {
+    ...row,
+    status: Number(row.status) === 1,
+    track_run: Number(row.track_run) === 1,
+    headers_json: headers,
+  }
+}
 
 const getMappedCronByName = async (cronName: string): Promise<Record<string, any> | null> => {
   const [rows] = await pool.query('SELECT * FROM cron_monitoring WHERE cron = ? LIMIT 1', [cronName])
@@ -1277,11 +1316,14 @@ app.post('/api/crons', requireEditor, async (req: Request, res: Response) => {
           endpoint,
           trigger_type,
           http_method,
+          headers_json,
+          body_text,
+          nats_subject,
           start_window_seconds,
           ping_window_seconds,
           status,
           track_run
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         payload.cron,
@@ -1290,6 +1332,9 @@ app.post('/api/crons', requireEditor, async (req: Request, res: Response) => {
         payload.endpoint,
         payload.trigger_type,
         payload.http_method,
+        payload.headers_json,
+        payload.body_text,
+        payload.nats_subject,
         payload.start_window_seconds,
         payload.ping_window_seconds,
         payload.status,
@@ -1332,6 +1377,9 @@ app.put('/api/crons/:cron', requireEditor, async (req: Request, res: Response) =
         endpoint = ?,
         trigger_type = ?,
         http_method = ?,
+        headers_json = ?,
+        body_text = ?,
+        nats_subject = ?,
         start_window_seconds = ?,
         ping_window_seconds = ?,
         status = ?,
@@ -1344,6 +1392,9 @@ app.put('/api/crons/:cron', requireEditor, async (req: Request, res: Response) =
       payload.endpoint,
       payload.trigger_type,
       payload.http_method,
+      payload.headers_json,
+      payload.body_text,
+      payload.nats_subject,
       payload.start_window_seconds,
       payload.ping_window_seconds,
       payload.status,
