@@ -19,7 +19,7 @@ services:
       MYSQL_CONNECTION_LIMIT: 5
       MONITOR_POLL_MS: 1000
       REQUEST_TIMEOUT_MS: 10000
-      CORS_ORIGINS: https://uptime.azure-services.myyogateacher.com
+      CORS_ORIGINS: https://uptime.yourdomain.com
       NOTIFICATIONS_ENABLED: 'true'
       SLACK_BOT_TOKEN: ''
       SLACK_CHANNEL_ID: ''
