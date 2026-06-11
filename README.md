@@ -6,6 +6,7 @@ Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MyS
 ![Uptime Control Panel](images/screenshot_status_page.png)
 
 It uses:
+
 - Frontend: React + Vite + Tailwind
 - Backend: Express on Bun
 - Storage: MySQL
@@ -102,11 +103,13 @@ Use `.env` (see `.env.example`):
 - `NOTIFICATION_TARGETS_JSON`
 
 Editor access control:
+
 - Set `CONTROL_PLANE_EDITOR_EMAILS` as a comma-separated list of Google account emails that can mutate monitors/groups.
 - Example: `CONTROL_PLANE_EDITOR_EMAILS=ops@company.com,sre@company.com`
 - If empty, any authenticated user can edit (default behavior).
 
 Session storage:
+
 - Sessions are persisted in MySQL (table managed by `express-mysql-session`).
 - Default login validity is 1 day (`SESSION_MAX_AGE_MS=86400000`).
 
@@ -146,6 +149,7 @@ bun run dev
 ```
 
 Default local URLs:
+
 - Frontend: `http://localhost:5173`
 - Backend/API: `http://localhost:8000`
 
@@ -167,6 +171,7 @@ docker compose up -d --build
 ```
 
 Services:
+
 - App: `http://localhost:8000`
 - MySQL: `localhost:3306`
 
@@ -209,3 +214,7 @@ docker compose down -v
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+## Author
+
+* Pankaj Soni<pankajsoni19@live.com>
