@@ -3,7 +3,8 @@
 Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, Redis, NATS JetStream, and TCP ports.
 
 ![Uptime Control Panel](images/screenshot_control_panel.png)
-![Uptime Control Panel](images/screenshot_status_page.png)
+![Status Page - Monitored Services](images/screenshot_status_page.png)
+![Status Page - Cron Health](images/screenshot_cron_health.png)
 
 It uses:
 
