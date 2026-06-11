@@ -23,6 +23,14 @@ services:
       NOTIFICATIONS_ENABLED: 'true'
       SLACK_BOT_TOKEN: ''
       SLACK_CHANNEL_ID: ''
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
   mysql:
     image: mysql:8.4
@@ -42,3 +50,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
