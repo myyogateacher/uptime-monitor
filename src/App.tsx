@@ -5,9 +5,9 @@ import {
     useRef,
     useState,
     type Dispatch,
-    type FormEvent,
     type MouseEvent as ReactMouseEvent,
     type SetStateAction,
+    type SubmitEvent,
 } from "react";
 import { FaChevronDown, FaChevronRight } from "react-icons/fa";
 import {
@@ -110,7 +110,7 @@ interface CronFormState {
     status: boolean;
 }
 
-const METHOD_OPTIONS = [
+const METHOD_OPTIONS: string[] = [
     "GET",
     "POST",
     "PUT",
@@ -119,7 +119,7 @@ const METHOD_OPTIONS = [
     "HEAD",
     "OPTIONS",
 ];
-const MONITOR_TYPE_OPTIONS = [
+const MONITOR_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
     { value: "http", label: "HTTP API" },
     { value: "mysql", label: "MySQL" },
     { value: "redis", label: "Redis" },
@@ -127,7 +127,7 @@ const MONITOR_TYPE_OPTIONS = [
     { value: "tcp", label: "TCP Port" },
 ];
 
-const DEFAULT_CONNECTION_JSON = {
+const DEFAULT_CONNECTION_JSON: Record<string, string> = {
     http: '{\n  "timeoutMs": 10000\n}',
     mysql: '{\n  "host": "127.0.0.1",\n  "port": 3306,\n  "user": "root",\n  "password": "",\n  "database": "app_db"\n}',
     redis: '{\n  "host": "127.0.0.1",\n  "port": 6379\n}',
@@ -135,7 +135,7 @@ const DEFAULT_CONNECTION_JSON = {
     tcp: '{\n  "host": "127.0.0.1",\n  "port": 443,\n  "timeoutMs": 5000\n}',
 };
 
-const INITIAL_ENDPOINT_FORM = {
+const INITIAL_ENDPOINT_FORM: EndpointFormState = {
     group_name: "",
     name: "",
     monitor_type: "http",
@@ -154,14 +154,14 @@ const INITIAL_ENDPOINT_FORM = {
     up_retries: 1,
 };
 
-const CRON_TRIGGER_TYPE_OPTIONS = [
+const CRON_TRIGGER_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
     { value: "nats", label: "NATS" },
     { value: "http", label: "HTTP" },
 ];
 
-const CRON_HTTP_METHOD_OPTIONS = ["GET", "POST"];
+const CRON_HTTP_METHOD_OPTIONS: string[] = ["GET", "POST"];
 
-const INITIAL_CRON_FORM = {
+const INITIAL_CRON_FORM: CronFormState = {
     cron: "",
     expression: "",
     service: "apis",
@@ -177,22 +177,27 @@ const INITIAL_CRON_FORM = {
     status: true,
 };
 
-const ADMIN_TAB_OPTIONS = [
+const ADMIN_TAB_OPTIONS: Array<{ value: AdminTab; label: string }> = [
     { value: "routes", label: "Monitored Services" },
     { value: "crons", label: "Cron Health" },
 ];
 
-const STATUS_TAB_OPTIONS = [
+const STATUS_TAB_OPTIONS: Array<{ value: StatusTab; label: string }> = [
     { value: "services", label: "Monitored Services" },
     { value: "crons", label: "Cron Health" },
 ];
 
-const CRON_RUNS_MODE_OPTIONS = [
+const STATUS_VIEW_MODE_OPTIONS: Array<{ value: StatsMode; label: string }> = [
+    { value: "aggregate", label: "Trend" },
+    { value: "raw", label: "Last 50 checks" },
+];
+
+const CRON_RUNS_MODE_OPTIONS: Array<{ value: CronRunsMode; label: string }> = [
     { value: "recent", label: "Last 50 runs" },
     { value: "window", label: "Window" },
 ];
 
-const CRON_STATUS_WINDOW_OPTIONS = [
+const CRON_STATUS_WINDOW_OPTIONS: Array<{ value: number; label: string }> = [
     { value: 1, label: "Last 24h" },
     { value: 7, label: "Last 7d" },
     { value: 30, label: "Last 30d" },
@@ -227,7 +232,10 @@ const STATUS_RANGE_OPTIONS: Record<
     ],
 };
 
-function formatRelativeTime(input, nowMs = Date.now()) {
+function formatRelativeTime(
+    input: string | number | Date | null | undefined,
+    nowMs: number = Date.now(),
+): string {
     if (!input) return "never";
 
     // const date = moment.utc(input).local().toDate()
@@ -257,7 +265,7 @@ function formatRelativeTime(input, nowMs = Date.now()) {
     return rtf.format(Math.round(deltaMonths / 12), "year");
 }
 
-function stringifyJson(value, fallback = "") {
+function stringifyJson(value: unknown, fallback = ""): string {
     if (value == null) return fallback;
     if (typeof value === "string") return value;
     if (typeof value === "object") {
@@ -267,7 +275,9 @@ function stringifyJson(value, fallback = "") {
     return String(value);
 }
 
-function formatFriendlyDateTime(input) {
+function formatFriendlyDateTime(
+    input: string | number | Date | null | undefined,
+): string {
     if (!input) return "Unknown time";
     const date = new Date(input);
     if (Number.isNaN(date.getTime())) return "Unknown time";
@@ -278,23 +288,29 @@ function formatFriendlyDateTime(input) {
     }).format(date);
 }
 
-function renderCronRunBadge(status) {
+function renderCronRunBadge(status: string | null | undefined): string {
     if (status === "success") return "bg-emerald-100/85 text-emerald-700";
     if (status === "failed" || status === "missed")
         return "bg-rose-100/85 text-rose-700";
     return "bg-amber-100/85 text-amber-700";
 }
 
-function cronRunStripColor(status) {
+function cronRunStripColor(status: string | null | undefined): string {
     if (status === "success") return "bg-emerald-500 hover:bg-emerald-400";
     if (status === "failed" || status === "missed")
         return "bg-rose-500 hover:bg-rose-400";
     return "bg-amber-400 hover:bg-amber-300";
 }
 
-function CronRunGrid({ runs }) {
-    const containerRef = useRef(null);
-    const [hoveredRun, setHoveredRun] = useState(null);
+interface HoveredCronRun {
+    run: CronRunSummary;
+    x: number;
+    y: number;
+}
+
+function CronRunGrid({ runs }: { runs: CronRunSummary[] }) {
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const [hoveredRun, setHoveredRun] = useState<HoveredCronRun | null>(null);
 
     // Latest run first, down to the oldest we have recorded.
     const orderedRuns = useMemo(() => {
@@ -309,7 +325,10 @@ function CronRunGrid({ runs }) {
         return <p className="text-xs text-slate-500">No runs recorded yet.</p>;
     }
 
-    const handleHover = (event, run) => {
+    const handleHover = (
+        event: ReactMouseEvent<HTMLSpanElement>,
+        run: CronRunSummary,
+    ) => {
         if (!containerRef.current) return;
         const containerRect = containerRef.current.getBoundingClientRect();
         const targetRect = event.currentTarget.getBoundingClientRect();
@@ -386,14 +405,17 @@ function CronRunGrid({ runs }) {
     );
 }
 
-function getGroupStatus(endpoints) {
+function getGroupStatus(endpoints: MonitorEndpoint[]): MonitorStatus {
     if (!endpoints.length) return "pending";
     if (endpoints.some((endpoint) => endpoint.status === "down")) return "down";
     if (endpoints.every((endpoint) => endpoint.status === "up")) return "up";
     return "pending";
 }
 
-function getBucketStart(input, granularity) {
+function getBucketStart(
+    input: string | number | Date | null | undefined,
+    granularity: StatsGranularity,
+): string | null {
     const date = new Date(input);
     if (Number.isNaN(date.getTime())) return null;
 
@@ -411,7 +433,7 @@ function getBucketStart(input, granularity) {
     return date.toISOString();
 }
 
-function clampRunsToRange(runs, rangeDays) {
+function clampRunsToRange(runs: RunPoint[], rangeDays: number): RunPoint[] {
     const cutoff = Date.now() - rangeDays * 24 * 60 * 60 * 1000;
     return runs.filter((run) => {
         const timestamp = new Date(
@@ -422,12 +444,12 @@ function clampRunsToRange(runs, rangeDays) {
 }
 
 function mergeRealtimeRun(
-    existingRuns,
-    payload,
-    statusViewMode,
-    statusGranularity,
-    statusRangeDays,
-) {
+    existingRuns: RunPoint[] | undefined,
+    payload: Partial<EndpointCheckResult>,
+    statusViewMode: StatsMode,
+    statusGranularity: StatsGranularity,
+    statusRangeDays: number,
+): RunPoint[] {
     if (statusViewMode === "raw") {
         const nextRun = {
             response_time_ms: payload.responseTimeMs ?? 0,
@@ -492,11 +514,32 @@ function mergeRealtimeRun(
     );
 }
 
-function LatencySparkline({ runs, granularity, statusViewMode }) {
-    const containerRef = useRef(null);
-    const [hoveredPoint, setHoveredPoint] = useState(null);
+interface SparklinePoint {
+    latency: number;
+    checkedAt: string | null | undefined;
+    checkCount: number;
+    upCount: number;
+    downCount: number;
+}
 
-    const points = useMemo(() => {
+type HoveredSparklinePoint = SparklinePoint & { x: number; y: number };
+
+interface LatencySparklineProps {
+    runs: RunPoint[];
+    granularity: StatsGranularity;
+    statusViewMode: StatsMode;
+}
+
+function LatencySparkline({
+    runs,
+    granularity,
+    statusViewMode,
+}: LatencySparklineProps) {
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const [hoveredPoint, setHoveredPoint] =
+        useState<HoveredSparklinePoint | null>(null);
+
+    const points = useMemo((): SparklinePoint[] => {
         return (runs ?? [])
             .map((run) => ({
                 latency:
@@ -562,7 +605,10 @@ function LatencySparkline({ runs, granularity, statusViewMode }) {
         .join(" ");
     const area = `${line} ${chartRight},${height - padding} ${chartLeft},${height - padding}`;
 
-    const handlePointHover = (event, point) => {
+    const handlePointHover = (
+        event: ReactMouseEvent<SVGCircleElement>,
+        point: SparklinePoint & { x: number; y: number },
+    ) => {
         if (!containerRef.current) return;
         const containerRect = containerRef.current.getBoundingClientRect();
         const targetRect = event.currentTarget.getBoundingClientRect();
@@ -689,6 +735,29 @@ function LatencySparkline({ runs, granularity, statusViewMode }) {
     );
 }
 
+interface StatusPageProps {
+    groups: MonitorGroup[];
+    endpoints: MonitorEndpoint[];
+    runsByEndpoint: RunsByEndpoint;
+    health: HealthSummary;
+    isLoading: boolean;
+    statusViewMode: StatsMode;
+    statusGranularity: StatsGranularity;
+    statusRangeDays: number;
+    onViewModeChange: (mode: StatsMode) => void;
+    onGranularityChange: (granularity: StatsGranularity) => void;
+    onRangeChange: (days: number) => void;
+    statusTab: StatusTab;
+    onStatusTabChange: (tab: StatusTab) => void;
+    crons: CronJob[];
+    cronRunsByName: CronRunsByName;
+    cronRunsMode: CronRunsMode;
+    onCronRunsModeChange: (mode: CronRunsMode) => void;
+    cronWindowDays: number;
+    onCronWindowDaysChange: (days: number) => void;
+    currentTimeMs: number;
+}
+
 function StatusPage({
     groups,
     endpoints,
@@ -710,8 +779,8 @@ function StatusPage({
     cronWindowDays,
     onCronWindowDaysChange,
     currentTimeMs,
-}) {
-    const groupedEndpoints = useMemo(() => {
+}: StatusPageProps) {
+    const groupedEndpoints = useMemo((): GroupWithEndpoints[] => {
         return groups.map((group) => ({
             ...group,
             endpoints: endpoints.filter(
@@ -738,14 +807,14 @@ function StatusPage({
             cronJob.last_run_status === "missed",
     ).length;
 
-    const renderStatus = (endpoint) => {
+    const renderStatus = (endpoint: MonitorEndpoint): string => {
         if (endpoint.is_paused) return "bg-slate-400";
         if (endpoint.status === "up") return "bg-emerald-500";
         if (endpoint.status === "down") return "bg-rose-500";
         return "bg-amber-500";
     };
 
-    const renderGroupStatus = (status) => {
+    const renderGroupStatus = (status: MonitorStatus): string => {
         if (status === "up")
             return "bg-emerald-100 text-emerald-700 border-emerald-200/80";
         if (status === "down")
@@ -929,13 +998,7 @@ function StatusPage({
                                 View
                             </span>
                             <div className="flex rounded-full border border-white/60 bg-white/55 p-1 backdrop-blur">
-                                {[
-                                    {
-                                        value: "aggregate",
-                                        label: "Trend",
-                                    },
-                                    { value: "raw", label: "Last 50 checks" },
-                                ].map((option) => (
+                                {STATUS_VIEW_MODE_OPTIONS.map((option) => (
                                     <button
                                         key={option.value}
                                         type="button"
@@ -1274,7 +1337,13 @@ function LandingPage() {
     );
 }
 
-function LoginPage({ apiBase, isChecking, error }) {
+interface LoginPageProps {
+    apiBase: string;
+    isChecking: boolean;
+    error: string;
+}
+
+function LoginPage({ apiBase, isChecking, error }: LoginPageProps) {
     const search =
         typeof window !== "undefined"
             ? new URLSearchParams(window.location.search)
@@ -1321,6 +1390,42 @@ function LoginPage({ apiBase, isChecking, error }) {
     );
 }
 
+interface AdminPageProps {
+    health: HealthSummary;
+    groups: MonitorGroup[];
+    groupedEndpoints: GroupWithEndpoints[];
+    endpointForm: EndpointFormState;
+    editingEndpointId: number | null;
+    canEdit: boolean;
+    isLoading: boolean;
+    isSavingEndpoint: boolean;
+    setEndpointForm: Dispatch<SetStateAction<EndpointFormState>>;
+    handleCancelEdit: () => void;
+    handleDeleteHistory: (endpointId: number) => Promise<void>;
+    handleEndpointSubmit: (
+        event: SubmitEvent<HTMLFormElement>,
+    ) => Promise<void>;
+    handleDeleteEndpoint: (endpointId: number) => Promise<void>;
+    handleCheckNow: (endpointId: number) => Promise<void>;
+    handleTogglePause: (endpoint: MonitorEndpoint) => Promise<void>;
+    handleToggleGroupPause: (group: GroupWithEndpoints) => Promise<void>;
+    handleStartEdit: (endpoint: MonitorEndpoint) => void;
+    crons: CronJob[];
+    cronForm: CronFormState;
+    setCronForm: Dispatch<SetStateAction<CronFormState>>;
+    editingCronName: string | null;
+    isSavingCron: boolean;
+    handleCronSubmit: (event: SubmitEvent<HTMLFormElement>) => Promise<void>;
+    handleCancelCronEdit: () => void;
+    handleStartEditCron: (cronJob: CronJob) => void;
+    handleDeleteCron: (cronName: string) => Promise<void>;
+    cronMonitorEnabled: boolean;
+    cronMonitorMeta: CronMonitorMeta;
+    handleToggleCronMonitor: () => Promise<void>;
+    currentTimeMs: number;
+    error: string;
+}
+
 function AdminPage({
     health,
     groups,
@@ -1353,9 +1458,9 @@ function AdminPage({
     handleToggleCronMonitor,
     currentTimeMs,
     error,
-}) {
+}: AdminPageProps) {
     const isHttpType = endpointForm.monitor_type === "http";
-    const [activeTab, setActiveTab] = useState("routes");
+    const [activeTab, setActiveTab] = useState<AdminTab>("routes");
     const [isGroupMenuOpen, setIsGroupMenuOpen] = useState(false);
     const [collapsedGroups, setCollapsedGroups] = useState<
         Record<number, boolean>
@@ -1369,14 +1474,14 @@ function AdminPage({
         );
     }, [groups, endpointForm.group_name]);
 
-    const renderStatusColor = (endpoint) => {
+    const renderStatusColor = (endpoint: MonitorEndpoint): string => {
         if (endpoint.is_paused) return "bg-slate-400";
         if (endpoint.status === "up") return "bg-emerald-500";
         if (endpoint.status === "down") return "bg-rose-500";
         return "bg-amber-500";
     };
 
-    const renderGroupStatus = (status) => {
+    const renderGroupStatus = (status: MonitorStatus): string => {
         if (status === "up")
             return "bg-emerald-100 text-emerald-700 border-emerald-200/80";
         if (status === "down")
@@ -2779,31 +2884,36 @@ function App() {
         pathname.startsWith("/monitors") ||
         (!isHomePage && !isStatusPage && !isLoginPage);
 
-    const [health, setHealth] = useState({
+    const [health, setHealth] = useState<HealthSummary>({
         status: "checking",
         endpointCount: 0,
     });
-    const [groups, setGroups] = useState([]);
-    const [endpoints, setEndpoints] = useState([]);
-    const [runsByEndpoint, setRunsByEndpoint] = useState({});
-    const [statusViewMode, setStatusViewMode] = useState("aggregate");
+    const [groups, setGroups] = useState<MonitorGroup[]>([]);
+    const [endpoints, setEndpoints] = useState<MonitorEndpoint[]>([]);
+    const [runsByEndpoint, setRunsByEndpoint] = useState<RunsByEndpoint>({});
+    const [statusViewMode, setStatusViewMode] =
+        useState<StatsMode>("aggregate");
     const [statusGranularity, setStatusGranularity] =
         useState<StatsGranularity>("hour");
     const [statusRangeDays, setStatusRangeDays] = useState(7);
     const [endpointForm, setEndpointForm] = useState(INITIAL_ENDPOINT_FORM);
-    const [editingEndpointId, setEditingEndpointId] = useState(null);
-    const [crons, setCrons] = useState([]);
+    const [editingEndpointId, setEditingEndpointId] = useState<number | null>(
+        null,
+    );
+    const [crons, setCrons] = useState<CronJob[]>([]);
     const [cronForm, setCronForm] = useState(INITIAL_CRON_FORM);
-    const [editingCronName, setEditingCronName] = useState(null);
+    const [editingCronName, setEditingCronName] = useState<string | null>(
+        null,
+    );
     const [isSavingCron, setIsSavingCron] = useState(false);
-    const [statusTab, setStatusTab] = useState("services");
+    const [statusTab, setStatusTab] = useState<StatusTab>("services");
     const [cronMonitorEnabled, setCronMonitorEnabled] = useState(false);
-    const [cronMonitorMeta, setCronMonitorMeta] = useState({
+    const [cronMonitorMeta, setCronMonitorMeta] = useState<CronMonitorMeta>({
         updatedBy: null,
         updatedAt: null,
     });
-    const [cronRunsByName, setCronRunsByName] = useState({});
-    const [cronRunsMode, setCronRunsMode] = useState("recent");
+    const [cronRunsByName, setCronRunsByName] = useState<CronRunsByName>({});
+    const [cronRunsMode, setCronRunsMode] = useState<CronRunsMode>("recent");
     const [cronWindowDays, setCronWindowDays] = useState(7);
     const [isLoading, setIsLoading] = useState(true);
     const [isSavingEndpoint, setIsSavingEndpoint] = useState(false);
@@ -2815,7 +2925,7 @@ function App() {
     const [authError, setAuthError] = useState("");
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
 
-    const groupedEndpoints = useMemo(() => {
+    const groupedEndpoints = useMemo((): GroupWithEndpoints[] => {
         return groups.map((group) => ({
             ...group,
             endpoints: endpoints.filter(
@@ -2860,46 +2970,61 @@ function App() {
         window.location.replace(`/login?returnTo=${returnTo}`);
     }, [authChecked, isAuthenticated, isMonitorsPage, pathname]);
 
-    const loadRuns = useCallback(async (endpointList, options = {}) => {
-        const runEntries = await Promise.all(
-            endpointList.map(async (endpoint) => {
-                try {
-                    const response = await monitoringService.getEndpointRuns(
-                        endpoint.id,
-                        options,
-                    );
-                    return [endpoint.id, response?.points ?? []];
-                } catch {
-                    return [endpoint.id, []];
-                }
-            }),
-        );
+    const loadRuns = useCallback(
+        async (
+            endpointList: MonitorEndpoint[],
+            options: {
+                mode?: StatsMode;
+                granularity?: StatsGranularity;
+                rangeDays?: number;
+            } = {},
+        ) => {
+            const runEntries = await Promise.all(
+                endpointList.map(
+                    async (endpoint): Promise<[number, RunPoint[]]> => {
+                        try {
+                            const response =
+                                await monitoringService.getEndpointRuns(
+                                    endpoint.id,
+                                    options,
+                                );
+                            return [endpoint.id, response?.points ?? []];
+                        } catch {
+                            return [endpoint.id, []];
+                        }
+                    },
+                ),
+            );
 
-        setRunsByEndpoint(Object.fromEntries(runEntries));
-    }, []);
+            setRunsByEndpoint(Object.fromEntries(runEntries));
+        },
+        [],
+    );
 
     const loadCronRuns = useCallback(
-        async (cronList) => {
+        async (cronList: CronJob[]) => {
             const options =
                 cronRunsMode === "window"
                     ? { rangeDays: cronWindowDays, limit: 500 }
                     : { limit: 50 };
 
             const entries = await Promise.all(
-                cronList.map(async (cronJob) => {
-                    try {
-                        const rows = await monitoringService.getCronRuns(
-                            cronJob.cron,
-                            options,
-                        );
-                        return [
-                            cronJob.cron,
-                            Array.isArray(rows) ? rows : [],
-                        ];
-                    } catch {
-                        return [cronJob.cron, []];
-                    }
-                }),
+                cronList.map(
+                    async (cronJob): Promise<[string, CronRunSummary[]]> => {
+                        try {
+                            const rows = await monitoringService.getCronRuns(
+                                cronJob.cron,
+                                options,
+                            );
+                            return [
+                                cronJob.cron,
+                                Array.isArray(rows) ? rows : [],
+                            ];
+                        } catch {
+                            return [cronJob.cron, []];
+                        }
+                    },
+                ),
             );
 
             setCronRunsByName(Object.fromEntries(entries));
@@ -3047,12 +3172,16 @@ function App() {
 
         const socket = new WebSocket(wsUrl);
 
-        socket.onmessage = (event) => {
+        socket.onmessage = (event: MessageEvent<string>) => {
             try {
-                const message = JSON.parse(event.data);
-                const payload = message?.payload ?? {};
+                const message = JSON.parse(event.data) as {
+                    type?: string;
+                    payload?: unknown;
+                };
 
                 if (message?.type === "monitor:checked") {
+                    const payload = (message.payload ??
+                        {}) as Partial<EndpointCheckResult>;
                     setCurrentTimeMs(Date.now());
                     setEndpoints((current) =>
                         current.map((endpoint) =>
@@ -3103,6 +3232,7 @@ function App() {
                     message?.type === "group:created" ||
                     message?.type === "group:updated"
                 ) {
+                    const payload = (message.payload ?? {}) as MonitorGroup;
                     setGroups((current) => {
                         const index = current.findIndex(
                             (group) => group.id === payload.id,
@@ -3118,6 +3248,7 @@ function App() {
                 }
 
                 if (message?.type === "group:deleted") {
+                    const payload = (message.payload ?? {}) as { id: number };
                     setGroups((current) =>
                         current.filter((group) => group.id !== payload.id),
                     );
@@ -3128,6 +3259,7 @@ function App() {
                     message?.type === "endpoint:created" ||
                     message?.type === "endpoint:updated"
                 ) {
+                    const payload = (message.payload ?? {}) as MonitorEndpoint;
                     setEndpoints((current) => {
                         const index = current.findIndex(
                             (endpoint) => endpoint.id === payload.id,
@@ -3143,6 +3275,7 @@ function App() {
                 }
 
                 if (message?.type === "endpoint:deleted") {
+                    const payload = (message.payload ?? {}) as { id: number };
                     setEndpoints((current) =>
                         current.filter(
                             (endpoint) => endpoint.id !== payload.id,
@@ -3157,6 +3290,8 @@ function App() {
                 }
 
                 if (message?.type === "cron:run") {
+                    const payload = (message.payload ??
+                        {}) as CronRunEventPayload;
                     setCrons((current) =>
                         current.map((cronJob) =>
                             cronJob.cron === payload.cron
@@ -3218,7 +3353,9 @@ function App() {
         statusViewMode,
     ]);
 
-    const handleEndpointSubmit = async (event) => {
+    const handleEndpointSubmit = async (
+        event: SubmitEvent<HTMLFormElement>,
+    ) => {
         event.preventDefault();
         setError("");
         if (!canEdit) {
@@ -3308,7 +3445,7 @@ function App() {
         }
     };
 
-    const handleDeleteEndpoint = async (endpointId) => {
+    const handleDeleteEndpoint = async (endpointId: number) => {
         setError("");
         if (!canEdit) {
             setError("You do not have permission to edit monitors");
@@ -3336,7 +3473,7 @@ function App() {
         }
     };
 
-    const handleDeleteHistory = async (endpointId) => {
+    const handleDeleteHistory = async (endpointId: number) => {
         setError("");
         if (!canEdit) {
             setError("You do not have permission to edit monitors");
@@ -3357,7 +3494,7 @@ function App() {
         }
     };
 
-    const handleStartEdit = (endpoint) => {
+    const handleStartEdit = (endpoint: MonitorEndpoint) => {
         if (!canEdit) {
             setError("You do not have permission to edit monitors");
             return;
@@ -3400,7 +3537,7 @@ function App() {
         }));
     };
 
-    const handleCheckNow = async (endpointId) => {
+    const handleCheckNow = async (endpointId: number) => {
         setError("");
         if (!canEdit) {
             setError("You do not have permission to edit monitors");
@@ -3421,7 +3558,7 @@ function App() {
         }
     };
 
-    const handleTogglePause = async (endpoint) => {
+    const handleTogglePause = async (endpoint: MonitorEndpoint) => {
         setError("");
         if (!canEdit) {
             setError("You do not have permission to edit monitors");
@@ -3448,7 +3585,7 @@ function App() {
         }
     };
 
-    const handleToggleGroupPause = async (group) => {
+    const handleToggleGroupPause = async (group: GroupWithEndpoints) => {
         setError("");
         if (!canEdit) {
             setError("You do not have permission to edit monitors");
@@ -3483,7 +3620,7 @@ function App() {
         }
     };
 
-    const handleCronSubmit = async (event) => {
+    const handleCronSubmit = async (event: SubmitEvent<HTMLFormElement>) => {
         event.preventDefault();
         setError("");
         if (!canEdit) {
@@ -3515,10 +3652,13 @@ function App() {
                     editingCronName,
                     payload,
                 );
+                // Fall back to the submitted payload if the server returned no
+                // body; its numeric status/track_run flags are truthy-compatible.
+                const merged = (updatedCron ?? payload) as Partial<CronJob>;
                 setCrons((current) =>
                     current.map((cronJob) =>
                         cronJob.cron === editingCronName
-                            ? { ...cronJob, ...(updatedCron ?? payload) }
+                            ? { ...cronJob, ...merged }
                             : cronJob,
                     ),
                 );
@@ -3527,7 +3667,7 @@ function App() {
                     await monitoringService.createCron(payload);
                 setCrons((current) =>
                     [
-                        createdCron ?? payload,
+                        (createdCron ?? payload) as CronJob,
                         ...current.filter(
                             (cronJob) => cronJob.cron !== normalizedCronName,
                         ),
@@ -3546,7 +3686,7 @@ function App() {
         }
     };
 
-    const handleStartEditCron = (cronJob) => {
+    const handleStartEditCron = (cronJob: CronJob) => {
         if (!canEdit) {
             setError("You do not have permission to edit crons");
             return;
@@ -3601,7 +3741,7 @@ function App() {
         setCronForm(INITIAL_CRON_FORM);
     };
 
-    const handleDeleteCron = async (cronName) => {
+    const handleDeleteCron = async (cronName: string) => {
         setError("");
         if (!canEdit) {
             setError("You do not have permission to edit crons");
