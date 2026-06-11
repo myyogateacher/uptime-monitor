@@ -25,14 +25,17 @@ import {
     type StatsMode,
 } from "./services/monitoringService";
 
+// Like Partial, but realtime websocket merges also write explicit nulls.
+type Nullable<T> = { [K in keyof T]?: T[K] | null };
+
 // A latency/run data point: raw check runs and aggregated buckets are
 // rendered by the same components, so both shapes are allowed.
-type RunPoint = Partial<EndpointCheckRun> & Partial<EndpointStatsBucket>;
+type RunPoint = Nullable<EndpointCheckRun> & Nullable<EndpointStatsBucket>;
 type RunsByEndpoint = Record<string, RunPoint[]>;
 
 // Realtime cron run updates arrive over the websocket with only a subset of
 // the full cron_runs row.
-type CronRunSummary = Partial<CronRun>;
+type CronRunSummary = Nullable<CronRun>;
 type CronRunsByName = Record<string, CronRunSummary[]>;
 
 type StatusTab = "services" | "crons";
@@ -232,6 +235,16 @@ const STATUS_RANGE_OPTIONS: Record<
     ],
 };
 
+// Epoch millis for sorting/filtering; NaN when the input is missing/invalid.
+function toTimeMs(input: string | number | Date | null | undefined): number {
+    if (input == null) return NaN;
+    return new Date(input).getTime();
+}
+
+function getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 function formatRelativeTime(
     input: string | number | Date | null | undefined,
     nowMs: number = Date.now(),
@@ -316,8 +329,7 @@ function CronRunGrid({ runs }: { runs: CronRunSummary[] }) {
     const orderedRuns = useMemo(() => {
         return [...(runs ?? [])].sort(
             (left, right) =>
-                new Date(right.triggered_at).getTime() -
-                new Date(left.triggered_at).getTime(),
+                toTimeMs(right.triggered_at) - toTimeMs(left.triggered_at),
         );
     }, [runs]);
 
@@ -416,6 +428,7 @@ function getBucketStart(
     input: string | number | Date | null | undefined,
     granularity: StatsGranularity,
 ): string | null {
+    if (input == null) return null;
     const date = new Date(input);
     if (Number.isNaN(date.getTime())) return null;
 
@@ -436,9 +449,9 @@ function getBucketStart(
 function clampRunsToRange(runs: RunPoint[], rangeDays: number): RunPoint[] {
     const cutoff = Date.now() - rangeDays * 24 * 60 * 60 * 1000;
     return runs.filter((run) => {
-        const timestamp = new Date(
+        const timestamp = toTimeMs(
             run.bucket_start ?? run.checked_at ?? run.latest_checked_at,
-        ).getTime();
+        );
         return Number.isFinite(timestamp) && timestamp >= cutoff;
     });
 }
@@ -507,8 +520,7 @@ function mergeRealtimeRun(
     return clampRunsToRange(
         nextRuns.sort(
             (left, right) =>
-                new Date(left.bucket_start).getTime() -
-                new Date(right.bucket_start).getTime(),
+                toTimeMs(left.bucket_start) - toTimeMs(right.bucket_start),
         ),
         statusRangeDays,
     );
@@ -556,8 +568,7 @@ function LatencySparkline({
             }))
             .sort(
                 (left, right) =>
-                    new Date(left.checkedAt).getTime() -
-                    new Date(right.checkedAt).getTime(),
+                    toTimeMs(left.checkedAt) - toTimeMs(right.checkedAt),
             )
             .map((run) => ({
                 ...run,
@@ -2953,7 +2964,7 @@ function App() {
             } catch (requestError) {
                 setIsAuthenticated(false);
                 setCanEdit(false);
-                setAuthError(requestError.message);
+                setAuthError(getErrorMessage(requestError));
             } finally {
                 setAuthChecked(true);
             }
@@ -3101,7 +3112,7 @@ function App() {
                 });
             }
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         } finally {
             setIsLoading(false);
         }
@@ -3375,24 +3386,25 @@ function App() {
                         normalizedGroupName.toLowerCase(),
                 ) ?? null;
             if (!group) {
-                group = await monitoringService.createGroup({
+                const createdGroup = await monitoringService.createGroup({
                     name: normalizedGroupName,
                     description: "",
                 });
+                group = createdGroup;
                 setGroups((current) => {
                     const index = current.findIndex(
-                        (existing) => existing.id === group.id,
+                        (existing) => existing.id === createdGroup.id,
                     );
                     if (index >= 0) {
                         const next = [...current];
                         next[index] = {
                             ...next[index],
-                            ...group,
+                            ...createdGroup,
                             endpoint_count: next[index].endpoint_count ?? 0,
                         };
                         return next;
                     }
-                    return [...current, { ...group, endpoint_count: 0 }];
+                    return [...current, { ...createdGroup, endpoint_count: 0 }];
                 });
             }
 
@@ -3439,7 +3451,7 @@ function App() {
             }));
             setEditingEndpointId(null);
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         } finally {
             setIsSavingEndpoint(false);
         }
@@ -3469,7 +3481,7 @@ function App() {
                 }));
             }
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 
@@ -3490,7 +3502,7 @@ function App() {
             await monitoringService.deleteEndpointRuns(endpointId);
             setRunsByEndpoint((current) => ({ ...current, [endpointId]: [] }));
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 
@@ -3554,7 +3566,7 @@ function App() {
                 ),
             );
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 
@@ -3581,7 +3593,7 @@ function App() {
                 return current;
             });
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 
@@ -3616,7 +3628,7 @@ function App() {
                 ),
             );
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 
@@ -3680,7 +3692,7 @@ function App() {
             setCronForm(INITIAL_CRON_FORM);
             setEditingCronName(null);
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         } finally {
             setIsSavingCron(false);
         }
@@ -3732,7 +3744,7 @@ function App() {
                 updatedAt: response?.updatedAt ?? null,
             });
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 
@@ -3759,7 +3771,7 @@ function App() {
                 setCronForm(INITIAL_CRON_FORM);
             }
         } catch (requestError) {
-            setError(requestError.message);
+            setError(getErrorMessage(requestError));
         }
     };
 

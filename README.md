@@ -16,51 +16,16 @@ The backend serves the built frontend (`dist/`) so both control plane and status
 
 ## Features
 
-- HTTP monitor support:
-  - Full URL endpoint
-  - HTTP method
-  - Optional headers JSON
-  - Optional request body
-  - Expected HTTP status code validation
-  - Nested JSON path + expected value matching
-- MySQL monitor support:
-  - Connection JSON
-  - Optional probe SQL
-  - Optional expected probe value matching
-- Redis monitor support:
-  - Connection JSON
-  - Optional probe command
-  - Optional expected probe value matching
-- NATS JetStream monitor support:
-  - Connection JSON
-  - JetStream probe command support (`jetstream.info`, `stream.info:<name>`)
-  - JetStream consumer lag checks (`consumers.lag[:<threshold>]` for all consumers, `consumer.lag:<stream>:<consumer>[:<threshold>]` for one)
-    - Flags consumers whose `num_ack_pending`, `num_pending`, or `num_waiting` exceeds the threshold (default 128)
-    - Per-consumer overrides via `"lag_thresholds": { "my_consumer": 1024, "default": 128 }` in Connection JSON, or globally via the `NATS_LAG_THRESHOLDS` env var (same JSON shape; Connection JSON wins)
-    - A lagging consumer that is draining (backlog lower than the previous check) is not flagged
-  - Optional expected probe value matching
-- TCP port monitor support:
-  - Host/port connection check
-  - Optional expected probe value matching (default `"open"`)
-- Retry-based health transitions:
-  - Interval per monitor
-  - Retries before marking down
-  - Retries before marking up
-- Pause/resume monitors
-- Pause/resume entire groups
-- Manual "Check now"
-- Google-only login for control plane
-- MySQL-backed backend sessions
-- Rich Slack notifications for up/down transitions
-- Pluggable webhook notifications for any custom endpoint
-- Group monitors by logical groups
-- Edit monitor configuration
-- Delete monitor historical runs per monitor
-- Realtime updates over WebSocket across tabs/sessions
-- Status page with grouped services and latency graph (with hover tooltip)
-- Glass-style SaaS UI
-- DB schema versioning via `schema_migrations`
-- Docker deployment with app + MySQL
+One service that watches your APIs, databases, message bus, and cron jobs — and tells you the moment something goes wrong.
+
+- **Five monitor types** — HTTP(S), MySQL, Redis, NATS JetStream, and TCP ports, each with per-monitor intervals and optional probe commands with expected-value matching.
+- **Deep HTTP checks** — custom method, headers, and body; assert on status code or a nested JSON path in the response.
+- **NATS JetStream consumer lag detection** — flags consumers whose backlog exceeds a threshold (global, per-stream, or per-consumer), and is smart enough not to alert on a consumer that is already draining.
+- **Cron monitoring** — schedules and fires your crons over NATS or HTTP, then tracks each run through start/ping/stop reports; runs that never report or go silent past their deadline are marked missed and alerted on.
+- **Retry-aware health transitions** — configurable retries before marking down or back up, so a single blip never pages anyone.
+- **Realtime control plane and status page** — WebSocket pushes every check result and config change to all open tabs; the public status page shows grouped service health, latency trend graphs, and cron run history.
+- **Alerts where you live** — rich Slack notifications and pluggable webhooks on up/down transitions and failed/missed cron runs.
+- **Built for operating** — pause/resume single monitors or whole groups, manual "check now", per-monitor history cleanup, Google sign-in with an editor email allowlist, versioned DB migrations, and one-command Docker deploy.
 
 ## Pages
 
