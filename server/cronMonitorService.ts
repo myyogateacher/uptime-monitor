@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import { CronExpressionParser } from 'cron-parser'
+import type { ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import { connect as connectNats, type NatsConnection } from 'nats'
 
 import { config } from './config'
@@ -9,8 +10,65 @@ import { CRON_RUN_EVENT, monitorEvents } from './events'
 import { notifyCronRun } from './notifier'
 
 type JsonObject = Record<string, unknown>
-type CronRow = Record<string, any>
-type CronRunRow = Record<string, any>
+
+export type CronTriggerType = 'nats' | 'http'
+export type CronHttpMethod = 'GET' | 'POST' | 'NONE'
+
+// Row shape of the cron_monitoring table.
+export interface CronRow extends RowDataPacket {
+  cron: string
+  expression: string
+  service: string
+  endpoint: string
+  trigger_type: CronTriggerType
+  http_method: CronHttpMethod
+  headers_json: string | JsonObject | null
+  body_text: string | null
+  nats_subject: string
+  start_window_seconds: number
+  ping_window_seconds: number
+  status: number
+  track_run: number
+  next_run_at: Date | string | null
+  created_date: Date | string
+  modified_date: Date | string
+}
+
+// Row shape of the cron_runs table.
+export interface CronRunRow extends RowDataPacket {
+  id: number
+  run_id: string
+  cron: string
+  trigger_type: CronTriggerType
+  status: string
+  triggered_at: Date | string
+  deadline_at: Date | string | null
+  first_ping_at: Date | string | null
+  last_ping_at: Date | string | null
+  completed_at: Date | string | null
+  pings: number
+  duration_ms: number | null
+  response_code: number | null
+  error_message: string | null
+  created_at: Date | string
+}
+
+interface CronRunDetailsRow extends CronRunRow {
+  expression: string | null
+  service: string | null
+  ping_window_seconds: number | null
+}
+
+interface DueCronRow extends CronRow {
+  overdue_seconds: number | null
+}
+
+interface OverdueRunRow extends RowDataPacket {
+  id: number
+  run_id: string
+  pings: number
+  elapsed_seconds: number | null
+}
 
 type TriggerOutcome = {
   ok: boolean
@@ -233,8 +291,8 @@ async function fireHttpTrigger(cron: CronRow, runId: string): Promise<TriggerOut
   }
 }
 
-const loadRun = async (runId: string): Promise<CronRunRow | null> => {
-  const [rows] = await pool.query(
+const loadRun = async (runId: string): Promise<CronRunDetailsRow | null> => {
+  const [rows] = await pool.query<CronRunDetailsRow[]>(
     `
       SELECT
         r.*,
@@ -253,7 +311,7 @@ const loadRun = async (runId: string): Promise<CronRunRow | null> => {
   return rows[0]
 }
 
-const emitRunEvent = (run: CronRunRow): void => {
+const emitRunEvent = (run: CronRunDetailsRow): void => {
   monitorEvents.emit(CRON_RUN_EVENT, {
     runId: run.run_id,
     cron: run.cron,
@@ -270,7 +328,7 @@ const emitRunEvent = (run: CronRunRow): void => {
   })
 }
 
-const notifyRunFailure = async (run: CronRunRow): Promise<void> => {
+const notifyRunFailure = async (run: CronRunDetailsRow): Promise<void> => {
   await notifyCronRun({
     cron: run.cron,
     runId: run.run_id,
@@ -318,7 +376,7 @@ const claimNextRunAt = async (cron: CronRow): Promise<boolean> => {
     return false
   }
 
-  const [result] = await pool.query(
+  const [result] = await pool.query<ResultSetHeader>(
     'UPDATE cron_monitoring SET next_run_at = ? WHERE cron = ? AND next_run_at <=> ?',
     [nextRunAt, cron.cron, cron.next_run_at],
   )
@@ -401,7 +459,7 @@ export async function recordCronRunStatus(report: CronRunStatusReport): Promise<
 
   if (report.status === 'start' || report.status === 'ping') {
     const pingWindowSeconds = Number(run.ping_window_seconds) || 300
-    const [result] = await pool.query(
+    const [result] = await pool.query<ResultSetHeader>(
       `
         UPDATE cron_runs
         SET
@@ -421,7 +479,7 @@ export async function recordCronRunStatus(report: CronRunStatusReport): Promise<
   }
 
   if (report.status === 'stop') {
-    const [result] = await pool.query(
+    const [result] = await pool.query<ResultSetHeader>(
       `
         UPDATE cron_runs
         SET
@@ -441,7 +499,7 @@ export async function recordCronRunStatus(report: CronRunStatusReport): Promise<
     return { accepted: true }
   }
 
-  const [result] = await pool.query(
+  const [result] = await pool.query<ResultSetHeader>(
     `
       UPDATE cron_runs
       SET
@@ -463,7 +521,7 @@ export async function recordCronRunStatus(report: CronRunStatusReport): Promise<
 }
 
 async function sweepOverdueRuns(): Promise<void> {
-  const [rows] = await pool.query(
+  const [rows] = await pool.query<OverdueRunRow[]>(
     `
       SELECT
         id,
@@ -483,7 +541,7 @@ async function sweepOverdueRuns(): Promise<void> {
       row.elapsed_seconds ?? 0,
     ).toFixed(2)} seconds`
 
-    const [result] = await pool.query(
+    const [result] = await pool.query<ResultSetHeader>(
       `
         UPDATE cron_runs
         SET
@@ -501,7 +559,7 @@ async function sweepOverdueRuns(): Promise<void> {
   }
 }
 
-async function tick() {
+async function tick(): Promise<void> {
   if (isTickRunning) return
   isTickRunning = true
 
@@ -524,7 +582,7 @@ async function tick() {
       lastSweepAt = Date.now()
     }
 
-    const [crons] = await pool.query(
+    const [crons] = await pool.query<DueCronRow[]>(
       `
         SELECT
           *,
@@ -537,7 +595,7 @@ async function tick() {
     )
 
     await Promise.all(
-      crons.map(async (cron: CronRow) => {
+      crons.map(async (cron) => {
         try {
           // NULL means freshly migrated/edited: initialize the schedule without firing.
           if (cron.next_run_at == null) {
@@ -576,7 +634,7 @@ export async function resetCronSchedule(cronName: string): Promise<void> {
   await pool.query('UPDATE cron_monitoring SET next_run_at = NULL WHERE cron = ?', [cronName])
 }
 
-export function startCronMonitor() {
+export function startCronMonitor(): void {
   if (timer) return
 
   timer = setInterval(() => {
@@ -585,7 +643,7 @@ export function startCronMonitor() {
   void tick()
 }
 
-export async function stopCronMonitor() {
+export async function stopCronMonitor(): Promise<void> {
   if (timer) {
     clearInterval(timer)
     timer = null

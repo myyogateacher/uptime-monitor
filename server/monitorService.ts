@@ -1,4 +1,4 @@
-import mysql from 'mysql2/promise'
+import mysql, { type RowDataPacket } from 'mysql2/promise'
 import { createClient } from 'redis'
 import net from 'node:net'
 import { connect as connectNats } from 'nats'
@@ -15,7 +15,7 @@ type MonitorType = 'http' | 'mysql' | 'redis' | 'nats' | 'tcp'
 
 type JsonObject = Record<string, unknown>
 
-interface MonitorEndpoint {
+interface MonitorEndpoint extends RowDataPacket {
   id: number
   group_id: number
   group_name?: string | null
@@ -207,7 +207,7 @@ const computeStatus = (endpoint: MonitorEndpoint, checkPassed: boolean): StatusC
 }
 
 const getEndpointById = async (endpointId: number): Promise<MonitorEndpoint | null> => {
-  const [rows] = await pool.query(
+  const [rows] = await pool.query<MonitorEndpoint[]>(
     `
       SELECT
         e.*,
@@ -220,7 +220,7 @@ const getEndpointById = async (endpointId: number): Promise<MonitorEndpoint | nu
     [endpointId],
   )
 
-  return ((rows as MonitorEndpoint[])[0] ?? null)
+  return rows[0] ?? null
 }
 
 const validateExpectedProbeValue = (
@@ -798,7 +798,7 @@ async function tick() {
       lastRetentionCleanupAt = Date.now()
     }
 
-    const [endpoints] = await pool.query(
+    const [endpoints] = await pool.query<MonitorEndpoint[]>(
       `
         SELECT
           e.*,
@@ -811,7 +811,7 @@ async function tick() {
       `,
     )
 
-    await Promise.all((endpoints as MonitorEndpoint[]).map((endpoint: MonitorEndpoint) => runCheck(endpoint)))
+    await Promise.all(endpoints.map((endpoint) => runCheck(endpoint)))
   } finally {
     isTickRunning = false
   }

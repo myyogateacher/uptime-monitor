@@ -1,7 +1,7 @@
-import mysql from "mysql2/promise";
+import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
 import { config } from "./config";
 
-export const pool: any = mysql.createPool({
+export const pool: Pool = mysql.createPool({
   ...config.mysql,
   waitForConnections: true,
 });
@@ -276,15 +276,21 @@ export type AppSettingRecord = {
 };
 
 export async function getAppSetting(name: string): Promise<string | null> {
-  const [rows] = await pool.query("SELECT value FROM app_settings WHERE name = ? LIMIT 1", [name]);
+  const [rows] = await pool.query<({ value: string } & RowDataPacket)[]>(
+    "SELECT value FROM app_settings WHERE name = ? LIMIT 1",
+    [name],
+  );
   if (!rows.length) return null;
   return String(rows[0].value);
 }
 
 export async function getAppSettingRecord(name: string): Promise<AppSettingRecord | null> {
-  const [rows] = await pool.query("SELECT * FROM app_settings WHERE name = ? LIMIT 1", [name]);
+  const [rows] = await pool.query<(AppSettingRecord & RowDataPacket)[]>(
+    "SELECT * FROM app_settings WHERE name = ? LIMIT 1",
+    [name],
+  );
   if (!rows.length) return null;
-  return rows[0] as AppSettingRecord;
+  return rows[0];
 }
 
 export async function setAppSetting(
@@ -302,7 +308,7 @@ export async function setAppSetting(
   );
 }
 
-async function ensureSchemaMigrationsTable() {
+async function ensureSchemaMigrationsTable(): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INT NOT NULL PRIMARY KEY,
@@ -312,14 +318,14 @@ async function ensureSchemaMigrationsTable() {
   `);
 }
 
-async function getAppliedVersions() {
-  const [rows] = await pool.query("SELECT version FROM schema_migrations");
-  return new Set(
-    (rows as { version: number }[]).map((row) => Number(row.version)),
+async function getAppliedVersions(): Promise<Set<number>> {
+  const [rows] = await pool.query<({ version: number } & RowDataPacket)[]>(
+    "SELECT version FROM schema_migrations",
   );
+  return new Set(rows.map((row) => Number(row.version)));
 }
 
-export async function initDatabase() {
+export async function initDatabase(): Promise<void> {
   await ensureSchemaMigrationsTable();
   const appliedVersions = await getAppliedVersions();
 

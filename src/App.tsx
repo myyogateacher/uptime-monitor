@@ -1,9 +1,114 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type Dispatch,
+    type FormEvent,
+    type MouseEvent as ReactMouseEvent,
+    type SetStateAction,
+} from "react";
 import { FaChevronDown, FaChevronRight } from "react-icons/fa";
 import {
     monitoringService,
+    type CronJob,
+    type CronRun,
+    type CronTriggerType,
+    type EndpointCheckResult,
+    type EndpointCheckRun,
+    type EndpointStatsBucket,
+    type MonitorEndpoint,
+    type MonitorGroup,
+    type MonitorStatus,
     type StatsGranularity,
+    type StatsMode,
 } from "./services/monitoringService";
+
+// A latency/run data point: raw check runs and aggregated buckets are
+// rendered by the same components, so both shapes are allowed.
+type RunPoint = Partial<EndpointCheckRun> & Partial<EndpointStatsBucket>;
+type RunsByEndpoint = Record<string, RunPoint[]>;
+
+// Realtime cron run updates arrive over the websocket with only a subset of
+// the full cron_runs row.
+type CronRunSummary = Partial<CronRun>;
+type CronRunsByName = Record<string, CronRunSummary[]>;
+
+type StatusTab = "services" | "crons";
+type AdminTab = "routes" | "crons";
+type CronRunsMode = "recent" | "window";
+
+type GroupWithEndpoints = MonitorGroup & {
+    endpoints: MonitorEndpoint[];
+    group_status: MonitorStatus;
+};
+
+// /api/health response; the initial client-side value only knows a subset.
+interface HealthSummary {
+    status: string;
+    endpointCount: number;
+    cronCount?: number;
+    timestamp?: string;
+}
+
+interface CronMonitorMeta {
+    updatedBy: string | null;
+    updatedAt: string | null;
+}
+
+// Payload of the "cron:run" websocket event (see server emitRunEvent).
+interface CronRunEventPayload {
+    runId: string;
+    cron: string;
+    status: string;
+    triggerType?: CronTriggerType | null;
+    triggeredAt?: string | null;
+    firstPingAt?: string | null;
+    lastPingAt?: string | null;
+    completedAt?: string | null;
+    pings?: number;
+    durationMs?: number | null;
+    responseCode?: number | null;
+    errorMessage?: string | null;
+}
+
+// Form state mirrors input elements: numeric fields may hold strings while
+// being edited; they are converted with Number() on submit.
+interface EndpointFormState {
+    group_name: string;
+    name: string;
+    monitor_type: string;
+    url: string;
+    method: string;
+    headers_json: string;
+    body_text: string;
+    expected_status: number | string;
+    expected_json_path: string;
+    expected_json_value: string;
+    connection_json: string;
+    probe_command: string;
+    expected_probe_value: string;
+    interval_seconds: number | string;
+    down_retries: number | string;
+    up_retries: number | string;
+}
+
+interface CronFormState {
+    cron: string;
+    expression: string;
+    service: string;
+    endpoint: string;
+    trigger_type: string;
+    http_method: string;
+    headers_json: string;
+    body_text: string;
+    nats_subject: string;
+    start_window_seconds: number | string;
+    ping_window_seconds: number | string;
+    track_run: boolean;
+    status: boolean;
+}
 
 const METHOD_OPTIONS = [
     "GET",

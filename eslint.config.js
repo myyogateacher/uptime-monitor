@@ -72,7 +72,10 @@ export default defineConfig([
     },
     rules: {
       'no-undef': 'off',
+      'no-unused-vars': 'off',
+      'no-redeclare': 'off',
       '@typescript-eslint/no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
+      '@typescript-eslint/no-redeclare': 'error',
     },
   },
 ])
