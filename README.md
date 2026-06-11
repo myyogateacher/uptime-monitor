@@ -20,7 +20,7 @@ One service that watches your APIs, databases, message bus, and cron jobs — an
 
 - **Five monitor types** — HTTP(S), MySQL, Redis, NATS JetStream, and TCP ports, each with per-monitor intervals and optional probe commands with expected-value matching.
 - **Deep HTTP checks** — custom method, headers, and body; assert on status code or a nested JSON path in the response.
-- **NATS JetStream consumer lag detection** — flags consumers whose backlog exceeds a threshold (global, per-stream, or per-consumer), and is smart enough not to alert on a consumer that is already draining.
+- **NATS JetStream consumer lag detection** — flags consumers whose backlog exceeds a threshold (global, per-monitor, or per-consumer), and is smart enough not to alert on a consumer that is already draining.
 - **Cron monitoring** — schedules and fires your crons over NATS or HTTP, then tracks each run through start/ping/stop reports; runs that never report or go silent past their deadline are marked missed and alerted on.
 - **Retry-aware health transitions** — configurable retries before marking down or back up, so a single blip never pages anyone.
 - **Realtime control plane and status page** — WebSocket pushes every check result and config change to all open tabs; the public status page shows grouped service health, latency trend graphs, and cron run history.
@@ -168,6 +168,12 @@ docker compose down -v
 - Check results are stored in `monitor_check_runs`.
 - Endpoint health state is updated with retry-aware transitions.
 - WebSocket events push monitor/group/endpoint changes to connected clients.
+
+NATS JetStream probe commands (set as the monitor's probe command):
+
+- `jetstream.info`, `stream.info:<name>` - account/stream health
+- `consumers.lag[:<threshold>]` - lag check across all consumers; `consumer.lag:<stream>:<consumer>[:<threshold>]` for one
+- A consumer is flagged when `num_ack_pending`, `num_pending`, or `num_waiting` exceeds the threshold (default 128). Override per consumer via `"lag_thresholds": { "my_consumer": 1024, "default": 128 }` in Connection JSON, or globally with `NATS_LAG_THRESHOLDS` (Connection JSON wins). Draining consumers (backlog shrinking since the last check) are not flagged.
 
 ## Database Migrations
 
