@@ -286,6 +286,26 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 13,
+    name: "create_audit_logs",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          actor_email VARCHAR(255) NULL,
+          actor_name VARCHAR(255) NULL,
+          action VARCHAR(40) NOT NULL,
+          entity_type VARCHAR(40) NOT NULL,
+          entity_id VARCHAR(120) NULL,
+          entity_label VARCHAR(255) NULL,
+          summary VARCHAR(512) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_audit_logs_created (created_at)
+        )
+      `);
+    },
+  },
 ];
 
 export type AppSettingRecord = {

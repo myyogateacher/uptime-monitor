@@ -30,6 +30,18 @@ export interface SessionState {
   role: UserRole | null
 }
 
+export interface AuditLogEntry {
+  id: number
+  actor_email: string | null
+  actor_name: string | null
+  action: string
+  entity_type: string
+  entity_id: string | null
+  entity_label: string | null
+  summary: string
+  created_at: string
+}
+
 export interface ManagedUser {
   id: number
   email: string
@@ -306,6 +318,9 @@ export const monitoringService = {
       method: 'PATCH',
       body: JSON.stringify({ banned }),
     })
+  },
+  getAuditLogs(limit = 200): Promise<AuditLogEntry[]> {
+    return request<AuditLogEntry[]>(`/api/audit-logs?limit=${limit}`)
   },
   getHealth(): Promise<HealthState> {
     return request<HealthState>('/api/health')

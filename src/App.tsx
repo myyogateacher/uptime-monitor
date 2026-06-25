@@ -16,6 +16,7 @@ import {
     FaBan,
     FaChevronDown,
     FaChevronRight,
+    FaClipboardList,
     FaServer,
     FaSignOutAlt,
     FaUndo,
@@ -24,6 +25,7 @@ import {
 } from "react-icons/fa";
 import {
     monitoringService,
+    type AuditLogEntry,
     type CronJob,
     type CronRun,
     type CronTriggerType,
@@ -2900,7 +2902,7 @@ function AdminPage({
     );
 }
 
-type AppSection = "monitors" | "users";
+type AppSection = "monitors" | "users" | "audit";
 
 type NavItem = {
     section: AppSection;
@@ -2933,6 +2935,12 @@ function AppSidebar({
                       label: "Users",
                       href: "/users",
                       icon: FaUsers,
+                  },
+                  {
+                      section: "audit" as const,
+                      label: "Audit Log",
+                      href: "/audit",
+                      icon: FaClipboardList,
                   },
               ]
             : []),
@@ -3502,6 +3510,130 @@ function UsersPage() {
     );
 }
 
+const AUDIT_ACTION_BADGE: Record<string, string> = {
+    create: "bg-emerald-100 text-emerald-700 border-emerald-200/80",
+    update: "bg-cyan-100 text-cyan-700 border-cyan-200/80",
+    delete: "bg-rose-100 text-rose-700 border-rose-200/80",
+    pause: "bg-amber-100 text-amber-700 border-amber-200/80",
+    resume: "bg-emerald-100 text-emerald-700 border-emerald-200/80",
+    ban: "bg-rose-100 text-rose-700 border-rose-200/80",
+    unban: "bg-emerald-100 text-emerald-700 border-emerald-200/80",
+    role_change: "bg-indigo-100 text-indigo-700 border-indigo-200/80",
+    settings: "bg-slate-100 text-slate-600 border-slate-200/80",
+    clear_history: "bg-amber-100 text-amber-700 border-amber-200/80",
+};
+
+const formatAuditTime = (value: string): string => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString();
+};
+
+function AuditLogPage() {
+    const [entries, setEntries] = useState<AuditLogEntry[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState("");
+
+    const loadEntries = useCallback(async () => {
+        setError("");
+        try {
+            setEntries(await monitoringService.getAuditLogs(200));
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        void loadEntries();
+    }, [loadEntries]);
+
+    return (
+        <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
+            <div className="mx-auto max-w-5xl space-y-6">
+                <section className="glass-card rounded-xl p-6">
+                    <div className="flex items-start justify-between gap-3">
+                        <div>
+                            <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                                Activity
+                            </p>
+                            <h1 className="mt-2 text-2xl font-semibold">
+                                Audit Log
+                            </h1>
+                            <p className="mt-2 text-sm text-slate-600">
+                                Recent changes to monitors, crons, and users —
+                                most recent first.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => void loadEntries()}
+                            className="rounded-lg border border-white/60 bg-white/55 px-3 py-1.5 text-xs font-medium text-slate-700 backdrop-blur transition hover:bg-white/80"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+                </section>
+
+                {error && (
+                    <div className="rounded-lg border border-rose-200/80 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
+                        {error}
+                    </div>
+                )}
+
+                <section className="glass-card rounded-xl p-4 md:p-6">
+                    {isLoading ? (
+                        <p className="px-2 py-6 text-sm text-slate-500">
+                            Loading activity…
+                        </p>
+                    ) : entries.length === 0 ? (
+                        <p className="px-2 py-6 text-sm text-slate-500">
+                            No activity recorded yet.
+                        </p>
+                    ) : (
+                        <ul className="space-y-2">
+                            {entries.map((entry) => (
+                                <li
+                                    key={entry.id}
+                                    className="flex flex-col gap-2 rounded-lg border border-white/60 bg-white/45 p-3 sm:flex-row sm:items-center sm:justify-between"
+                                >
+                                    <div className="flex min-w-0 items-center gap-3">
+                                        <span
+                                            className={`shrink-0 rounded-full border px-2 py-0.5 text-xs font-medium capitalize ${
+                                                AUDIT_ACTION_BADGE[
+                                                    entry.action
+                                                ] ??
+                                                "bg-slate-100 text-slate-600 border-slate-200/80"
+                                            }`}
+                                        >
+                                            {entry.action.replace("_", " ")}
+                                        </span>
+                                        <div className="min-w-0">
+                                            <p className="truncate text-sm font-medium text-slate-800">
+                                                {entry.summary}
+                                            </p>
+                                            <p className="truncate text-xs text-slate-500">
+                                                {entry.entity_type}
+                                                {entry.actor_email
+                                                    ? ` · by ${entry.actor_name || entry.actor_email}`
+                                                    : ""}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <span className="shrink-0 text-xs text-slate-500 sm:text-right">
+                                        {formatAuditTime(entry.created_at)}
+                                    </span>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </section>
+            </div>
+        </main>
+    );
+}
+
 function App() {
     const pathname =
         typeof window !== "undefined" ? window.location.pathname : "/";
@@ -3509,6 +3641,7 @@ function App() {
     const isStatusPage = pathname.startsWith("/status");
     const isLoginPage = pathname.startsWith("/login");
     const isUsersPage = pathname.startsWith("/users");
+    const isAuditPage = pathname.startsWith("/audit");
     const isMonitorsPage =
         pathname.startsWith("/monitors") ||
         (!isHomePage && !isStatusPage && !isLoginPage);
@@ -4462,26 +4595,31 @@ function App() {
 
     return (
         <AppShell
-            active={isUsersPage ? "users" : "monitors"}
+            active={
+                isUsersPage ? "users" : isAuditPage ? "audit" : "monitors"
+            }
             canManageUsers={canManageUsers}
             user={user}
         >
-            {isUsersPage ? (
-                canManageUsers ? (
-                    <UsersPage />
-                ) : (
+            {isUsersPage || isAuditPage ? (
+                !canManageUsers ? (
                     <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
                         <div className="mx-auto max-w-5xl">
                             <section className="glass-card rounded-xl p-6">
                                 <h1 className="text-2xl font-semibold">
-                                    Users
+                                    {isAuditPage ? "Audit Log" : "Users"}
                                 </h1>
                                 <p className="mt-2 text-sm text-slate-600">
-                                    You do not have permission to manage users.
+                                    You do not have permission to view this
+                                    section.
                                 </p>
                             </section>
                         </div>
                     </main>
+                ) : isAuditPage ? (
+                    <AuditLogPage />
+                ) : (
+                    <UsersPage />
                 )
             ) : (
                 <AdminPage

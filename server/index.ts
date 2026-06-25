@@ -33,6 +33,11 @@ import {
 } from "./events";
 import { startMonitor, stopMonitor, triggerCheckNow } from "./monitorService";
 import {
+  type AuditEntryInput,
+  listAuditLogs,
+  recordAudit,
+} from "./auditService";
+import {
   USER_ROLES,
   type UserRole,
   canEditWithRole,
@@ -852,6 +857,15 @@ const buildLoginUrl = (returnTo?: string): string => {
   return `${config.auth.loginPath}${suffix ? `?${suffix}` : ""}`;
 };
 
+const audit = (req: Request, entry: AuditEntryInput): Promise<void> =>
+  recordAudit(
+    {
+      email: req.session?.user?.email ?? null,
+      name: req.session?.user?.name ?? null,
+    },
+    entry,
+  );
+
 app.get("/api/auth/me", async (req: Request, res: Response) => {
   const anonymous = {
     authenticated: false,
@@ -1056,6 +1070,13 @@ app.post("/api/users", requireAdmin, async (req: Request, res: Response) => {
   }
 
   const created = await createUser(email, role);
+  await audit(req, {
+    action: "create",
+    entityType: "user",
+    entityId: created.id,
+    entityLabel: created.email,
+    summary: `Invited user ${created.email} as ${role}`,
+  });
   return res
     .status(201)
     .json(serializeUser(created, String(req.session?.user?.sub ?? "")));
@@ -1086,6 +1107,13 @@ app.patch(
     }
 
     await setUserRole(id, role);
+    await audit(req, {
+      action: "role_change",
+      entityType: "user",
+      entityId: id,
+      entityLabel: target.email,
+      summary: `Changed ${target.email} role from ${target.role} to ${role}`,
+    });
     const updated = await getUserById(id);
     return res.json(
       serializeUser(updated!, String(req.session?.user?.sub ?? "")),
@@ -1113,12 +1141,37 @@ app.patch(
     }
 
     await setUserBanned(id, banned);
+    await audit(req, {
+      action: banned ? "ban" : "unban",
+      entityType: "user",
+      entityId: id,
+      entityLabel: target.email,
+      summary: `${banned ? "Banned" : "Unbanned"} ${target.email}`,
+    });
     const updated = await getUserById(id);
     return res.json(
       serializeUser(updated!, String(req.session?.user?.sub ?? "")),
     );
   },
 );
+
+app.get("/api/audit-logs", requireAdmin, async (req: Request, res: Response) => {
+  const limit = toInteger(req.query.limit, 200) ?? 200;
+  const rows = await listAuditLogs(limit);
+  res.json(
+    rows.map((row) => ({
+      id: row.id,
+      actor_email: row.actor_email,
+      actor_name: row.actor_name,
+      action: row.action,
+      entity_type: row.entity_type,
+      entity_id: row.entity_id,
+      entity_label: row.entity_label,
+      summary: row.summary,
+      created_at: row.created_at,
+    })),
+  );
+});
 
 app.get("/api/health", async (_req: Request, res: Response) => {
   const [rows] = await pool.query<
@@ -1169,6 +1222,13 @@ app.post("/api/groups", requireEditor, async (req: Request, res: Response) => {
   );
   const createdGroup = rows[0];
   monitorEvents.emit(GROUP_CREATED_EVENT, createdGroup);
+  await audit(req, {
+    action: "create",
+    entityType: "group",
+    entityId: createdGroup.id,
+    entityLabel: createdGroup.name,
+    summary: `Created group "${createdGroup.name}"`,
+  });
   return res.status(201).json(createdGroup);
 });
 
@@ -1204,6 +1264,13 @@ app.put(
 
     const updatedGroup = rows[0];
     monitorEvents.emit(GROUP_UPDATED_EVENT, updatedGroup);
+    await audit(req, {
+      action: "update",
+      entityType: "group",
+      entityId: updatedGroup.id,
+      entityLabel: updatedGroup.name,
+      summary: `Updated group "${updatedGroup.name}"`,
+    });
     return res.json(updatedGroup);
   },
 );
@@ -1218,6 +1285,11 @@ app.delete(
       return res.status(400).json({ error: "Invalid group id" });
     }
 
+    const [nameRows] = await pool.query<GroupRow[]>(
+      "SELECT * FROM monitor_groups WHERE id = ? LIMIT 1",
+      [id],
+    );
+
     const [result] = await pool.query<ResultSetHeader>(
       "DELETE FROM monitor_groups WHERE id = ?",
       [id],
@@ -1228,6 +1300,13 @@ app.delete(
     }
 
     monitorEvents.emit(GROUP_DELETED_EVENT, { id });
+    await audit(req, {
+      action: "delete",
+      entityType: "group",
+      entityId: id,
+      entityLabel: nameRows[0]?.name ?? null,
+      summary: `Deleted group "${nameRows[0]?.name ?? `#${id}`}"`,
+    });
     return res.status(204).send();
   },
 );
@@ -1242,10 +1321,9 @@ app.post(
       return res.status(400).json({ error: "Invalid group id" });
     }
 
-    const [groupRows] = await pool.query<IdRow[]>(
-      "SELECT id FROM monitor_groups WHERE id = ? LIMIT 1",
-      [id],
-    );
+    const [groupRows] = await pool.query<
+      ({ id: number; name: string } & RowDataPacket)[]
+    >("SELECT id, name FROM monitor_groups WHERE id = ? LIMIT 1", [id]);
     if (!groupRows.length) {
       return res.status(404).json({ error: "Group not found" });
     }
@@ -1266,6 +1344,13 @@ app.post(
       monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint);
     }
 
+    await audit(req, {
+      action: "pause",
+      entityType: "group",
+      entityId: id,
+      entityLabel: groupRows[0].name,
+      summary: `Paused all monitors in group "${groupRows[0].name}"`,
+    });
     return res.json({
       groupId: id,
       action: "paused",
@@ -1284,10 +1369,9 @@ app.post(
       return res.status(400).json({ error: "Invalid group id" });
     }
 
-    const [groupRows] = await pool.query<IdRow[]>(
-      "SELECT id FROM monitor_groups WHERE id = ? LIMIT 1",
-      [id],
-    );
+    const [groupRows] = await pool.query<
+      ({ id: number; name: string } & RowDataPacket)[]
+    >("SELECT id, name FROM monitor_groups WHERE id = ? LIMIT 1", [id]);
     if (!groupRows.length) {
       return res.status(404).json({ error: "Group not found" });
     }
@@ -1308,6 +1392,13 @@ app.post(
       monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint);
     }
 
+    await audit(req, {
+      action: "resume",
+      entityType: "group",
+      entityId: id,
+      entityLabel: groupRows[0].name,
+      summary: `Resumed all monitors in group "${groupRows[0].name}"`,
+    });
     return res.json({
       groupId: id,
       action: "resumed",
@@ -1421,6 +1512,13 @@ app.post(
 
     const createdEndpoint = mapEndpointRow(rows[0]);
     monitorEvents.emit(ENDPOINT_CREATED_EVENT, createdEndpoint);
+    await audit(req, {
+      action: "create",
+      entityType: "endpoint",
+      entityId: createdEndpoint.id,
+      entityLabel: createdEndpoint.name,
+      summary: `Created monitor "${createdEndpoint.name}" in group "${createdEndpoint.group_name}"`,
+    });
     return res.status(201).json(createdEndpoint);
   },
 );
@@ -1549,6 +1647,13 @@ app.put(
 
     const updatedEndpoint = mapEndpointRow(rows[0]);
     monitorEvents.emit(ENDPOINT_UPDATED_EVENT, updatedEndpoint);
+    await audit(req, {
+      action: "update",
+      entityType: "endpoint",
+      entityId: updatedEndpoint.id,
+      entityLabel: updatedEndpoint.name,
+      summary: `Updated monitor "${updatedEndpoint.name}"`,
+    });
     return res.json(updatedEndpoint);
   },
 );
@@ -1563,6 +1668,10 @@ app.delete(
       return res.status(400).json({ error: "Invalid endpoint id" });
     }
 
+    const [nameRows] = await pool.query<
+      ({ name: string } & RowDataPacket)[]
+    >("SELECT name FROM monitor_endpoints WHERE id = ? LIMIT 1", [id]);
+
     const [result] = await pool.query<ResultSetHeader>(
       "DELETE FROM monitor_endpoints WHERE id = ?",
       [id],
@@ -1573,6 +1682,13 @@ app.delete(
     }
 
     monitorEvents.emit(ENDPOINT_DELETED_EVENT, { id });
+    await audit(req, {
+      action: "delete",
+      entityType: "endpoint",
+      entityId: id,
+      entityLabel: nameRows[0]?.name ?? null,
+      summary: `Deleted monitor "${nameRows[0]?.name ?? `#${id}`}"`,
+    });
     return res.status(204).send();
   },
 );
@@ -1634,6 +1750,13 @@ app.post(
 
     const endpoint = await getMappedEndpointById(id);
     monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint);
+    await audit(req, {
+      action: "pause",
+      entityType: "endpoint",
+      entityId: id,
+      entityLabel: endpoint?.name ?? null,
+      summary: `Paused monitor "${endpoint?.name ?? `#${id}`}"`,
+    });
     return res.json(endpoint);
   },
 );
@@ -1665,6 +1788,13 @@ app.post(
 
     const endpoint = await getMappedEndpointById(id);
     monitorEvents.emit(ENDPOINT_UPDATED_EVENT, endpoint);
+    await audit(req, {
+      action: "resume",
+      entityType: "endpoint",
+      entityId: id,
+      entityLabel: endpoint?.name ?? null,
+      summary: `Resumed monitor "${endpoint?.name ?? `#${id}`}"`,
+    });
     return res.json(endpoint);
   },
 );
@@ -1743,10 +1873,9 @@ app.delete(
       return res.status(400).json({ error: "Invalid endpoint id" });
     }
 
-    const [endpointRows] = await pool.query<IdRow[]>(
-      "SELECT id FROM monitor_endpoints WHERE id = ? LIMIT 1",
-      [id],
-    );
+    const [endpointRows] = await pool.query<
+      ({ id: number; name: string } & RowDataPacket)[]
+    >("SELECT id, name FROM monitor_endpoints WHERE id = ? LIMIT 1", [id]);
     if (!endpointRows.length) {
       return res.status(404).json({ error: "Endpoint not found" });
     }
@@ -1756,6 +1885,13 @@ app.delete(
       [id],
     );
 
+    await audit(req, {
+      action: "clear_history",
+      entityType: "endpoint",
+      entityId: id,
+      entityLabel: endpointRows[0].name,
+      summary: `Cleared ${result.affectedRows ?? 0} check run(s) for monitor "${endpointRows[0].name}"`,
+    });
     return res.json({
       endpointId: id,
       deletedRuns: result.affectedRows ?? 0,
@@ -1792,6 +1928,13 @@ app.put(
     const enabled = Boolean(req.body?.enabled);
     const updatedBy = getSessionEmail(req) || null;
     await setCronMonitorEnabled(enabled, updatedBy);
+    await audit(req, {
+      action: "settings",
+      entityType: "settings",
+      entityId: "cron_monitor_enabled",
+      entityLabel: "Cron monitoring",
+      summary: `${enabled ? "Enabled" : "Disabled"} cron monitoring`,
+    });
     return res.json(await getCronMonitorSettings());
   },
 );
@@ -1951,6 +2094,13 @@ app.post("/api/crons", requireEditor, async (req: Request, res: Response) => {
 
   const createdCron = await getMappedCronByName(String(payload.cron));
   monitorEvents.emit(CRON_CREATED_EVENT, createdCron);
+  await audit(req, {
+    action: "create",
+    entityType: "cron",
+    entityId: String(payload.cron),
+    entityLabel: String(payload.cron),
+    summary: `Created cron "${String(payload.cron)}"`,
+  });
   return res.status(201).json(createdCron);
 });
 
@@ -2018,6 +2168,13 @@ app.put(
 
     const updatedCron = await getMappedCronByName(cronName);
     monitorEvents.emit(CRON_UPDATED_EVENT, updatedCron);
+    await audit(req, {
+      action: "update",
+      entityType: "cron",
+      entityId: cronName,
+      entityLabel: cronName,
+      summary: `Updated cron "${cronName}"`,
+    });
     return res.json(updatedCron);
   },
 );
@@ -2042,6 +2199,13 @@ app.delete(
     }
 
     monitorEvents.emit(CRON_DELETED_EVENT, { cron: cronName });
+    await audit(req, {
+      action: "delete",
+      entityType: "cron",
+      entityId: cronName,
+      entityLabel: cronName,
+      summary: `Deleted cron "${cronName}"`,
+    });
     return res.status(204).send();
   },
 );
