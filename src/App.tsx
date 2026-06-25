@@ -1382,6 +1382,14 @@ function LoginPage({ apiBase, isChecking, error }: LoginPageProps) {
             ? requestedReturnTo
             : "/monitors";
     const googleAuthUrl = `${apiBase || ""}/api/auth/google?returnTo=${encodeURIComponent(safeReturnTo)}`;
+    const errorCode = search.get("error");
+    const errorMessage =
+        error ||
+        (errorCode === "account_not_provisioned"
+            ? "Your account hasn't been granted access. Ask an administrator to add you first."
+            : errorCode === "banned"
+              ? "Your account has been suspended. Contact an administrator."
+              : "");
 
     return (
         <main className="min-h-screen px-4 py-12 text-slate-900 md:px-8">
@@ -1409,8 +1417,10 @@ function LoginPage({ apiBase, isChecking, error }: LoginPageProps) {
                             Checking session...
                         </p>
                     ) : null}
-                    {error ? (
-                        <p className="mt-3 text-xs text-rose-600">{error}</p>
+                    {errorMessage ? (
+                        <p className="mt-3 text-xs text-rose-600">
+                            {errorMessage}
+                        </p>
                     ) : null}
                 </section>
             </div>
@@ -3529,10 +3539,44 @@ const formatAuditTime = (value: string): string => {
     return date.toLocaleString();
 };
 
+const AUDIT_TRUNCATE_OPTIONS: Array<{
+    value: string;
+    label: string;
+    confirm: string;
+}> = [
+    {
+        value: "3m",
+        label: "Keep last 3 months",
+        confirm: "Delete all audit entries older than 3 months?",
+    },
+    {
+        value: "1m",
+        label: "Keep last 1 month",
+        confirm: "Delete all audit entries older than 1 month?",
+    },
+    {
+        value: "1w",
+        label: "Keep last 1 week",
+        confirm: "Delete all audit entries older than 1 week?",
+    },
+    {
+        value: "1d",
+        label: "Keep last 1 day",
+        confirm: "Delete all audit entries older than 1 day?",
+    },
+    {
+        value: "all",
+        label: "Clear all",
+        confirm: "Permanently delete ALL audit log entries?",
+    },
+];
+
 function AuditLogPage() {
     const [entries, setEntries] = useState<AuditLogEntry[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState("");
+    const [truncatePeriod, setTruncatePeriod] = useState("3m");
+    const [isTruncating, setIsTruncating] = useState(false);
 
     const loadEntries = useCallback(async () => {
         setError("");
@@ -3548,6 +3592,29 @@ function AuditLogPage() {
     useEffect(() => {
         void loadEntries();
     }, [loadEntries]);
+
+    const handleTruncate = async () => {
+        const option = AUDIT_TRUNCATE_OPTIONS.find(
+            (item) => item.value === truncatePeriod,
+        );
+        if (!option) return;
+        if (
+            typeof window !== "undefined" &&
+            !window.confirm(option.confirm)
+        ) {
+            return;
+        }
+        setIsTruncating(true);
+        setError("");
+        try {
+            await monitoringService.truncateAuditLogs(truncatePeriod);
+            await loadEntries();
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setIsTruncating(false);
+        }
+    };
 
     return (
         <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
@@ -3573,6 +3640,40 @@ function AuditLogPage() {
                         >
                             Refresh
                         </button>
+                    </div>
+
+                    <div className="mt-5 flex flex-col gap-2 border-t border-white/50 pt-4 sm:flex-row sm:items-center">
+                        <span className="text-xs font-medium uppercase tracking-wider text-slate-500">
+                            Retention
+                        </span>
+                        <div className="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">
+                            <select
+                                value={truncatePeriod}
+                                onChange={(event) =>
+                                    setTruncatePeriod(event.target.value)
+                                }
+                                disabled={isTruncating}
+                                className="rounded-lg border border-slate-300/80 px-3 py-1.5 text-sm font-medium text-slate-700 disabled:opacity-60"
+                            >
+                                {AUDIT_TRUNCATE_OPTIONS.map((option) => (
+                                    <option
+                                        key={option.value}
+                                        value={option.value}
+                                    >
+                                        {option.label}
+                                    </option>
+                                ))}
+                            </select>
+                            <button
+                                type="button"
+                                onClick={() => void handleTruncate()}
+                                disabled={isTruncating}
+                                className="flex items-center justify-center gap-1.5 rounded-lg border border-rose-200/80 bg-rose-50/80 px-3 py-1.5 text-sm font-medium text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                <FaBan />
+                                {isTruncating ? "Truncating…" : "Truncate"}
+                            </button>
+                        </div>
                     </div>
                 </section>
 

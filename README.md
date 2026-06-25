@@ -63,6 +63,7 @@ Use `.env` (see `.env.example`):
 - `LOGIN_PATH`
 - `TRUST_PROXY`
 - `CONTROL_PLANE_ADMIN_EMAILS`
+- `ALLOW_NEW_ACCOUNTS`
 - `NOTIFICATIONS_ENABLED`
 - `SLACK_BOT_TOKEN`
 - `SLACK_CHANNEL_ID`
@@ -76,6 +77,12 @@ Access control:
 - Example: `CONTROL_PLANE_ADMIN_EMAILS=ops@company.com,sre@company.com`
 - These emails are inserted as admins on startup (and re-asserted to admin + un-banned on every boot, so a configured admin can always recover access). A row is created without a Google ID and claimed by email at first login.
 - If empty and no admin exists yet, the Users console is unreachable — set at least one admin email before locking down access.
+- `ALLOW_NEW_ACCOUNTS` (default `true`): when `true`, anyone who signs in with Google and isn't already known is created with the `viewer` role. When `false`, only users who already exist in the `users` table (invited from the Users console, or seeded admins) can sign in — everyone else is denied at login. Admins seeded via `CONTROL_PLANE_ADMIN_EMAILS` are always allowed regardless of this setting.
+
+Audit log:
+
+- All changes to monitors, groups, crons, and users are recorded in an audit log, viewable by admins under the **Audit Log** section.
+- Admins can truncate the log by retention window (keep last 3 months / 1 month / 1 week / 1 day) or clear it entirely.
 
 Session storage:
 

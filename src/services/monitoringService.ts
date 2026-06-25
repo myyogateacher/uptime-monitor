@@ -322,6 +322,12 @@ export const monitoringService = {
   getAuditLogs(limit = 200): Promise<AuditLogEntry[]> {
     return request<AuditLogEntry[]>(`/api/audit-logs?limit=${limit}`)
   },
+  truncateAuditLogs(period: string): Promise<{ deleted: number }> {
+    return request<{ deleted: number }>(
+      `/api/audit-logs?period=${encodeURIComponent(period)}`,
+      { method: 'DELETE' },
+    )
+  },
   getHealth(): Promise<HealthState> {
     return request<HealthState>('/api/health')
   },

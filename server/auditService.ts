@@ -57,6 +57,42 @@ export const recordAudit = async (
   }
 };
 
+export const AUDIT_RETENTION_PERIODS = {
+  "3m": { days: 90, label: "last 3 months" },
+  "1m": { days: 30, label: "last 1 month" },
+  "1w": { days: 7, label: "last 1 week" },
+  "1d": { days: 1, label: "last 1 day" },
+  all: { days: null, label: "all entries" },
+} as const;
+
+export type AuditRetentionPeriod = keyof typeof AUDIT_RETENTION_PERIODS;
+
+export const isAuditRetentionPeriod = (
+  value: string,
+): value is AuditRetentionPeriod =>
+  Object.prototype.hasOwnProperty.call(AUDIT_RETENTION_PERIODS, value);
+
+/**
+ * Deletes audit entries. For a dated period, removes everything older than the
+ * retention window; for "all", clears the table. Returns the number removed.
+ */
+export const truncateAuditLogs = async (
+  period: AuditRetentionPeriod,
+): Promise<number> => {
+  const { days } = AUDIT_RETENTION_PERIODS[period];
+  if (days == null) {
+    const [result] = await pool.query<ResultSetHeader>(
+      "DELETE FROM audit_logs",
+    );
+    return result.affectedRows ?? 0;
+  }
+  const [result] = await pool.query<ResultSetHeader>(
+    "DELETE FROM audit_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)",
+    [days],
+  );
+  return result.affectedRows ?? 0;
+};
+
 export const listAuditLogs = async (limit = 200): Promise<AuditLogRow[]> => {
   const safeLimit = Math.max(1, Math.min(limit, 500));
   const [rows] = await pool.query<AuditLogRow[]>(

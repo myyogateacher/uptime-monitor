@@ -120,15 +120,23 @@ export const createUser = async (
  * admin awaiting first login, or a returning user) is matched by email and has
  * its google_sub / profile claimed; otherwise a new viewer row is inserted. Role
  * and ban status are never overwritten here — only the admin console changes them.
+ *
+ * Returns null when the account does not exist and new-account creation is
+ * disabled (ALLOW_NEW_ACCOUNTS=false), signalling the caller to deny the login.
+ * Seed admins are always allowed through so the console can never be locked out.
  */
 export const upsertUserOnLogin = async (
   profile: GoogleProfile,
-): Promise<UserRow> => {
+): Promise<UserRow | null> => {
   const email = normalizeEmail(profile.email);
 
   const existing = email
     ? await getUserByEmail(email)
     : await getUserBySub(profile.sub);
+
+  if (!existing && !config.auth.allowNewAccounts && !isSeedAdmin(email)) {
+    return null;
+  }
 
   if (existing) {
     await pool.query<ResultSetHeader>(

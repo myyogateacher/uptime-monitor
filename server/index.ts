@@ -33,9 +33,12 @@ import {
 } from "./events";
 import { startMonitor, stopMonitor, triggerCheckNow } from "./monitorService";
 import {
+  AUDIT_RETENTION_PERIODS,
   type AuditEntryInput,
+  isAuditRetentionPeriod,
   listAuditLogs,
   recordAudit,
+  truncateAuditLogs,
 } from "./auditService";
 import {
   USER_ROLES,
@@ -850,9 +853,10 @@ const requireGoogleConfig = (res: Response): boolean => {
   return true;
 };
 
-const buildLoginUrl = (returnTo?: string): string => {
+const buildLoginUrl = (returnTo?: string, error?: string): string => {
   const params = new URLSearchParams();
   if (returnTo) params.set("returnTo", returnTo);
+  if (error) params.set("error", error);
   const suffix = params.toString();
   return `${config.auth.loginPath}${suffix ? `?${suffix}` : ""}`;
 };
@@ -999,8 +1003,12 @@ app.get("/api/auth/google/callback", async (req: Request, res: Response) => {
       picture: profile.picture,
     });
 
+    if (!record) {
+      return res.redirect(buildLoginUrl(returnTo, "account_not_provisioned"));
+    }
+
     if (record.is_banned) {
-      return res.redirect(buildLoginUrl(returnTo));
+      return res.redirect(buildLoginUrl(returnTo, "banned"));
     }
 
     req.session.user = {
@@ -1172,6 +1180,29 @@ app.get("/api/audit-logs", requireAdmin, async (req: Request, res: Response) => 
     })),
   );
 });
+
+app.delete(
+  "/api/audit-logs",
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const period = String(req.query.period ?? "").trim();
+    if (!isAuditRetentionPeriod(period)) {
+      return res.status(400).json({ error: "Invalid retention period" });
+    }
+
+    const deleted = await truncateAuditLogs(period);
+    const label = AUDIT_RETENTION_PERIODS[period].label;
+    await audit(req, {
+      action: "truncate",
+      entityType: "audit",
+      summary:
+        period === "all"
+          ? `Cleared all audit logs (${deleted} removed)`
+          : `Truncated audit logs to ${label} (${deleted} removed)`,
+    });
+    return res.json({ deleted });
+  },
+);
 
 app.get("/api/health", async (_req: Request, res: Response) => {
   const [rows] = await pool.query<

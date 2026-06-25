@@ -208,5 +208,6 @@ export const config = {
     loginPath: process.env.LOGIN_PATH ?? '/login',
     trustProxy: toBoolean(process.env.TRUST_PROXY, nodeEnv === 'production'),
     adminEmails: parseEmailAllowlist(process.env.CONTROL_PLANE_ADMIN_EMAILS),
+    allowNewAccounts: toBoolean(process.env.ALLOW_NEW_ACCOUNTS, true),
   },
 }
