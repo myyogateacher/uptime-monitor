@@ -3110,7 +3110,10 @@ function UsersPage() {
     const [users, setUsers] = useState<ManagedUser[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState("");
-    const [busyId, setBusyId] = useState<number | null>(null);
+    const [isSaving, setIsSaving] = useState(false);
+    const [editingUserId, setEditingUserId] = useState<number | null>(null);
+    const [formEmail, setFormEmail] = useState("");
+    const [formRole, setFormRole] = useState<UserRole>("viewer");
 
     const loadUsers = useCallback(async () => {
         setError("");
@@ -3134,22 +3137,64 @@ function UsersPage() {
             ),
         );
 
-    const handleRoleChange = async (user: ManagedUser, role: UserRole) => {
-        if (role === user.role) return;
-        setBusyId(user.id);
+    const editingUser =
+        editingUserId === null
+            ? null
+            : (users.find((user) => user.id === editingUserId) ?? null);
+    const roleLocked = Boolean(
+        editingUser && (editingUser.is_self || editingUser.is_allowlisted),
+    );
+    const roleUnchanged = editingUser ? formRole === editingUser.role : false;
+
+    const handleStartEdit = (user: ManagedUser) => {
+        setEditingUserId(user.id);
+        setFormRole(user.role);
+        setFormEmail("");
         setError("");
+    };
+
+    const handleCancelEdit = () => {
+        setEditingUserId(null);
+        setFormEmail("");
+        setFormRole("viewer");
+        setError("");
+    };
+
+    const handleSubmit = async (event: SubmitEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        setError("");
+        setIsSaving(true);
         try {
-            replaceUser(await monitoringService.setUserRole(user.id, role));
+            if (editingUser) {
+                if (!roleLocked && !roleUnchanged) {
+                    replaceUser(
+                        await monitoringService.setUserRole(
+                            editingUser.id,
+                            formRole,
+                        ),
+                    );
+                }
+            } else {
+                const email = formEmail.trim();
+                if (!email) return;
+                const created = await monitoringService.createUser(
+                    email,
+                    formRole,
+                );
+                setUsers((prev) => [...prev, created]);
+                setFormEmail("");
+                setFormRole("viewer");
+            }
         } catch (requestError) {
             setError(getErrorMessage(requestError));
         } finally {
-            setBusyId(null);
+            setIsSaving(false);
         }
     };
 
     const handleToggleBan = async (user: ManagedUser) => {
-        setBusyId(user.id);
         setError("");
+        setIsSaving(true);
         try {
             replaceUser(
                 await monitoringService.setUserBanned(user.id, !user.is_banned),
@@ -3157,25 +3202,46 @@ function UsersPage() {
         } catch (requestError) {
             setError(getErrorMessage(requestError));
         } finally {
-            setBusyId(null);
+            setIsSaving(false);
         }
     };
 
     const activeCount = users.filter((user) => !user.is_banned).length;
 
+    const renderAvatar = (user: ManagedUser, size: string) =>
+        user.picture ? (
+            <img
+                src={user.picture}
+                alt={user.name ?? user.email}
+                className={`${size} shrink-0 rounded-full object-cover`}
+            />
+        ) : (
+            <span
+                className={`${size} grid shrink-0 place-items-center rounded-full bg-slate-700 text-sm font-semibold text-white`}
+            >
+                {(user.name || user.email).trim().charAt(0).toUpperCase()}
+            </span>
+        );
+
     return (
         <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
-            <div className="mx-auto max-w-5xl space-y-6">
+            <div className="mx-auto max-w-7xl space-y-6">
                 <section className="glass-card rounded-xl p-6">
-                    <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
-                        Access Control
-                    </p>
-                    <h1 className="mt-2 text-2xl font-semibold">Users</h1>
-                    <p className="mt-2 text-sm text-slate-600">
-                        Manage who can sign in, their permission level, and
-                        whether their access is suspended.
-                    </p>
-                    <div className="mt-4 grid grid-cols-2 gap-3 text-sm md:max-w-md">
+                    <div className="flex items-start justify-between gap-3">
+                        <div>
+                            <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                                Access Control
+                            </p>
+                            <h1 className="mt-2 text-2xl font-semibold">
+                                Users
+                            </h1>
+                            <p className="mt-2 text-sm text-slate-600">
+                                Manage who can sign in, their permission level,
+                                and whether their access is suspended.
+                            </p>
+                        </div>
+                    </div>
+                    <div className="mt-4 grid grid-cols-2 gap-3 text-sm md:max-w-md md:grid-cols-3">
                         <div className="rounded-lg border border-white/60 bg-white/45 p-3">
                             <p className="text-slate-500">Total Users</p>
                             <p className="font-semibold">{users.length}</p>
@@ -3183,6 +3249,12 @@ function UsersPage() {
                         <div className="rounded-lg border border-white/60 bg-white/45 p-3">
                             <p className="text-slate-500">Active</p>
                             <p className="font-semibold">{activeCount}</p>
+                        </div>
+                        <div className="rounded-lg border border-white/60 bg-white/45 p-3">
+                            <p className="text-slate-500">Banned</p>
+                            <p className="font-semibold">
+                                {users.length - activeCount}
+                            </p>
                         </div>
                     </div>
                 </section>
@@ -3193,144 +3265,237 @@ function UsersPage() {
                     </div>
                 )}
 
-                <section className="glass-card rounded-xl p-4 md:p-6">
-                    {isLoading ? (
-                        <p className="px-2 py-6 text-sm text-slate-500">
-                            Loading users…
-                        </p>
-                    ) : users.length === 0 ? (
-                        <p className="px-2 py-6 text-sm text-slate-500">
-                            No users have signed in yet.
-                        </p>
-                    ) : (
-                        <ul className="space-y-3">
-                            {users.map((user) => {
-                                const isBusy = busyId === user.id;
-                                const roleLocked =
-                                    user.is_self || user.is_allowlisted;
-                                const banLocked =
-                                    user.is_self || user.is_allowlisted;
-                                return (
-                                    <li
-                                        key={user.id}
-                                        className={`flex flex-col gap-3 rounded-lg border border-white/60 bg-white/45 p-4 md:flex-row md:items-center md:justify-between ${
-                                            user.is_banned ? "opacity-70" : ""
-                                        }`}
-                                    >
-                                        <div className="flex min-w-0 items-center gap-3">
-                                            {user.picture ? (
-                                                <img
-                                                    src={user.picture}
-                                                    alt={user.name ?? user.email}
-                                                    className="h-10 w-10 shrink-0 rounded-full object-cover"
-                                                />
-                                            ) : (
-                                                <span className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-slate-700 text-sm font-semibold text-white">
-                                                    {(user.name || user.email)
-                                                        .trim()
-                                                        .charAt(0)
-                                                        .toUpperCase()}
-                                                </span>
-                                            )}
-                                            <div className="min-w-0">
-                                                <div className="flex flex-wrap items-center gap-2">
-                                                    <p className="truncate font-medium text-slate-800">
-                                                        {user.name || user.email}
-                                                    </p>
-                                                    <span
-                                                        className={`rounded-full border px-2 py-0.5 text-xs font-medium capitalize ${
-                                                            ROLE_BADGE_CLASS[
-                                                                user.effective_role
-                                                            ]
-                                                        }`}
-                                                    >
-                                                        {user.effective_role}
-                                                    </span>
-                                                    {user.is_self && (
-                                                        <span className="rounded-full border border-slate-200/80 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
-                                                            You
-                                                        </span>
-                                                    )}
-                                                    {user.is_allowlisted && (
-                                                        <span
-                                                            className="flex items-center gap-1 rounded-full border border-amber-200/80 bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700"
-                                                            title="Admin seeded via CONTROL_PLANE_ADMIN_EMAILS"
-                                                        >
-                                                            <FaUserShield />
-                                                            Seed admin
-                                                        </span>
-                                                    )}
-                                                    {user.is_banned && (
-                                                        <span className="rounded-full border border-rose-200/80 bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">
-                                                            Banned
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <p className="truncate text-sm text-slate-500">
-                                                    {user.email}
-                                                </p>
-                                            </div>
-                                        </div>
-
-                                        <div className="flex shrink-0 items-center gap-2">
-                                            <select
-                                                value={user.role}
-                                                disabled={roleLocked || isBusy}
-                                                onChange={(event) =>
-                                                    void handleRoleChange(
-                                                        user,
-                                                        event.target
-                                                            .value as UserRole,
-                                                    )
-                                                }
-                                                title={
-                                                    roleLocked
-                                                        ? "This user's role is managed by the allowlist"
-                                                        : "Change permission level"
-                                                }
-                                                className="rounded-lg border border-slate-300/80 px-3 py-1.5 text-sm font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                            >
-                                                {USER_ROLE_OPTIONS.map(
-                                                    (option) => (
-                                                        <option
-                                                            key={option.value}
-                                                            value={option.value}
-                                                        >
-                                                            {option.label}
-                                                        </option>
-                                                    ),
-                                                )}
-                                            </select>
+                <section className="grid gap-6 lg:grid-cols-[1.35fr_1fr]">
+                    <section className="glass-card rounded-xl p-5">
+                        <h2 className="text-lg font-semibold">All Users</h2>
+                        {isLoading ? (
+                            <p className="mt-3 text-sm text-slate-500">
+                                Loading...
+                            </p>
+                        ) : users.length === 0 ? (
+                            <p className="mt-3 text-sm text-slate-500">
+                                No users yet. Add one from the form on the right.
+                            </p>
+                        ) : (
+                            <ul className="mt-4 space-y-3">
+                                {users.map((user) => {
+                                    const isSelected = user.id === editingUserId;
+                                    return (
+                                        <li key={user.id}>
                                             <button
                                                 type="button"
-                                                disabled={banLocked || isBusy}
                                                 onClick={() =>
-                                                    void handleToggleBan(user)
+                                                    handleStartEdit(user)
                                                 }
-                                                className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                                                className={`flex w-full items-center gap-3 rounded-lg border p-4 text-left transition ${
+                                                    isSelected
+                                                        ? "border-slate-400 bg-white/70 ring-2 ring-slate-300"
+                                                        : "border-white/60 bg-white/40 hover:bg-white/60"
+                                                } ${
                                                     user.is_banned
-                                                        ? "border-emerald-200/80 bg-emerald-50/80 text-emerald-700 hover:bg-emerald-100"
-                                                        : "border-rose-200/80 bg-rose-50/80 text-rose-700 hover:bg-rose-100"
+                                                        ? "opacity-70"
+                                                        : ""
                                                 }`}
                                             >
-                                                {user.is_banned ? (
-                                                    <>
-                                                        <FaUndo />
-                                                        Unban
-                                                    </>
-                                                ) : (
-                                                    <>
-                                                        <FaBan />
-                                                        Ban
-                                                    </>
+                                                {renderAvatar(
+                                                    user,
+                                                    "h-10 w-10",
                                                 )}
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <p className="truncate font-medium text-slate-800">
+                                                            {user.name ||
+                                                                user.email}
+                                                        </p>
+                                                        <span
+                                                            className={`rounded-full border px-2 py-0.5 text-xs font-medium capitalize ${
+                                                                ROLE_BADGE_CLASS[
+                                                                    user
+                                                                        .effective_role
+                                                                ]
+                                                            }`}
+                                                        >
+                                                            {user.effective_role}
+                                                        </span>
+                                                        {user.is_self && (
+                                                            <span className="rounded-full border border-slate-200/80 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
+                                                                You
+                                                            </span>
+                                                        )}
+                                                        {user.is_allowlisted && (
+                                                            <span
+                                                                className="flex items-center gap-1 rounded-full border border-amber-200/80 bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700"
+                                                                title="Admin seeded via CONTROL_PLANE_ADMIN_EMAILS"
+                                                            >
+                                                                <FaUserShield />
+                                                                Seed admin
+                                                            </span>
+                                                        )}
+                                                        {user.is_banned && (
+                                                            <span className="rounded-full border border-rose-200/80 bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">
+                                                                Banned
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <p className="truncate text-sm text-slate-500">
+                                                        {user.email}
+                                                    </p>
+                                                </div>
+                                                <FaChevronRight className="shrink-0 text-slate-400" />
                                             </button>
-                                        </div>
-                                    </li>
-                                );
-                            })}
-                        </ul>
-                    )}
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        )}
+                    </section>
+
+                    <section className="space-y-4">
+                        <form
+                            onSubmit={handleSubmit}
+                            className="glass-card sticky top-4 rounded-xl p-5"
+                        >
+                            <div className="flex items-center justify-between gap-3">
+                                <h2 className="text-lg font-semibold">
+                                    {editingUser ? "Edit User" : "Add User"}
+                                </h2>
+                                {editingUser ? (
+                                    <button
+                                        type="button"
+                                        onClick={handleCancelEdit}
+                                        className="cursor-pointer rounded border border-slate-300/70 bg-white/70 px-3 py-1.5 text-xs text-slate-700 transition hover:bg-white"
+                                    >
+                                        Cancel Edit
+                                    </button>
+                                ) : null}
+                            </div>
+
+                            {editingUser ? (
+                                <div className="mt-4 flex items-center gap-3 rounded-lg border border-white/60 bg-white/45 p-3">
+                                    {renderAvatar(editingUser, "h-10 w-10")}
+                                    <div className="min-w-0">
+                                        <p className="truncate font-medium text-slate-800">
+                                            {editingUser.name ||
+                                                editingUser.email}
+                                        </p>
+                                        <p className="truncate text-sm text-slate-500">
+                                            {editingUser.email}
+                                        </p>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="mt-4">
+                                    <label className="block text-sm font-medium text-slate-700">
+                                        Email
+                                    </label>
+                                    <input
+                                        type="email"
+                                        required
+                                        value={formEmail}
+                                        onChange={(event) =>
+                                            setFormEmail(event.target.value)
+                                        }
+                                        placeholder="name@company.com"
+                                        className="mt-1 w-full rounded-lg border border-slate-300/80 px-3 py-2 text-sm text-slate-700"
+                                    />
+                                    <p className="mt-1 text-xs text-slate-500">
+                                        Name and profile photo are filled in when
+                                        they first sign in with Google.
+                                    </p>
+                                </div>
+                            )}
+
+                            <div className="mt-4">
+                                <label className="block text-sm font-medium text-slate-700">
+                                    Role
+                                </label>
+                                <select
+                                    value={formRole}
+                                    disabled={roleLocked || isSaving}
+                                    onChange={(event) =>
+                                        setFormRole(
+                                            event.target.value as UserRole,
+                                        )
+                                    }
+                                    className="mt-1 w-full rounded-lg border border-slate-300/80 px-3 py-2 text-sm font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                    {USER_ROLE_OPTIONS.map((option) => (
+                                        <option
+                                            key={option.value}
+                                            value={option.value}
+                                        >
+                                            {option.label}
+                                        </option>
+                                    ))}
+                                </select>
+                                {roleLocked && (
+                                    <p className="mt-1 text-xs text-amber-700">
+                                        {editingUser?.is_self
+                                            ? "You can't change your own role."
+                                            : "Role is managed by CONTROL_PLANE_ADMIN_EMAILS."}
+                                    </p>
+                                )}
+                            </div>
+
+                            <button
+                                type="submit"
+                                disabled={
+                                    isSaving ||
+                                    (editingUser
+                                        ? roleLocked || roleUnchanged
+                                        : !formEmail.trim())
+                                }
+                                className="mt-5 w-full rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                {isSaving
+                                    ? "Saving…"
+                                    : editingUser
+                                      ? "Save changes"
+                                      : "Add user"}
+                            </button>
+
+                            {editingUser && (
+                                <div className="mt-4 border-t border-white/50 pt-4">
+                                    <button
+                                        type="button"
+                                        disabled={
+                                            editingUser.is_self ||
+                                            editingUser.is_allowlisted ||
+                                            isSaving
+                                        }
+                                        onClick={() =>
+                                            void handleToggleBan(editingUser)
+                                        }
+                                        className={`flex w-full items-center justify-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                                            editingUser.is_banned
+                                                ? "border-emerald-200/80 bg-emerald-50/80 text-emerald-700 hover:bg-emerald-100"
+                                                : "border-rose-200/80 bg-rose-50/80 text-rose-700 hover:bg-rose-100"
+                                        }`}
+                                    >
+                                        {editingUser.is_banned ? (
+                                            <>
+                                                <FaUndo />
+                                                Unban user
+                                            </>
+                                        ) : (
+                                            <>
+                                                <FaBan />
+                                                Ban user
+                                            </>
+                                        )}
+                                    </button>
+                                    {(editingUser.is_self ||
+                                        editingUser.is_allowlisted) && (
+                                        <p className="mt-1 text-center text-xs text-slate-500">
+                                            {editingUser.is_self
+                                                ? "You can't ban yourself."
+                                                : "Seeded admins can't be banned."}
+                                        </p>
+                                    )}
+                                </div>
+                            )}
+                        </form>
+                    </section>
                 </section>
             </div>
         </main>
@@ -4265,7 +4430,27 @@ function App() {
         );
     }
 
-    if (isLoginPage || (isMonitorsPage && !isAuthenticated)) {
+    if (isLoginPage) {
+        return (
+            <LoginPage
+                apiBase={apiBase}
+                isChecking={!authChecked}
+                error={authError}
+            />
+        );
+    }
+
+    // While the session check is in flight on a protected page, show a neutral
+    // loading state instead of flashing the sign-in page on every navigation.
+    if (isMonitorsPage && !authChecked) {
+        return (
+            <main className="grid min-h-screen place-items-center px-4 text-slate-900">
+                <p className="text-sm text-slate-500">Loading…</p>
+            </main>
+        );
+    }
+
+    if (isMonitorsPage && !isAuthenticated) {
         return (
             <LoginPage
                 apiBase={apiBase}

@@ -86,12 +86,33 @@ export const listUsers = async (): Promise<UserRow[]> => {
   return rows;
 };
 
-const getUserByEmail = async (email: string): Promise<UserRow | null> => {
+export const getUserByEmail = async (
+  email: string,
+): Promise<UserRow | null> => {
   const [rows] = await pool.query<UserRow[]>(
     "SELECT * FROM users WHERE email = ? LIMIT 1",
-    [email],
+    [normalizeEmail(email)],
   );
   return rows[0] ?? null;
+};
+
+/**
+ * Creates a user by email with a role before they have signed in. The Google
+ * profile (google_sub, name, picture) is filled in when they first log in via
+ * upsertUserOnLogin, which matches the row by email.
+ */
+export const createUser = async (
+  email: string,
+  role: UserRole,
+): Promise<UserRow> => {
+  const normalized = normalizeEmail(email);
+  await pool.query<ResultSetHeader>(
+    "INSERT INTO users (email, role) VALUES (?, ?)",
+    [normalized, role],
+  );
+  const record = await getUserByEmail(normalized);
+  if (!record) throw new Error("Failed to create user");
+  return record;
 };
 
 /**
@@ -177,6 +198,46 @@ export const seedAdminUsers = async (): Promise<void> => {
 
   console.log(
     `[users] Ensured ${emails.length} admin account(s) from CONTROL_PLANE_ADMIN_EMAILS`,
+  );
+};
+
+/**
+ * Backfills the DB row for an already-signed-in user from their session profile.
+ * Self-heals rows that were seeded (email + role only) or created before the
+ * claim-on-login logic existed, so their google_sub / name / picture populate
+ * without requiring the user to sign out and back in.
+ */
+export const syncUserOnSession = async (sessionUser: {
+  sub: string;
+  email?: string;
+  name?: string;
+  picture?: string;
+}): Promise<void> => {
+  const email = normalizeEmail(sessionUser.email);
+  const bySub = await getUserBySub(sessionUser.sub);
+  const target = bySub ?? (email ? await getUserByEmail(email) : null);
+  if (!target) return;
+
+  const needsUpdate =
+    target.google_sub !== sessionUser.sub ||
+    (Boolean(sessionUser.name) && target.name !== sessionUser.name) ||
+    (Boolean(sessionUser.picture) && target.picture !== sessionUser.picture);
+  if (!needsUpdate) return;
+
+  await pool.query<ResultSetHeader>(
+    `
+      UPDATE users
+         SET google_sub = ?,
+             name = COALESCE(?, name),
+             picture = COALESCE(?, picture)
+       WHERE id = ?
+    `,
+    [
+      sessionUser.sub,
+      sessionUser.name ?? null,
+      sessionUser.picture ?? null,
+      target.id,
+    ],
   );
 };
 

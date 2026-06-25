@@ -37,12 +37,15 @@ import {
   type UserRole,
   canEditWithRole,
   canManageUsersWithRole,
+  createUser,
   effectiveRole,
   isSeedAdmin,
+  getUserByEmail,
   getUserById,
   getUserBySub,
   listUsers,
   seedAdminUsers,
+  syncUserOnSession,
   setUserBanned,
   setUserRole,
   upsertUserOnLogin,
@@ -862,6 +865,8 @@ app.get("/api/auth/me", async (req: Request, res: Response) => {
     return res.status(200).json(anonymous);
   }
 
+  await syncUserOnSession(req.session.user);
+
   const resolved = await resolveSession(req);
   if (!resolved || resolved.banned) {
     return req.session.destroy(() => res.status(200).json(anonymous));
@@ -1028,6 +1033,32 @@ app.get("/api/users", requireAdmin, async (req: Request, res: Response) => {
   const currentSub = String(req.session?.user?.sub ?? "");
   const rows = await listUsers();
   res.json(rows.map((row) => serializeUser(row, currentSub)));
+});
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post("/api/users", requireAdmin, async (req: Request, res: Response) => {
+  const email = String(req.body.email ?? "").trim().toLowerCase();
+  const role = String(req.body.role ?? "viewer").trim().toLowerCase() as UserRole;
+
+  if (!EMAIL_PATTERN.test(email)) {
+    return res.status(400).json({ error: "A valid email is required" });
+  }
+  if (!USER_ROLES.includes(role)) {
+    return res.status(400).json({ error: "Invalid role" });
+  }
+
+  const existing = await getUserByEmail(email);
+  if (existing) {
+    return res
+      .status(409)
+      .json({ error: "A user with that email already exists" });
+  }
+
+  const created = await createUser(email, role);
+  return res
+    .status(201)
+    .json(serializeUser(created, String(req.session?.user?.sub ?? "")));
 });
 
 app.patch(

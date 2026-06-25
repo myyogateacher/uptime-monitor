@@ -289,6 +289,12 @@ export const monitoringService = {
   getUsers(): Promise<ManagedUser[]> {
     return request<ManagedUser[]>('/api/users')
   },
+  createUser(email: string, role: UserRole): Promise<ManagedUser> {
+    return request<ManagedUser>('/api/users', {
+      method: 'POST',
+      body: JSON.stringify({ email, role }),
+    })
+  },
   setUserRole(userId: number, role: UserRole): Promise<ManagedUser> {
     return request<ManagedUser>(`/api/users/${userId}/role`, {
       method: 'PATCH',
