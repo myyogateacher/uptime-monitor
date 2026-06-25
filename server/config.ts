@@ -207,6 +207,6 @@ export const config = {
     controlPlanePath: process.env.CONTROL_PLANE_PATH ?? '/monitors',
     loginPath: process.env.LOGIN_PATH ?? '/login',
     trustProxy: toBoolean(process.env.TRUST_PROXY, nodeEnv === 'production'),
-    editorEmails: parseEmailAllowlist(process.env.CONTROL_PLANE_EDITOR_EMAILS),
+    adminEmails: parseEmailAllowlist(process.env.CONTROL_PLANE_ADMIN_EMAILS),
   },
 }

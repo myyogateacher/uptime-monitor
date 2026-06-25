@@ -62,17 +62,20 @@ Use `.env` (see `.env.example`):
 - `CONTROL_PLANE_PATH`
 - `LOGIN_PATH`
 - `TRUST_PROXY`
-- `CONTROL_PLANE_EDITOR_EMAILS`
+- `CONTROL_PLANE_ADMIN_EMAILS`
 - `NOTIFICATIONS_ENABLED`
 - `SLACK_BOT_TOKEN`
 - `SLACK_CHANNEL_ID`
 - `NOTIFICATION_TARGETS_JSON`
 
-Editor access control:
+Access control:
 
-- Set `CONTROL_PLANE_EDITOR_EMAILS` as a comma-separated list of Google account emails that can mutate monitors/groups.
-- Example: `CONTROL_PLANE_EDITOR_EMAILS=ops@company.com,sre@company.com`
-- If empty, any authenticated user can edit (default behavior).
+- Roles are stored per user in the database (`admin`, `editor`, `viewer`) and managed from the in-app **Users** console (admin only). Admins can change roles and ban/unban users.
+- `editor`/`admin` can mutate monitors, groups, and crons; `viewer` is read-only. `admin` additionally manages users.
+- Set `CONTROL_PLANE_ADMIN_EMAILS` as a comma-separated list of Google account emails to seed the initial admins.
+- Example: `CONTROL_PLANE_ADMIN_EMAILS=ops@company.com,sre@company.com`
+- These emails are inserted as admins on startup (and re-asserted to admin + un-banned on every boot, so a configured admin can always recover access). A row is created without a Google ID and claimed by email at first login.
+- If empty and no admin exists yet, the Users console is unreachable — set at least one admin email before locking down access.
 
 Session storage:
 

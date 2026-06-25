@@ -12,17 +12,36 @@ export type StatsMode = 'aggregate' | 'raw'
 export type CronTriggerType = 'nats' | 'http'
 export type CronHttpMethod = 'GET' | 'POST' | 'NONE'
 
+export type UserRole = 'admin' | 'editor' | 'viewer'
+
 export interface SessionUser {
   sub: string
   email?: string
   name?: string
   picture?: string
+  role?: UserRole
 }
 
 export interface SessionState {
   authenticated: boolean
   user: SessionUser | null
   canEdit: boolean
+  canManageUsers: boolean
+  role: UserRole | null
+}
+
+export interface ManagedUser {
+  id: number
+  email: string
+  name: string | null
+  picture: string | null
+  role: UserRole
+  effective_role: UserRole
+  is_banned: boolean
+  is_allowlisted: boolean
+  is_self: boolean
+  last_login_at: string | null
+  created_at: string | null
 }
 
 export interface HealthState {
@@ -265,6 +284,21 @@ export const monitoringService = {
   logout(): Promise<null> {
     return request<null>('/api/auth/logout', {
       method: 'POST',
+    })
+  },
+  getUsers(): Promise<ManagedUser[]> {
+    return request<ManagedUser[]>('/api/users')
+  },
+  setUserRole(userId: number, role: UserRole): Promise<ManagedUser> {
+    return request<ManagedUser>(`/api/users/${userId}/role`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    })
+  },
+  setUserBanned(userId: number, banned: boolean): Promise<ManagedUser> {
+    return request<ManagedUser>(`/api/users/${userId}/ban`, {
+      method: 'PATCH',
+      body: JSON.stringify({ banned }),
     })
   },
   getHealth(): Promise<HealthState> {

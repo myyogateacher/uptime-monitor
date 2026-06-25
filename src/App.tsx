@@ -6,10 +6,22 @@ import {
     useState,
     type Dispatch,
     type MouseEvent as ReactMouseEvent,
+    type ReactNode,
     type SetStateAction,
     type SubmitEvent,
 } from "react";
-import { FaChevronDown, FaChevronRight } from "react-icons/fa";
+import {
+    FaAngleDoubleLeft,
+    FaAngleDoubleRight,
+    FaBan,
+    FaChevronDown,
+    FaChevronRight,
+    FaServer,
+    FaSignOutAlt,
+    FaUndo,
+    FaUsers,
+    FaUserShield,
+} from "react-icons/fa";
 import {
     monitoringService,
     type CronJob,
@@ -18,11 +30,14 @@ import {
     type EndpointCheckResult,
     type EndpointCheckRun,
     type EndpointStatsBucket,
+    type ManagedUser,
     type MonitorEndpoint,
     type MonitorGroup,
     type MonitorStatus,
+    type SessionUser,
     type StatsGranularity,
     type StatsMode,
+    type UserRole,
 } from "./services/monitoringService";
 
 // Like Partial, but realtime websocket merges also write explicit nulls.
@@ -2885,12 +2900,450 @@ function AdminPage({
     );
 }
 
+type AppSection = "monitors" | "users";
+
+type NavItem = {
+    section: AppSection;
+    label: string;
+    href: string;
+    icon: typeof FaServer;
+};
+
+function AppSidebar({
+    active,
+    collapsed,
+    onToggleCollapse,
+    canManageUsers,
+    user,
+    onLogout,
+}: {
+    active: AppSection;
+    collapsed: boolean;
+    onToggleCollapse: () => void;
+    canManageUsers: boolean;
+    user: SessionUser | null;
+    onLogout: () => void;
+}) {
+    const navItems: NavItem[] = [
+        { section: "monitors", label: "Monitors", href: "/monitors", icon: FaServer },
+        ...(canManageUsers
+            ? [
+                  {
+                      section: "users" as const,
+                      label: "Users",
+                      href: "/users",
+                      icon: FaUsers,
+                  },
+              ]
+            : []),
+    ];
+
+    const displayName = user?.name || user?.email || "Signed in";
+    const initial = (user?.name || user?.email || "?").trim().charAt(0).toUpperCase();
+
+    return (
+        <aside
+            className={`glass-card sticky top-0 z-20 flex h-screen shrink-0 flex-col rounded-none border-y-0 border-l-0 px-3 py-4 transition-[width] duration-200 ${
+                collapsed ? "w-16" : "w-60"
+            }`}
+        >
+            <div
+                className={`flex items-center ${
+                    collapsed ? "justify-center" : "justify-between"
+                } px-1`}
+            >
+                {!collapsed && (
+                    <span className="text-sm font-semibold tracking-tight text-slate-800">
+                        Uptime
+                    </span>
+                )}
+                <button
+                    type="button"
+                    onClick={onToggleCollapse}
+                    aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    title={collapsed ? "Expand" : "Collapse"}
+                    className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg border border-white/60 bg-white/55 text-slate-600 transition hover:bg-white/80"
+                >
+                    {collapsed ? <FaAngleDoubleRight /> : <FaAngleDoubleLeft />}
+                </button>
+            </div>
+
+            <nav className="mt-6 flex flex-1 flex-col gap-1">
+                {navItems.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = item.section === active;
+                    return (
+                        <a
+                            key={item.section}
+                            href={item.href}
+                            title={collapsed ? item.label : undefined}
+                            className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition ${
+                                collapsed ? "justify-center" : ""
+                            } ${
+                                isActive
+                                    ? "bg-slate-900 text-white shadow"
+                                    : "text-slate-600 hover:bg-white/70"
+                            }`}
+                        >
+                            <Icon className="shrink-0 text-base" />
+                            {!collapsed && <span>{item.label}</span>}
+                        </a>
+                    );
+                })}
+            </nav>
+
+            <div className="mt-2 border-t border-white/50 pt-3">
+                <div
+                    className={`flex items-center gap-3 ${
+                        collapsed ? "justify-center" : ""
+                    }`}
+                >
+                    {user?.picture ? (
+                        <img
+                            src={user.picture}
+                            alt={displayName}
+                            className="h-8 w-8 shrink-0 rounded-full object-cover"
+                        />
+                    ) : (
+                        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-slate-700 text-xs font-semibold text-white">
+                            {initial}
+                        </span>
+                    )}
+                    {!collapsed && (
+                        <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-medium text-slate-800">
+                                {displayName}
+                            </p>
+                            {user?.role && (
+                                <p className="text-xs capitalize text-slate-500">
+                                    {user.role}
+                                </p>
+                            )}
+                        </div>
+                    )}
+                </div>
+                <button
+                    type="button"
+                    onClick={onLogout}
+                    title={collapsed ? "Sign out" : undefined}
+                    className={`mt-3 flex w-full items-center gap-2 rounded-lg border border-white/60 bg-white/55 px-3 py-2 text-sm font-medium text-slate-600 transition hover:bg-white/80 ${
+                        collapsed ? "justify-center" : ""
+                    }`}
+                >
+                    <FaSignOutAlt className="shrink-0" />
+                    {!collapsed && <span>Sign out</span>}
+                </button>
+            </div>
+        </aside>
+    );
+}
+
+function AppShell({
+    active,
+    canManageUsers,
+    user,
+    children,
+}: {
+    active: AppSection;
+    canManageUsers: boolean;
+    user: SessionUser | null;
+    children: ReactNode;
+}) {
+    const [collapsed, setCollapsed] = useState<boolean>(() => {
+        if (typeof window === "undefined") return false;
+        return window.localStorage.getItem("sidebar_collapsed") === "1";
+    });
+
+    const toggleCollapse = useCallback(() => {
+        setCollapsed((prev) => {
+            const next = !prev;
+            try {
+                window.localStorage.setItem(
+                    "sidebar_collapsed",
+                    next ? "1" : "0",
+                );
+            } catch {
+                // localStorage may be unavailable; collapse still works in-memory.
+            }
+            return next;
+        });
+    }, []);
+
+    const handleLogout = useCallback(async () => {
+        try {
+            await monitoringService.logout();
+        } catch {
+            // Ignore logout errors and redirect regardless.
+        } finally {
+            window.location.assign("/login");
+        }
+    }, []);
+
+    return (
+        <div className="flex min-h-screen">
+            <AppSidebar
+                active={active}
+                collapsed={collapsed}
+                onToggleCollapse={toggleCollapse}
+                canManageUsers={canManageUsers}
+                user={user}
+                onLogout={handleLogout}
+            />
+            <div className="min-w-0 flex-1">{children}</div>
+        </div>
+    );
+}
+
+const USER_ROLE_OPTIONS: Array<{ value: UserRole; label: string }> = [
+    { value: "admin", label: "Admin" },
+    { value: "editor", label: "Editor" },
+    { value: "viewer", label: "Viewer" },
+];
+
+const ROLE_BADGE_CLASS: Record<UserRole, string> = {
+    admin: "bg-indigo-100 text-indigo-700 border-indigo-200/80",
+    editor: "bg-cyan-100 text-cyan-700 border-cyan-200/80",
+    viewer: "bg-slate-100 text-slate-600 border-slate-200/80",
+};
+
+function UsersPage() {
+    const [users, setUsers] = useState<ManagedUser[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState("");
+    const [busyId, setBusyId] = useState<number | null>(null);
+
+    const loadUsers = useCallback(async () => {
+        setError("");
+        try {
+            setUsers(await monitoringService.getUsers());
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        void loadUsers();
+    }, [loadUsers]);
+
+    const replaceUser = (updated: ManagedUser) =>
+        setUsers((prev) =>
+            prev.map((existing) =>
+                existing.id === updated.id ? updated : existing,
+            ),
+        );
+
+    const handleRoleChange = async (user: ManagedUser, role: UserRole) => {
+        if (role === user.role) return;
+        setBusyId(user.id);
+        setError("");
+        try {
+            replaceUser(await monitoringService.setUserRole(user.id, role));
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setBusyId(null);
+        }
+    };
+
+    const handleToggleBan = async (user: ManagedUser) => {
+        setBusyId(user.id);
+        setError("");
+        try {
+            replaceUser(
+                await monitoringService.setUserBanned(user.id, !user.is_banned),
+            );
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setBusyId(null);
+        }
+    };
+
+    const activeCount = users.filter((user) => !user.is_banned).length;
+
+    return (
+        <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
+            <div className="mx-auto max-w-5xl space-y-6">
+                <section className="glass-card rounded-xl p-6">
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                        Access Control
+                    </p>
+                    <h1 className="mt-2 text-2xl font-semibold">Users</h1>
+                    <p className="mt-2 text-sm text-slate-600">
+                        Manage who can sign in, their permission level, and
+                        whether their access is suspended.
+                    </p>
+                    <div className="mt-4 grid grid-cols-2 gap-3 text-sm md:max-w-md">
+                        <div className="rounded-lg border border-white/60 bg-white/45 p-3">
+                            <p className="text-slate-500">Total Users</p>
+                            <p className="font-semibold">{users.length}</p>
+                        </div>
+                        <div className="rounded-lg border border-white/60 bg-white/45 p-3">
+                            <p className="text-slate-500">Active</p>
+                            <p className="font-semibold">{activeCount}</p>
+                        </div>
+                    </div>
+                </section>
+
+                {error && (
+                    <div className="rounded-lg border border-rose-200/80 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
+                        {error}
+                    </div>
+                )}
+
+                <section className="glass-card rounded-xl p-4 md:p-6">
+                    {isLoading ? (
+                        <p className="px-2 py-6 text-sm text-slate-500">
+                            Loading users…
+                        </p>
+                    ) : users.length === 0 ? (
+                        <p className="px-2 py-6 text-sm text-slate-500">
+                            No users have signed in yet.
+                        </p>
+                    ) : (
+                        <ul className="space-y-3">
+                            {users.map((user) => {
+                                const isBusy = busyId === user.id;
+                                const roleLocked =
+                                    user.is_self || user.is_allowlisted;
+                                const banLocked =
+                                    user.is_self || user.is_allowlisted;
+                                return (
+                                    <li
+                                        key={user.id}
+                                        className={`flex flex-col gap-3 rounded-lg border border-white/60 bg-white/45 p-4 md:flex-row md:items-center md:justify-between ${
+                                            user.is_banned ? "opacity-70" : ""
+                                        }`}
+                                    >
+                                        <div className="flex min-w-0 items-center gap-3">
+                                            {user.picture ? (
+                                                <img
+                                                    src={user.picture}
+                                                    alt={user.name ?? user.email}
+                                                    className="h-10 w-10 shrink-0 rounded-full object-cover"
+                                                />
+                                            ) : (
+                                                <span className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-slate-700 text-sm font-semibold text-white">
+                                                    {(user.name || user.email)
+                                                        .trim()
+                                                        .charAt(0)
+                                                        .toUpperCase()}
+                                                </span>
+                                            )}
+                                            <div className="min-w-0">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <p className="truncate font-medium text-slate-800">
+                                                        {user.name || user.email}
+                                                    </p>
+                                                    <span
+                                                        className={`rounded-full border px-2 py-0.5 text-xs font-medium capitalize ${
+                                                            ROLE_BADGE_CLASS[
+                                                                user.effective_role
+                                                            ]
+                                                        }`}
+                                                    >
+                                                        {user.effective_role}
+                                                    </span>
+                                                    {user.is_self && (
+                                                        <span className="rounded-full border border-slate-200/80 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
+                                                            You
+                                                        </span>
+                                                    )}
+                                                    {user.is_allowlisted && (
+                                                        <span
+                                                            className="flex items-center gap-1 rounded-full border border-amber-200/80 bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700"
+                                                            title="Admin seeded via CONTROL_PLANE_ADMIN_EMAILS"
+                                                        >
+                                                            <FaUserShield />
+                                                            Seed admin
+                                                        </span>
+                                                    )}
+                                                    {user.is_banned && (
+                                                        <span className="rounded-full border border-rose-200/80 bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">
+                                                            Banned
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <p className="truncate text-sm text-slate-500">
+                                                    {user.email}
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex shrink-0 items-center gap-2">
+                                            <select
+                                                value={user.role}
+                                                disabled={roleLocked || isBusy}
+                                                onChange={(event) =>
+                                                    void handleRoleChange(
+                                                        user,
+                                                        event.target
+                                                            .value as UserRole,
+                                                    )
+                                                }
+                                                title={
+                                                    roleLocked
+                                                        ? "This user's role is managed by the allowlist"
+                                                        : "Change permission level"
+                                                }
+                                                className="rounded-lg border border-slate-300/80 px-3 py-1.5 text-sm font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                            >
+                                                {USER_ROLE_OPTIONS.map(
+                                                    (option) => (
+                                                        <option
+                                                            key={option.value}
+                                                            value={option.value}
+                                                        >
+                                                            {option.label}
+                                                        </option>
+                                                    ),
+                                                )}
+                                            </select>
+                                            <button
+                                                type="button"
+                                                disabled={banLocked || isBusy}
+                                                onClick={() =>
+                                                    void handleToggleBan(user)
+                                                }
+                                                className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                                                    user.is_banned
+                                                        ? "border-emerald-200/80 bg-emerald-50/80 text-emerald-700 hover:bg-emerald-100"
+                                                        : "border-rose-200/80 bg-rose-50/80 text-rose-700 hover:bg-rose-100"
+                                                }`}
+                                            >
+                                                {user.is_banned ? (
+                                                    <>
+                                                        <FaUndo />
+                                                        Unban
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <FaBan />
+                                                        Ban
+                                                    </>
+                                                )}
+                                            </button>
+                                        </div>
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    )}
+                </section>
+            </div>
+        </main>
+    );
+}
+
 function App() {
     const pathname =
         typeof window !== "undefined" ? window.location.pathname : "/";
     const isHomePage = pathname === "/";
     const isStatusPage = pathname.startsWith("/status");
     const isLoginPage = pathname.startsWith("/login");
+    const isUsersPage = pathname.startsWith("/users");
     const isMonitorsPage =
         pathname.startsWith("/monitors") ||
         (!isHomePage && !isStatusPage && !isLoginPage);
@@ -2933,6 +3386,8 @@ function App() {
     const [authChecked, setAuthChecked] = useState(false);
     const [isAuthenticated, setIsAuthenticated] = useState(false);
     const [canEdit, setCanEdit] = useState(false);
+    const [canManageUsers, setCanManageUsers] = useState(false);
+    const [user, setUser] = useState<SessionUser | null>(null);
     const [authError, setAuthError] = useState("");
     const apiBase = import.meta.env.VITE_API_BASE_URL || "";
 
@@ -2961,9 +3416,13 @@ function App() {
                 const authenticated = Boolean(sessionState?.authenticated);
                 setIsAuthenticated(authenticated);
                 setCanEdit(Boolean(sessionState?.canEdit));
+                setCanManageUsers(Boolean(sessionState?.canManageUsers));
+                setUser(sessionState?.user ?? null);
             } catch (requestError) {
                 setIsAuthenticated(false);
                 setCanEdit(false);
+                setCanManageUsers(false);
+                setUser(null);
                 setAuthError(getErrorMessage(requestError));
             } finally {
                 setAuthChecked(true);
@@ -3817,39 +4276,64 @@ function App() {
     }
 
     return (
-        <AdminPage
-            health={health}
-            groups={groups}
-            groupedEndpoints={groupedEndpoints}
-            endpointForm={endpointForm}
-            editingEndpointId={editingEndpointId}
-            canEdit={canEdit}
-            isLoading={isLoading}
-            isSavingEndpoint={isSavingEndpoint}
-            setEndpointForm={setEndpointForm}
-            handleCancelEdit={handleCancelEdit}
-            handleDeleteHistory={handleDeleteHistory}
-            handleEndpointSubmit={handleEndpointSubmit}
-            handleDeleteEndpoint={handleDeleteEndpoint}
-            handleCheckNow={handleCheckNow}
-            handleTogglePause={handleTogglePause}
-            handleToggleGroupPause={handleToggleGroupPause}
-            handleStartEdit={handleStartEdit}
-            crons={crons}
-            cronForm={cronForm}
-            setCronForm={setCronForm}
-            editingCronName={editingCronName}
-            isSavingCron={isSavingCron}
-            handleCronSubmit={handleCronSubmit}
-            handleCancelCronEdit={handleCancelCronEdit}
-            handleStartEditCron={handleStartEditCron}
-            handleDeleteCron={handleDeleteCron}
-            cronMonitorEnabled={cronMonitorEnabled}
-            cronMonitorMeta={cronMonitorMeta}
-            handleToggleCronMonitor={handleToggleCronMonitor}
-            currentTimeMs={currentTimeMs}
-            error={error}
-        />
+        <AppShell
+            active={isUsersPage ? "users" : "monitors"}
+            canManageUsers={canManageUsers}
+            user={user}
+        >
+            {isUsersPage ? (
+                canManageUsers ? (
+                    <UsersPage />
+                ) : (
+                    <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
+                        <div className="mx-auto max-w-5xl">
+                            <section className="glass-card rounded-xl p-6">
+                                <h1 className="text-2xl font-semibold">
+                                    Users
+                                </h1>
+                                <p className="mt-2 text-sm text-slate-600">
+                                    You do not have permission to manage users.
+                                </p>
+                            </section>
+                        </div>
+                    </main>
+                )
+            ) : (
+                <AdminPage
+                    health={health}
+                    groups={groups}
+                    groupedEndpoints={groupedEndpoints}
+                    endpointForm={endpointForm}
+                    editingEndpointId={editingEndpointId}
+                    canEdit={canEdit}
+                    isLoading={isLoading}
+                    isSavingEndpoint={isSavingEndpoint}
+                    setEndpointForm={setEndpointForm}
+                    handleCancelEdit={handleCancelEdit}
+                    handleDeleteHistory={handleDeleteHistory}
+                    handleEndpointSubmit={handleEndpointSubmit}
+                    handleDeleteEndpoint={handleDeleteEndpoint}
+                    handleCheckNow={handleCheckNow}
+                    handleTogglePause={handleTogglePause}
+                    handleToggleGroupPause={handleToggleGroupPause}
+                    handleStartEdit={handleStartEdit}
+                    crons={crons}
+                    cronForm={cronForm}
+                    setCronForm={setCronForm}
+                    editingCronName={editingCronName}
+                    isSavingCron={isSavingCron}
+                    handleCronSubmit={handleCronSubmit}
+                    handleCancelCronEdit={handleCancelCronEdit}
+                    handleStartEditCron={handleStartEditCron}
+                    handleDeleteCron={handleDeleteCron}
+                    cronMonitorEnabled={cronMonitorEnabled}
+                    cronMonitorMeta={cronMonitorMeta}
+                    handleToggleCronMonitor={handleToggleCronMonitor}
+                    currentTimeMs={currentTimeMs}
+                    error={error}
+                />
+            )}
+        </AppShell>
     );
 }
 

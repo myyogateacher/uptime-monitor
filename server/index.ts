@@ -33,6 +33,21 @@ import {
 } from "./events";
 import { startMonitor, stopMonitor, triggerCheckNow } from "./monitorService";
 import {
+  USER_ROLES,
+  type UserRole,
+  canEditWithRole,
+  canManageUsersWithRole,
+  effectiveRole,
+  isSeedAdmin,
+  getUserById,
+  getUserBySub,
+  listUsers,
+  seedAdminUsers,
+  setUserBanned,
+  setUserRole,
+  upsertUserOnLogin,
+} from "./usersService";
+import {
   type CronRow,
   type CronRunRow,
   getCronMonitorSettings,
@@ -758,31 +773,64 @@ const getMappedEndpointsByGroupId = async (
   return rows.map(mapEndpointRow);
 };
 
-const isAuthenticated = (req: Request): boolean => Boolean(req.session?.user);
 const getSessionEmail = (req: Request): string =>
   String(req.session?.user?.email ?? "")
     .trim()
     .toLowerCase();
-const canEditControlPlane = (req: Request): boolean => {
-  if (!isAuthenticated(req)) return false;
-  const allowlist = config.auth.editorEmails;
-  if (!allowlist.length) return true;
-  const email = getSessionEmail(req);
-  return allowlist.includes(email);
+type ResolvedSession = {
+  role: UserRole;
+  banned: boolean;
 };
 
-const requireEditor = (
+/**
+ * Loads the signed-in user's effective role from the database. Banned status is
+ * surfaced so callers can terminate the session immediately. Sessions created
+ * before the user existed in the DB resolve via the allowlist fallback.
+ */
+const resolveSession = async (req: Request): Promise<ResolvedSession | null> => {
+  const sub = req.session?.user?.sub;
+  if (!sub) return null;
+  const record = await getUserBySub(sub);
+  return {
+    role: effectiveRole(record, getSessionEmail(req)),
+    banned: Boolean(record?.is_banned),
+  };
+};
+
+const requireEditor = async (
   req: Request,
   res: Response,
   next: NextFunction,
-): Response | void => {
-  if (!isAuthenticated(req)) {
+): Promise<Response | void> => {
+  const resolved = await resolveSession(req);
+  if (!resolved) {
     return res.status(401).json({ error: "Authentication required" });
   }
-  if (canEditControlPlane(req)) return next();
+  if (resolved.banned) {
+    return res.status(403).json({ error: "Your account has been banned" });
+  }
+  if (canEditWithRole(resolved.role)) return next();
   return res
     .status(403)
     .json({ error: "You do not have permission to edit monitors" });
+};
+
+const requireAdmin = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<Response | void> => {
+  const resolved = await resolveSession(req);
+  if (!resolved) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+  if (resolved.banned) {
+    return res.status(403).json({ error: "Your account has been banned" });
+  }
+  if (canManageUsersWithRole(resolved.role)) return next();
+  return res
+    .status(403)
+    .json({ error: "You do not have permission to manage users" });
 };
 
 const requireGoogleConfig = (res: Response): boolean => {
@@ -801,17 +849,30 @@ const buildLoginUrl = (returnTo?: string): string => {
   return `${config.auth.loginPath}${suffix ? `?${suffix}` : ""}`;
 };
 
-app.get("/api/auth/me", (req: Request, res: Response) => {
+app.get("/api/auth/me", async (req: Request, res: Response) => {
+  const anonymous = {
+    authenticated: false,
+    user: null,
+    canEdit: false,
+    canManageUsers: false,
+    role: null,
+  };
+
   if (!req.session?.user) {
-    return res
-      .status(200)
-      .json({ authenticated: false, user: null, canEdit: false });
+    return res.status(200).json(anonymous);
+  }
+
+  const resolved = await resolveSession(req);
+  if (!resolved || resolved.banned) {
+    return req.session.destroy(() => res.status(200).json(anonymous));
   }
 
   return res.status(200).json({
     authenticated: true,
-    user: req.session.user,
-    canEdit: canEditControlPlane(req),
+    user: { ...req.session.user, role: resolved.role },
+    canEdit: canEditWithRole(resolved.role),
+    canManageUsers: canManageUsersWithRole(resolved.role),
+    role: resolved.role,
   });
 });
 
@@ -912,11 +973,23 @@ app.get("/api/auth/google/callback", async (req: Request, res: Response) => {
       return res.redirect(buildLoginUrl(returnTo));
     }
 
+    const record = await upsertUserOnLogin({
+      sub: profile.sub,
+      email: profile.email,
+      name: profile.name,
+      picture: profile.picture,
+    });
+
+    if (record.is_banned) {
+      return res.redirect(buildLoginUrl(returnTo));
+    }
+
     req.session.user = {
       sub: profile.sub,
       email: profile.email,
       name: profile.name,
       picture: profile.picture,
+      role: effectiveRole(record, profile.email),
     };
 
     req.session.save(() => {
@@ -933,6 +1006,88 @@ app.post("/api/auth/logout", (req: Request, res: Response) => {
     res.status(204).send();
   });
 });
+
+const serializeUser = (
+  row: Awaited<ReturnType<typeof listUsers>>[number],
+  currentSub: string,
+) => ({
+  id: row.id,
+  email: row.email,
+  name: row.name,
+  picture: row.picture,
+  role: row.role,
+  effective_role: effectiveRole(row, row.email),
+  is_banned: Boolean(row.is_banned),
+  is_allowlisted: isSeedAdmin(row.email),
+  is_self: row.google_sub === currentSub,
+  last_login_at: row.last_login_at,
+  created_at: row.created_at,
+});
+
+app.get("/api/users", requireAdmin, async (req: Request, res: Response) => {
+  const currentSub = String(req.session?.user?.sub ?? "");
+  const rows = await listUsers();
+  res.json(rows.map((row) => serializeUser(row, currentSub)));
+});
+
+app.patch(
+  "/api/users/:id/role",
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const id = toInteger(req.params.id, NaN);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    const role = String(req.body.role ?? "").trim().toLowerCase() as UserRole;
+    if (!USER_ROLES.includes(role)) {
+      return res.status(400).json({ error: "Invalid role" });
+    }
+
+    const target = await getUserById(id);
+    if (!target) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (target.google_sub === req.session?.user?.sub) {
+      return res
+        .status(400)
+        .json({ error: "You cannot change your own role" });
+    }
+
+    await setUserRole(id, role);
+    const updated = await getUserById(id);
+    return res.json(
+      serializeUser(updated!, String(req.session?.user?.sub ?? "")),
+    );
+  },
+);
+
+app.patch(
+  "/api/users/:id/ban",
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const id = toInteger(req.params.id, NaN);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    const banned = Boolean(req.body.banned);
+
+    const target = await getUserById(id);
+    if (!target) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (target.google_sub === req.session?.user?.sub) {
+      return res.status(400).json({ error: "You cannot ban yourself" });
+    }
+
+    await setUserBanned(id, banned);
+    const updated = await getUserById(id);
+    return res.json(
+      serializeUser(updated!, String(req.session?.user?.sub ?? "")),
+    );
+  },
+);
 
 app.get("/api/health", async (_req: Request, res: Response) => {
   const [rows] = await pool.query<
@@ -1882,6 +2037,7 @@ if (existsSync(distPath)) {
 
 async function start(): Promise<void> {
   await initDatabase();
+  await seedAdminUsers();
   startMonitor();
   startCronMonitor();
 

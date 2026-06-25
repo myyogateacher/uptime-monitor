@@ -266,6 +266,26 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 12,
+    name: "create_users",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          google_sub VARCHAR(255) NULL UNIQUE,
+          email VARCHAR(255) NOT NULL UNIQUE,
+          name VARCHAR(255) NULL,
+          picture VARCHAR(1024) NULL,
+          role ENUM('admin','editor','viewer') NOT NULL DEFAULT 'viewer',
+          is_banned TINYINT(1) NOT NULL DEFAULT 0,
+          last_login_at DATETIME NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
+    },
+  },
 ];
 
 export type AppSettingRecord = {
