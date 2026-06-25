@@ -5,6 +5,7 @@ Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MyS
 ![Uptime Control Panel](images/screenshot_control_panel.png)
 ![Status Page - Monitored Services](images/screenshot_status_page.png)
 ![Status Page - Cron Health](images/screenshot_cron_health.png)
+![Audit Log](images/screenshot_audit_log.png)
 
 It uses:
 
