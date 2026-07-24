@@ -66,6 +66,31 @@ limits `cpus: 0.25 / memory: 128M` (reservations `0.02 / 32M`), read-only bind
 mounts of `/var/run/docker.sock` and `/proc → /host/proc`, and injects the
 token via the external secret using `METRICS_INGEST_TOKEN_FILE`.
 
+### Standalone VM (no swarm)
+
+The collector also works on any plain Docker host. When the swarm labels are
+absent, service identity falls back automatically (swarm > compose > name):
+
+- **docker-compose** containers group by their `com.docker.compose.service`
+  under the compose project (`com.docker.compose.project`), with the replica
+  slot taken from `com.docker.compose.container-number` — so a compose service
+  shows up as a named, multi-replica service just like a swarm service.
+- **bare `docker run`** containers (no orchestration labels) appear as
+  single-replica services named after the container itself.
+
+Either way every container is now drillable under the Services table, not just
+in the VM-level metrics and container count. Use
+[`deploy/docker-compose.yml`](./deploy/docker-compose.yml):
+
+```sh
+METRICS_INGEST_TOKEN=YOUR_INGEST_TOKEN NODE_NAME=my-vm-01 \
+  docker compose -f deploy/docker-compose.yml up -d
+```
+
+Outside a swarm there are no Docker secrets, so the token is passed via env
+(or a `.env` file next to the compose file). `NODE_NAME` gives the VM a stable
+display name; without it the daemon hostname is used.
+
 Rotate the token by recreating the secret and redeploying (a `docker secret` is
 immutable):
 

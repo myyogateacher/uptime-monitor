@@ -24,13 +24,24 @@ export interface ContainerMetrics {
   container_id: string;
   name: string;
   image: string;
-  /** com.docker.swarm.service.name label; null for non-swarm containers. */
+  /**
+   * Service identity, resolved via a fallback chain (swarm > compose > name):
+   * com.docker.swarm.service.name, else com.docker.compose.service, else the
+   * container name as-is (bare `docker run` -> single-replica service). Only
+   * null when a container has no name at all.
+   */
   service_name: string | null;
-  /** com.docker.swarm.task.name label. */
+  /**
+   * com.docker.swarm.task.name for swarm; otherwise the container name (compose
+   * and bare-run fallbacks).
+   */
   task_name: string | null;
   /** Replica slot parsed from the task name (service.SLOT.taskid). */
   replica_slot: number | null;
-  /** com.docker.stack.namespace label. */
+  /**
+   * com.docker.stack.namespace for swarm, else com.docker.compose.project for
+   * compose; null for bare containers.
+   */
   stack_namespace: string | null;
   /** docker-stats semantics: 100 = one full core; can exceed 100 on multi-core quota. */
   cpu_pct: number;

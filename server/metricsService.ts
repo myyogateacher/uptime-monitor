@@ -87,6 +87,104 @@ const toFiniteOrNull = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+// Timeseries queries operate over an explicit half-open [from, to) window.
+// bucket_start columns are stored as UTC datetimes, so windows are formatted
+// as 'YYYY-MM-DD HH:MM:SS' in UTC to compare directly.
+export type MetricWindow = { from: Date; to: Date }
+
+const toMysqlUtc = (value: Date): string =>
+  value.toISOString().slice(0, 19).replace('T', ' ')
+
+// Aggregation ("group by") applied when re-bucketing minute rollups. avg/sum/
+// count/max are computed in SQL; p95/p99 are computed in JS over the per-minute
+// average values within each output bucket.
+export type MetricAgg = 'avg' | 'sum' | 'count' | 'max' | 'p95' | 'p99'
+export const METRIC_AGGS = new Set<MetricAgg>([
+  'avg',
+  'sum',
+  'count',
+  'max',
+  'p95',
+  'p99',
+])
+
+const isPercentileAgg = (agg: MetricAgg): boolean => agg === 'p95' || agg === 'p99'
+
+// Nearest-rank percentile over an ascending-sorted array.
+const percentileOf = (sortedAsc: number[], percentile: number): number | null => {
+  if (!sortedAsc.length) return null
+  const rank = Math.ceil((percentile / 100) * sortedAsc.length)
+  const index = Math.min(sortedAsc.length, Math.max(1, rank)) - 1
+  return sortedAsc[index]
+}
+
+// Truncate a minute-level 'YYYY-MM-DD HH:MM:SS' string down to a granularity
+// bucket key (mirrors bucketExprFor but in JS, for the percentile path).
+const bucketKeyFor = (
+  granularity: MetricGranularity,
+  minuteStart: string,
+): string => {
+  if (granularity === 'day') return `${minuteStart.slice(0, 10)} 00:00:00`
+  if (granularity === 'hour') return `${minuteStart.slice(0, 13)}:00:00`
+  return `${minuteStart.slice(0, 16)}:00`
+}
+
+// Selects the requested aggregate from precomputed per-bucket components.
+// Percentiles are resolved separately and never reach this helper.
+const pickAgg = (
+  agg: MetricAgg,
+  components: {
+    avg: number | null
+    sum: number | null
+    count: number | null
+    max: number | null
+  },
+): number | null => {
+  switch (agg) {
+    case 'sum':
+      return components.sum
+    case 'count':
+      return components.count
+    case 'max':
+      return components.max
+    default:
+      return components.avg
+  }
+}
+
+// Builds a TimeseriesPoint from a single aggregated scalar. For memory the
+// scalar is a byte value (except count, which is a sample count) and `avg` also
+// carries a percentage of `reference` (mem total/limit) for aggregates where
+// that is meaningful.
+const buildScalarPoint = (
+  bucketStart: string,
+  metric: MetricKind,
+  agg: MetricAgg,
+  value: number | null,
+  reference: number | null,
+): TimeseriesPoint => {
+  if (metric === 'memory') {
+    const pct =
+      agg === 'count'
+        ? value
+        : value != null && reference
+          ? (value / reference) * 100
+          : null
+    return {
+      bucket_start: bucketStart,
+      avg: pct,
+      max: pct,
+      avg_bytes: value,
+      max_bytes: value,
+    }
+  }
+  return {
+    bucket_start: bucketStart,
+    avg: value,
+    max: value,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Ingest
 // ---------------------------------------------------------------------------
@@ -588,11 +686,20 @@ export async function listServiceContainers(serviceName: string) {
 
 interface NodeSampleRow extends RowDataPacket {
   bucket_start: string
-  cpu_avg: number | null
+  cpu_sum: number | null
   cpu_max: number | null
-  mem_used_avg: number | null
-  mem_used_max: number | null
+  mem_sum: number | null
+  mem_max: number | null
+  sample_count: number | null
   mem_total_bytes: number | null
+}
+
+interface NodeMinuteRow extends RowDataPacket {
+  bucket_start: string
+  cpu_pct_sum: number | null
+  mem_used_sum: number | null
+  sample_count: number | null
+  mem_total_last: number | null
 }
 
 export type TimeseriesPoint = {
@@ -609,7 +716,8 @@ export async function getNodeTimeseries(
   nodeKey: string,
   metric: MetricKind,
   granularity: MetricGranularity,
-  rangeDays: number,
+  window: MetricWindow,
+  agg: MetricAgg = 'avg',
 ): Promise<{ node: Record<string, unknown>; points: TimeseriesPoint[] } | null> {
   const [nodeRows] = await pool.query<
     ({ id: number; node_key: string; hostname: string | null; cpu_cores: number | null; mem_total_bytes: number | null } & RowDataPacket)[]
@@ -620,69 +728,150 @@ export async function getNodeTimeseries(
   if (!nodeRows.length) return null
   const node = nodeRows[0]
 
+  const fromStr = toMysqlUtc(window.from)
+  const toStr = toMysqlUtc(window.to)
+
+  const nodeSubject = {
+    node_key: node.node_key,
+    hostname: node.hostname,
+    cpu_cores: node.cpu_cores,
+    mem_total_bytes: node.mem_total_bytes == null ? null : Number(node.mem_total_bytes),
+  }
+
+  if (isPercentileAgg(agg)) {
+    const [minuteRows] = await pool.query<NodeMinuteRow[]>(
+      `
+        SELECT bucket_start, cpu_pct_sum, mem_used_sum, sample_count, mem_total_last
+        FROM metric_node_samples
+        WHERE entity_id = ?
+          AND bucket_start >= ?
+          AND bucket_start < ?
+        ORDER BY bucket_start ASC
+      `,
+      [node.id, fromStr, toStr],
+    )
+    const points = percentilePoints(
+      minuteRows,
+      granularity,
+      metric,
+      agg,
+      (row) => {
+        const count = Number(row.sample_count) || 0
+        const sum = metric === 'memory' ? Number(row.mem_used_sum) : Number(row.cpu_pct_sum)
+        return count ? sum / count : null
+      },
+      (row) => (row.mem_total_last == null ? null : Number(row.mem_total_last)),
+    )
+    return { node: nodeSubject, points }
+  }
+
   const bucketExpr = bucketExprFor(granularity)
   const [rows] = await pool.query<NodeSampleRow[]>(
     `
       SELECT
         ${bucketExpr} AS bucket_start,
-        SUM(cpu_pct_sum) / SUM(sample_count) AS cpu_avg,
+        SUM(cpu_pct_sum) AS cpu_sum,
         MAX(cpu_pct_max) AS cpu_max,
-        SUM(mem_used_sum) / SUM(sample_count) AS mem_used_avg,
-        MAX(mem_used_max) AS mem_used_max,
+        SUM(mem_used_sum) AS mem_sum,
+        MAX(mem_used_max) AS mem_max,
+        SUM(sample_count) AS sample_count,
         MAX(mem_total_last) AS mem_total_bytes
       FROM metric_node_samples
       WHERE entity_id = ?
-        AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+        AND bucket_start >= ?
+        AND bucket_start < ?
       GROUP BY bucket_start
       ORDER BY bucket_start ASC
     `,
-    [node.id, rangeDays],
+    [node.id, fromStr, toStr],
   )
 
   const points: TimeseriesPoint[] = rows.map((row) => {
+    const count = row.sample_count == null ? null : Number(row.sample_count)
+    const total = row.mem_total_bytes == null ? null : Number(row.mem_total_bytes)
     if (metric === 'memory') {
-      const total = row.mem_total_bytes == null ? null : Number(row.mem_total_bytes)
-      const avgBytes = row.mem_used_avg == null ? null : Number(row.mem_used_avg)
-      const maxBytes = row.mem_used_max == null ? null : Number(row.mem_used_max)
-      return {
-        bucket_start: row.bucket_start,
-        avg: avgBytes != null && total ? (avgBytes / total) * 100 : null,
-        max: maxBytes != null && total ? (maxBytes / total) * 100 : null,
-        avg_bytes: avgBytes,
-        max_bytes: maxBytes,
-      }
+      const sum = row.mem_sum == null ? null : Number(row.mem_sum)
+      const value = pickAgg(agg, {
+        avg: sum != null && count ? sum / count : null,
+        sum,
+        count,
+        max: row.mem_max == null ? null : Number(row.mem_max),
+      })
+      return buildScalarPoint(row.bucket_start, metric, agg, value, total)
     }
-    return {
-      bucket_start: row.bucket_start,
-      avg: toFiniteOrNull(row.cpu_avg),
-      max: toFiniteOrNull(row.cpu_max),
-    }
+    const sum = row.cpu_sum == null ? null : Number(row.cpu_sum)
+    const value = pickAgg(agg, {
+      avg: sum != null && count ? sum / count : null,
+      sum,
+      count,
+      max: row.cpu_max == null ? null : Number(row.cpu_max),
+    })
+    return buildScalarPoint(row.bucket_start, metric, agg, value, null)
   })
 
-  return {
-    node: {
-      node_key: node.node_key,
-      hostname: node.hostname,
-      cpu_cores: node.cpu_cores,
-      mem_total_bytes: node.mem_total_bytes == null ? null : Number(node.mem_total_bytes),
-    },
-    points,
+  return { node: nodeSubject, points }
+}
+
+// Shared JS percentile path: buckets per-minute rows, computes each minute's
+// value via `minuteValue`, then takes the nearest-rank percentile per bucket.
+// `reference` (mem total/limit) is carried as the max seen within the bucket.
+function percentilePoints<Row extends RowDataPacket>(
+  minuteRows: Row[],
+  granularity: MetricGranularity,
+  metric: MetricKind,
+  agg: MetricAgg,
+  minuteValue: (row: Row) => number | null,
+  referenceOf?: (row: Row) => number | null,
+): TimeseriesPoint[] {
+  const buckets = new Map<string, { values: number[]; reference: number | null }>()
+  for (const row of minuteRows) {
+    const key = bucketKeyFor(granularity, String(row.bucket_start))
+    let entry = buckets.get(key)
+    if (!entry) {
+      entry = { values: [], reference: null }
+      buckets.set(key, entry)
+    }
+    const value = minuteValue(row)
+    if (value != null && Number.isFinite(value)) entry.values.push(value)
+    if (referenceOf) {
+      const reference = referenceOf(row)
+      if (reference != null) {
+        entry.reference = entry.reference == null ? reference : Math.max(entry.reference, reference)
+      }
+    }
   }
+  const percentile = agg === 'p99' ? 99 : 95
+  return [...buckets.entries()]
+    .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+    .map(([key, entry]) => {
+      const sorted = entry.values.slice().sort((left, right) => left - right)
+      return buildScalarPoint(key, metric, agg, percentileOf(sorted, percentile), entry.reference)
+    })
 }
 
 interface ServiceSampleRow extends RowDataPacket {
   bucket_start: string
   cpu_avg: number | null
+  cpu_sum: number | null
   cpu_max: number | null
   mem_used_avg: number | null
+  mem_used_sum: number | null
   mem_used_max: number | null
+  sample_count: number | null
+}
+
+interface ServiceMinuteRow extends RowDataPacket {
+  minute: string
+  cpu_total: number | null
+  mem_used_total: number | null
 }
 
 export async function getServiceTimeseries(
   serviceName: string,
   metric: MetricKind,
   granularity: MetricGranularity,
-  rangeDays: number,
+  window: MetricWindow,
+  agg: MetricAgg = 'avg',
 ): Promise<{ service: Record<string, unknown>; points: TimeseriesPoint[] } | null> {
   const [serviceRows] = await pool.query<({ id: number } & RowDataPacket)[]>(
     'SELECT id FROM metric_services WHERE service_name = ? LIMIT 1',
@@ -712,6 +901,50 @@ export async function getServiceTimeseries(
       ? null
       : Number(totalRows[0].total_mem_limit_bytes)
 
+  const fromStr = toMysqlUtc(window.from)
+  const toStr = toMysqlUtc(window.to)
+  const serviceSubject = {
+    service_name: serviceName,
+    total_quota_cores: totalQuota,
+    total_mem_limit_bytes: totalMemLimit,
+  }
+
+  if (isPercentileAgg(agg)) {
+    // Per-minute totals across replicas; percentile taken over those minutes.
+    const [minuteRows] = await pool.query<ServiceMinuteRow[]>(
+      `
+        SELECT
+          cs.bucket_start AS minute,
+          SUM(cs.cpu_pct_sum / cs.sample_count) AS cpu_total,
+          SUM(cs.mem_used_sum / cs.sample_count) AS mem_used_total
+        FROM metric_container_samples cs
+        JOIN metric_containers c ON c.id = cs.entity_id
+        WHERE c.service_id = ?
+          AND cs.bucket_start >= ?
+          AND cs.bucket_start < ?
+        GROUP BY cs.bucket_start
+        ORDER BY cs.bucket_start ASC
+      `,
+      [serviceId, fromStr, toStr],
+    )
+    const points = percentilePoints(
+      minuteRows.map((row) => ({ ...row, bucket_start: row.minute })),
+      granularity,
+      metric,
+      agg,
+      (row) =>
+        metric === 'memory'
+          ? row.mem_used_total == null
+            ? null
+            : Number(row.mem_used_total)
+          : row.cpu_total == null
+            ? null
+            : Number(row.cpu_total),
+      () => totalMemLimit,
+    )
+    return { service: serviceSubject, points }
+  }
+
   const bucketExpr = bucketExprFor(granularity)
   // Inner query totals across replicas per minute; outer re-buckets over time.
   const [rows] = await pool.query<ServiceSampleRow[]>(
@@ -719,74 +952,86 @@ export async function getServiceTimeseries(
       SELECT
         ${bucketExpr.replace(/bucket_start/g, 'm.minute')} AS bucket_start,
         AVG(m.cpu_total) AS cpu_avg,
+        SUM(m.cpu_total) AS cpu_sum,
         MAX(m.cpu_max_total) AS cpu_max,
         AVG(m.mem_used_total) AS mem_used_avg,
-        MAX(m.mem_used_max_total) AS mem_used_max
+        SUM(m.mem_used_total) AS mem_used_sum,
+        MAX(m.mem_used_max_total) AS mem_used_max,
+        SUM(m.sample_count_total) AS sample_count
       FROM (
         SELECT
           cs.bucket_start AS minute,
           SUM(cs.cpu_pct_sum / cs.sample_count) AS cpu_total,
           SUM(cs.cpu_pct_max) AS cpu_max_total,
           SUM(cs.mem_used_sum / cs.sample_count) AS mem_used_total,
-          SUM(cs.mem_used_max) AS mem_used_max_total
+          SUM(cs.mem_used_max) AS mem_used_max_total,
+          SUM(cs.sample_count) AS sample_count_total
         FROM metric_container_samples cs
         JOIN metric_containers c ON c.id = cs.entity_id
         WHERE c.service_id = ?
-          AND cs.bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+          AND cs.bucket_start >= ?
+          AND cs.bucket_start < ?
         GROUP BY cs.bucket_start
       ) m
       GROUP BY bucket_start
       ORDER BY bucket_start ASC
     `,
-    [serviceId, rangeDays],
+    [serviceId, fromStr, toStr],
   )
 
   const points: TimeseriesPoint[] = rows.map((row) => {
+    const count = row.sample_count == null ? null : Number(row.sample_count)
     if (metric === 'memory') {
-      const avgBytes = row.mem_used_avg == null ? null : Number(row.mem_used_avg)
-      const maxBytes = row.mem_used_max == null ? null : Number(row.mem_used_max)
-      return {
-        bucket_start: row.bucket_start,
-        avg: avgBytes != null && totalMemLimit ? (avgBytes / totalMemLimit) * 100 : null,
-        max: maxBytes != null && totalMemLimit ? (maxBytes / totalMemLimit) * 100 : null,
-        avg_bytes: avgBytes,
-        max_bytes: maxBytes,
-      }
+      const value = pickAgg(agg, {
+        avg: row.mem_used_avg == null ? null : Number(row.mem_used_avg),
+        sum: row.mem_used_sum == null ? null : Number(row.mem_used_sum),
+        count,
+        max: row.mem_used_max == null ? null : Number(row.mem_used_max),
+      })
+      return buildScalarPoint(row.bucket_start, metric, agg, value, totalMemLimit)
     }
-    return {
-      bucket_start: row.bucket_start,
-      avg: toFiniteOrNull(row.cpu_avg),
-      max: toFiniteOrNull(row.cpu_max),
-    }
+    const value = pickAgg(agg, {
+      avg: row.cpu_avg == null ? null : Number(row.cpu_avg),
+      sum: row.cpu_sum == null ? null : Number(row.cpu_sum),
+      count,
+      max: row.cpu_max == null ? null : Number(row.cpu_max),
+    })
+    return buildScalarPoint(row.bucket_start, metric, agg, value, null)
   })
 
   return {
-    service: {
-      service_name: serviceName,
-      total_quota_cores: totalQuota,
-      total_mem_limit_bytes: totalMemLimit,
-    },
+    service: serviceSubject,
     points,
   }
 }
 
 interface ContainerSampleRow extends RowDataPacket {
   bucket_start: string
-  cpu_avg: number | null
+  cpu_sum: number | null
   cpu_max: number | null
-  mem_used_avg: number | null
-  mem_used_max: number | null
+  mem_sum: number | null
+  mem_max: number | null
+  sample_count: number | null
   mem_limit_bytes: number | null
   cpu_quota_cores: number | null
   net_rx_last: number | null
   net_tx_last: number | null
 }
 
+interface ContainerMinuteRow extends RowDataPacket {
+  bucket_start: string
+  cpu_pct_sum: number | null
+  mem_used_sum: number | null
+  sample_count: number | null
+  mem_limit_bytes_last: number | null
+}
+
 export async function getContainerTimeseries(
   containerKey: string,
   metric: MetricKind,
   granularity: MetricGranularity,
-  rangeDays: number,
+  window: MetricWindow,
+  agg: MetricAgg = 'avg',
 ): Promise<{ container: Record<string, unknown>; points: TimeseriesPoint[] } | null> {
   const [containerRows] = await pool.query<
     ({ id: number; container_key: string; name: string | null; task_name: string | null; cpu_quota_cores: number | null; mem_limit_bytes: number | null } & RowDataPacket)[]
@@ -797,27 +1042,61 @@ export async function getContainerTimeseries(
   if (!containerRows.length) return null
   const container = containerRows[0]
 
+  const fromStr = toMysqlUtc(window.from)
+  const toStr = toMysqlUtc(window.to)
+
   const bucketExpr = bucketExprFor(granularity)
+  // The grouped query always yields the per-bucket net rate inputs plus the
+  // SQL aggregates; percentiles later override only the plotted value field.
   const [rows] = await pool.query<ContainerSampleRow[]>(
     `
       SELECT
         ${bucketExpr} AS bucket_start,
-        SUM(cpu_pct_sum) / SUM(sample_count) AS cpu_avg,
+        SUM(cpu_pct_sum) AS cpu_sum,
         MAX(cpu_pct_max) AS cpu_max,
-        SUM(mem_used_sum) / SUM(sample_count) AS mem_used_avg,
-        MAX(mem_used_max) AS mem_used_max,
+        SUM(mem_used_sum) AS mem_sum,
+        MAX(mem_used_max) AS mem_max,
+        SUM(sample_count) AS sample_count,
         MAX(mem_limit_bytes_last) AS mem_limit_bytes,
         MAX(cpu_quota_cores_last) AS cpu_quota_cores,
         CAST(SUBSTRING_INDEX(GROUP_CONCAT(net_rx_last ORDER BY bucket_start DESC), ',', 1) AS UNSIGNED) AS net_rx_last,
         CAST(SUBSTRING_INDEX(GROUP_CONCAT(net_tx_last ORDER BY bucket_start DESC), ',', 1) AS UNSIGNED) AS net_tx_last
       FROM metric_container_samples
       WHERE entity_id = ?
-        AND bucket_start >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+        AND bucket_start >= ?
+        AND bucket_start < ?
       GROUP BY bucket_start
       ORDER BY bucket_start ASC
     `,
-    [container.id, rangeDays],
+    [container.id, fromStr, toStr],
   )
+
+  // Percentile aggregates need per-minute values; keyed by bucket for merge.
+  let percentileByBucket: Map<string, number | null> | null = null
+  if (isPercentileAgg(agg)) {
+    const [minuteRows] = await pool.query<ContainerMinuteRow[]>(
+      `
+        SELECT bucket_start, cpu_pct_sum, mem_used_sum, sample_count
+        FROM metric_container_samples
+        WHERE entity_id = ?
+          AND bucket_start >= ?
+          AND bucket_start < ?
+        ORDER BY bucket_start ASC
+      `,
+      [container.id, fromStr, toStr],
+    )
+    const percentilePts = percentilePoints(minuteRows, granularity, metric, agg, (row) => {
+      const count = Number(row.sample_count) || 0
+      const sum = metric === 'memory' ? Number(row.mem_used_sum) : Number(row.cpu_pct_sum)
+      return count ? sum / count : null
+    })
+    percentileByBucket = new Map(
+      percentilePts.map((point) => [
+        point.bucket_start,
+        metric === 'memory' ? point.avg_bytes ?? null : point.avg,
+      ]),
+    )
+  }
 
   let prevRx: number | null = null
   let prevTx: number | null = null
@@ -847,27 +1126,34 @@ export async function getContainerTimeseries(
     prevTx = tx
     prevTime = bucketTime
 
-    const point: TimeseriesPoint = {
-      bucket_start: row.bucket_start,
-      avg: null,
-      max: null,
-      net_rx_bps: netRxBps,
-      net_tx_bps: netTxBps,
-    }
+    const count = row.sample_count == null ? null : Number(row.sample_count)
+    const limit = row.mem_limit_bytes == null ? null : Number(row.mem_limit_bytes)
+    const reference = metric === 'memory' ? limit : null
 
-    if (metric === 'memory') {
-      const limit = row.mem_limit_bytes == null ? null : Number(row.mem_limit_bytes)
-      const avgBytes = row.mem_used_avg == null ? null : Number(row.mem_used_avg)
-      const maxBytes = row.mem_used_max == null ? null : Number(row.mem_used_max)
-      point.avg = avgBytes != null && limit ? (avgBytes / limit) * 100 : null
-      point.max = maxBytes != null && limit ? (maxBytes / limit) * 100 : null
-      point.avg_bytes = avgBytes
-      point.max_bytes = maxBytes
+    let value: number | null
+    if (percentileByBucket) {
+      value = percentileByBucket.get(row.bucket_start) ?? null
+    } else if (metric === 'memory') {
+      const sum = row.mem_sum == null ? null : Number(row.mem_sum)
+      value = pickAgg(agg, {
+        avg: sum != null && count ? sum / count : null,
+        sum,
+        count,
+        max: row.mem_max == null ? null : Number(row.mem_max),
+      })
     } else {
-      point.avg = toFiniteOrNull(row.cpu_avg)
-      point.max = toFiniteOrNull(row.cpu_max)
+      const sum = row.cpu_sum == null ? null : Number(row.cpu_sum)
+      value = pickAgg(agg, {
+        avg: sum != null && count ? sum / count : null,
+        sum,
+        count,
+        max: row.cpu_max == null ? null : Number(row.cpu_max),
+      })
     }
 
+    const point = buildScalarPoint(row.bucket_start, metric, agg, value, reference)
+    point.net_rx_bps = netRxBps
+    point.net_tx_bps = netTxBps
     return point
   })
 

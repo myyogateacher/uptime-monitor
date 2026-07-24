@@ -25,6 +25,9 @@ import {
 const LABEL_SERVICE = 'com.docker.swarm.service.name'
 const LABEL_TASK = 'com.docker.swarm.task.name'
 const LABEL_STACK = 'com.docker.stack.namespace'
+const LABEL_COMPOSE_SERVICE = 'com.docker.compose.service'
+const LABEL_COMPOSE_PROJECT = 'com.docker.compose.project'
+const LABEL_COMPOSE_CONTAINER_NUMBER = 'com.docker.compose.container-number'
 
 // docker-stats CPU%: 100 == one full core. Returns 0 for the guarded edge
 // cases (zeroed precpu, non-positive system delta), clamps to [0, cores*100].
@@ -118,6 +121,58 @@ const cleanName = (names: string[] | undefined): string => {
   return raw.startsWith('/') ? raw.slice(1) : raw
 }
 
+// Service identity resolved through a strict fallback chain: swarm > compose >
+// name. This is what makes a container appear under a named service in the
+// dashboard's Services table regardless of how it was launched.
+export interface ServiceIdentity {
+  service_name: string | null
+  task_name: string | null
+  replica_slot: number | null
+  stack_namespace: string | null
+}
+
+// `cleanedName` is the leading-slash-stripped container name (see cleanName).
+export const extractServiceIdentity = (
+  labels: Record<string, string>,
+  cleanedName: string,
+): ServiceIdentity => {
+  // Tier 1 — Docker Swarm. Present on swarm tasks (including swarm stacks
+  // deployed from compose files, which also carry compose labels); swarm wins.
+  const swarmService = labels[LABEL_SERVICE]
+  if (swarmService) {
+    const taskName = labels[LABEL_TASK] ?? null
+    return {
+      service_name: swarmService,
+      task_name: taskName,
+      replica_slot: parseReplicaSlot(taskName),
+      stack_namespace: labels[LABEL_STACK] ?? null,
+    }
+  }
+
+  // Tier 2 — docker-compose. Groups replicas by the compose service; the
+  // container-number label is the per-service instance index.
+  const composeService = labels[LABEL_COMPOSE_SERVICE]
+  if (composeService) {
+    const rawNumber = labels[LABEL_COMPOSE_CONTAINER_NUMBER]
+    const slot = rawNumber != null ? parseInt(rawNumber, 10) : NaN
+    return {
+      service_name: composeService,
+      task_name: cleanedName || null,
+      replica_slot: Number.isNaN(slot) ? null : slot,
+      stack_namespace: labels[LABEL_COMPOSE_PROJECT] ?? null,
+    }
+  }
+
+  // Tier 3 — bare `docker run`. No orchestration labels: use the container
+  // name as-is so every container is drillable as a single-replica service.
+  return {
+    service_name: cleanedName || null,
+    task_name: cleanedName || null,
+    replica_slot: null,
+    stack_namespace: null,
+  }
+}
+
 const buildContainerMetrics = (
   container: ContainerListItem,
   stats: ContainerStats,
@@ -125,19 +180,18 @@ const buildContainerMetrics = (
   hostTotalBytes: number,
 ): ContainerMetrics => {
   const labels = container.Labels ?? {}
-  const serviceName = labels[LABEL_SERVICE] ?? null
-  const taskName = labels[LABEL_TASK] ?? null
-  const stackNamespace = labels[LABEL_STACK] ?? null
+  const name = cleanName(container.Names)
+  const identity = extractServiceIdentity(labels, name)
   const net = sumNetwork(stats)
 
   return {
     container_id: container.Id,
-    name: cleanName(container.Names),
+    name,
     image: container.Image,
-    service_name: serviceName,
-    task_name: taskName,
-    replica_slot: parseReplicaSlot(taskName),
-    stack_namespace: stackNamespace,
+    service_name: identity.service_name,
+    task_name: identity.task_name,
+    replica_slot: identity.replica_slot,
+    stack_namespace: identity.stack_namespace,
     cpu_pct: computeCpuPct(stats),
     cpu_quota_cores: computeQuotaCores(inspect),
     mem_used_bytes: computeMemUsed(stats),

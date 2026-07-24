@@ -21,6 +21,7 @@ import {
     FaChevronDown,
     FaChevronRight,
     FaClipboardList,
+    FaRegCalendarAlt,
     FaServer,
     FaSignOutAlt,
     FaUndo,
@@ -39,6 +40,7 @@ import {
     type EndpointCheckRun,
     type EndpointStatsBucket,
     type ManagedUser,
+    type MetricAgg,
     type MetricAlertRule,
     type MetricAlertRuleInput,
     type MetricContainer,
@@ -358,7 +360,11 @@ function formatBytesRate(bytesPerSec: number | null | undefined): string {
 function formatCores(cpuPct: number | null | undefined): string {
     if (cpuPct == null || Number.isNaN(cpuPct)) return "—";
     const cores = cpuPct / 100;
-    return `${cores >= 10 ? Math.round(cores) : Math.round(cores * 100) / 100} cores`;
+    if (cores === 0) return "0 cores";
+    // Adaptive precision so tiny-but-nonzero usage never reads as "0 cores".
+    if (cores >= 10) return `${Math.round(cores)} cores`;
+    if (cores >= 0.01) return `${Math.round(cores * 100) / 100} cores`;
+    return `${Math.max(1, Math.round(cores * 1000))} mcores`;
 }
 
 function formatPct(pct: number | null | undefined): string {
@@ -824,6 +830,47 @@ interface MetricRangeOption {
     // range_days may be fractional for sub-day windows (server computes a
     // now - range_days*86400s cutoff).
     rangeDays: number;
+    // Custom absolute window (YYYY-MM-DD). When set these override rangeDays and
+    // are forwarded to the server as from/to; `custom` flags the active state so
+    // charts can show a range-specific empty message.
+    from?: string;
+    to?: string;
+    custom?: boolean;
+    // Aggregation ("group by") applied server-side; threaded to every chart.
+    agg?: MetricAgg;
+}
+
+const METRIC_GRANULARITY_OPTIONS: Array<{
+    value: MetricGranularity;
+    label: string;
+    // Max window span (days) this granularity is allowed to cover (server caps).
+    maxDays: number;
+}> = [
+    { value: "minute", label: "Minute", maxDays: 7 },
+    { value: "hour", label: "Hourly", maxDays: 30 },
+    { value: "day", label: "Daily", maxDays: 90 },
+];
+
+const METRIC_AGG_OPTIONS: Array<{ value: MetricAgg; label: string }> = [
+    { value: "avg", label: "Avg" },
+    { value: "sum", label: "Sum" },
+    { value: "count", label: "Count" },
+    { value: "max", label: "Max" },
+    { value: "p95", label: "p95" },
+    { value: "p99", label: "p99" },
+];
+
+// Count returns plain sample counts, so charts drop % / byte units and
+// reference lines for that aggregate.
+function isCountAgg(agg: MetricAgg | undefined): boolean {
+    return agg === "count";
+}
+
+function aggLabel(agg: MetricAgg | undefined): string {
+    return (
+        METRIC_AGG_OPTIONS.find((option) => option.value === (agg ?? "avg"))
+            ?.label ?? "Avg"
+    );
 }
 
 const METRIC_RANGE_OPTIONS: MetricRangeOption[] = [
@@ -834,6 +881,53 @@ const METRIC_RANGE_OPTIONS: MetricRangeOption[] = [
     { key: "30d", label: "30d", granularity: "day", rangeDays: 30 },
     { key: "90d", label: "90d", granularity: "day", rangeDays: 90 },
 ];
+
+const METRIC_CUSTOM_MAX_DAYS = 90;
+
+// Parse a YYYY-MM-DD control value as a UTC instant (start-of-day).
+function customDateMs(value: string, endOfDay = false): number {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return NaN;
+    return new Date(
+        `${value}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`,
+    ).getTime();
+}
+
+// Span in days between two YYYY-MM-DD values (to is treated as end-of-day so a
+// single-day selection spans ~1 day).
+function customSpanDays(from: string, to: string): number {
+    const fromMs = customDateMs(from);
+    const toMs = customDateMs(to, true);
+    if (Number.isNaN(fromMs) || Number.isNaN(toMs)) return NaN;
+    return (toMs - fromMs) / (24 * 60 * 60 * 1000);
+}
+
+// Auto-select granularity from the span, staying within the server caps
+// (minute ≤ 7d, hour ≤ 30d, day ≤ 90d): minute up to 2 days, hour up to
+// 30 days, day beyond.
+function customGranularityFor(span: number): MetricGranularity {
+    if (!Number.isFinite(span) || span <= 2) return "minute";
+    if (span <= 30) return "hour";
+    return "day";
+}
+
+// Compact label for a custom range pill, e.g. "Jul 1 – Jul 7".
+function formatCustomRangeLabel(from: string, to: string): string {
+    const fmt = (value: string) => {
+        const ms = customDateMs(value);
+        if (Number.isNaN(ms)) return value;
+        return new Date(ms).toLocaleDateString("en-US", {
+            month: "short",
+            day: "numeric",
+            timeZone: "UTC",
+        });
+    };
+    return `${fmt(from)} – ${fmt(to)}`;
+}
+
+// Today (UTC) as YYYY-MM-DD; used for future-date guards and the max attr.
+function todayUtc(): string {
+    return new Date().toISOString().slice(0, 10);
+}
 
 const ALERT_SCOPE_OPTIONS: Array<{ value: AlertScope; label: string }> = [
     { value: "node", label: "Node" },
@@ -1065,7 +1159,14 @@ function MetricChart<P>({
                         {!compact && referenceLabel && (
                             <text
                                 x={chartRight}
-                                y={Math.max(refY - 3, padding + 8)}
+                                // Sit clearly above the dashed line; if the line
+                                // hugs the top edge, drop the label just below it
+                                // instead so the two never overlap.
+                                y={
+                                    refY - 5 >= padding + 8
+                                        ? refY - 5
+                                        : refY + 11
+                                }
                                 textAnchor="end"
                                 fontSize="9"
                                 fill="#e11d48"
@@ -1149,11 +1250,17 @@ function NodeCard({
                         metric: "cpu",
                         granularity: range.granularity,
                         rangeDays: range.rangeDays,
+                        from: range.from,
+                        to: range.to,
+                        agg: range.agg,
                     }),
                     monitoringService.getNodeTimeseries(node.node_key, {
                         metric: "memory",
                         granularity: range.granularity,
                         rangeDays: range.rangeDays,
+                        from: range.from,
+                        to: range.to,
+                        agg: range.agg,
                     }),
                 ]);
                 if (cancelled) return;
@@ -1170,7 +1277,19 @@ function NodeCard({
         return () => {
             cancelled = true;
         };
-    }, [node.node_key, range.granularity, range.rangeDays, refreshKey]);
+    }, [
+        node.node_key,
+        range.granularity,
+        range.rangeDays,
+        range.from,
+        range.to,
+        range.agg,
+        refreshKey,
+    ]);
+
+    const emptyLabel = range.custom ? "No data in this range." : undefined;
+    const countAgg = isCountAgg(range.agg);
+    const aggHint = aggLabel(range.agg);
 
     const memTotalRef =
         mem?.node?.mem_total_bytes ?? node.mem_total_bytes ?? 0;
@@ -1219,42 +1338,52 @@ function NodeCard({
             </div>
 
             <div>
-                <ChartLabel>CPU %</ChartLabel>
+                <ChartLabel>{countAgg ? "CPU samples" : "CPU %"} · {aggHint}</ChartLabel>
                 <MetricChart
                     points={cpu?.points ?? []}
                     getValue={(point) => Number(point.avg ?? 0)}
                     getTime={(point) => point.bucket_start}
                     color="#0284c7"
                     seriesLabel="CPU"
-                    valueFormatter={(value) => `${Math.round(value)}%`}
+                    valueFormatter={(value) =>
+                        countAgg
+                            ? `${Math.round(value)}`
+                            : `${Math.round(value)}%`
+                    }
                     height={80}
+                    emptyLabel={emptyLabel}
                 />
             </div>
             <div>
-                <ChartLabel>Memory</ChartLabel>
+                <ChartLabel>{countAgg ? "Memory samples" : "Memory"} · {aggHint}</ChartLabel>
                 <MetricChart
                     points={mem?.points ?? []}
                     getValue={(point) => Number(point.avg_bytes ?? 0)}
                     getTime={(point) => point.bucket_start}
                     color="#0f766e"
                     seriesLabel="Mem"
-                    referenceValue={memTotalRef}
+                    referenceValue={countAgg ? null : memTotalRef}
                     referenceLabel="total"
-                    valueFormatter={(value) => formatBytes(value)}
+                    valueFormatter={(value) =>
+                        countAgg ? `${Math.round(value)}` : formatBytes(value)
+                    }
                     height={80}
+                    emptyLabel={emptyLabel}
                 />
             </div>
         </button>
     );
 }
 
-// A compact CPU sparkline for a services-table row.
+// A compact CPU or memory sparkline for a services-table row.
 function ServiceSparkline({
     serviceName,
+    metric = "cpu",
     range,
     refreshKey,
 }: {
     serviceName: string;
+    metric?: MetricKind;
     range: MetricRangeOption;
     refreshKey: number;
 }) {
@@ -1264,9 +1393,12 @@ function ServiceSparkline({
         let cancelled = false;
         monitoringService
             .getServiceTimeseries(serviceName, {
-                metric: "cpu",
+                metric,
                 granularity: range.granularity,
                 rangeDays: range.rangeDays,
+                from: range.from,
+                to: range.to,
+                agg: range.agg,
             })
             .then((res) => {
                 if (!cancelled) setData(res);
@@ -1277,17 +1409,38 @@ function ServiceSparkline({
         return () => {
             cancelled = true;
         };
-    }, [serviceName, range.granularity, range.rangeDays, refreshKey]);
+    }, [
+        serviceName,
+        metric,
+        range.granularity,
+        range.rangeDays,
+        range.from,
+        range.to,
+        range.agg,
+        refreshKey,
+    ]);
 
+    const countAgg = isCountAgg(range.agg);
+    const isMemory = metric === "memory";
     return (
         <div className="w-40">
             <MetricChart
                 points={data?.points ?? []}
-                getValue={(point) => Number(point.avg ?? 0)}
+                getValue={(point) =>
+                    isMemory
+                        ? Number(point.avg_bytes ?? 0)
+                        : Number(point.avg ?? 0)
+                }
                 getTime={(point) => point.bucket_start}
-                color="#0284c7"
-                seriesLabel="CPU"
-                valueFormatter={(value) => `${Math.round(value)}%`}
+                color={isMemory ? "#0f766e" : "#0284c7"}
+                seriesLabel={isMemory ? "Mem" : "CPU"}
+                valueFormatter={(value) =>
+                    countAgg
+                        ? `${Math.round(value)}`
+                        : isMemory
+                          ? formatBytes(value)
+                          : `${Math.round(value)}%`
+                }
                 height={36}
                 compact
                 emptyLabel="—"
@@ -1321,6 +1474,9 @@ function ContainerDetail({
                             metric: "cpu",
                             granularity: range.granularity,
                             rangeDays: range.rangeDays,
+                            from: range.from,
+                            to: range.to,
+                            agg: range.agg,
                         },
                     ),
                     monitoringService.getContainerTimeseries(
@@ -1329,6 +1485,9 @@ function ContainerDetail({
                             metric: "memory",
                             granularity: range.granularity,
                             rangeDays: range.rangeDays,
+                            from: range.from,
+                            to: range.to,
+                            agg: range.agg,
                         },
                     ),
                 ]);
@@ -1346,7 +1505,19 @@ function ContainerDetail({
         return () => {
             cancelled = true;
         };
-    }, [container.container_key, range.granularity, range.rangeDays, refreshKey]);
+    }, [
+        container.container_key,
+        range.granularity,
+        range.rangeDays,
+        range.from,
+        range.to,
+        range.agg,
+        refreshKey,
+    ]);
+
+    const emptyLabel = range.custom ? "No data in this range." : undefined;
+    const countAgg = isCountAgg(range.agg);
+    const aggHint = aggLabel(range.agg);
 
     const cpuQuotaCores =
         cpu?.container?.cpu_quota_cores ?? container.cpu_quota_cores ?? null;
@@ -1375,8 +1546,8 @@ function ContainerDetail({
         <div className="mt-3 grid gap-4 rounded-xl border border-white/60 bg-white/40 p-4 md:grid-cols-3">
             <div>
                 <ChartLabel>
-                    CPU (cores){" "}
-                    {cpuQuotaCores != null && (
+                    {countAgg ? "CPU (samples)" : "CPU (cores)"} · {aggHint}{" "}
+                    {!countAgg && cpuQuotaCores != null && (
                         <span className="text-rose-500">
                             quota {cpuQuotaCores}
                         </span>
@@ -1384,16 +1555,25 @@ function ContainerDetail({
                 </ChartLabel>
                 <MetricChart
                     points={cpu?.points ?? []}
-                    getValue={(point) => Number(point.avg ?? 0) / 100}
+                    getValue={(point) =>
+                        countAgg
+                            ? Number(point.avg ?? 0)
+                            : Number(point.avg ?? 0) / 100
+                    }
                     getTime={(point) => point.bucket_start}
                     color="#0284c7"
                     seriesLabel="CPU"
-                    referenceValue={cpuQuotaCores ?? null}
+                    referenceValue={countAgg ? null : (cpuQuotaCores ?? null)}
                     referenceLabel="quota"
-                    valueFormatter={(value) => `${Math.round(value * 100) / 100}`}
+                    valueFormatter={(value) =>
+                        countAgg
+                            ? `${Math.round(value)}`
+                            : `${Math.round(value * 100) / 100}`
+                    }
                     height={96}
+                    emptyLabel={emptyLabel}
                 />
-                {cpuUsedPct != null && (
+                {!countAgg && cpuUsedPct != null && (
                     <p className="mt-1 text-[11px] text-slate-500">
                         {formatPct(cpuUsedPct)} of quota
                     </p>
@@ -1401,8 +1581,8 @@ function ContainerDetail({
             </div>
             <div>
                 <ChartLabel>
-                    Memory{" "}
-                    {memLimit != null && (
+                    {countAgg ? "Memory (samples)" : "Memory"} · {aggHint}{" "}
+                    {!countAgg && memLimit != null && (
                         <span className="text-rose-500">
                             limit {formatBytes(memLimit)}
                         </span>
@@ -1414,12 +1594,15 @@ function ContainerDetail({
                     getTime={(point) => point.bucket_start}
                     color="#0f766e"
                     seriesLabel="Mem"
-                    referenceValue={memLimit}
+                    referenceValue={countAgg ? null : memLimit}
                     referenceLabel="limit"
-                    valueFormatter={(value) => formatBytes(value)}
+                    valueFormatter={(value) =>
+                        countAgg ? `${Math.round(value)}` : formatBytes(value)
+                    }
                     height={96}
+                    emptyLabel={emptyLabel}
                 />
-                {memUsedPct != null && (
+                {!countAgg && memUsedPct != null && (
                     <p className="mt-1 text-[11px] text-slate-500">
                         {formatPct(memUsedPct)} of limit
                     </p>
@@ -1528,7 +1711,12 @@ function ServicesTable({
                         <th className="px-4 py-3">Nodes</th>
                         <th className="px-4 py-3">CPU</th>
                         <th className="px-4 py-3">Memory</th>
-                        <th className="px-4 py-3">CPU trend</th>
+                        <th className="hidden px-4 py-3 lg:table-cell">
+                            CPU trend
+                        </th>
+                        <th className="hidden px-4 py-3 lg:table-cell">
+                            Memory trend
+                        </th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1593,9 +1781,18 @@ function ServicesTable({
                                             </span>
                                         )}
                                     </td>
-                                    <td className="px-4 py-3">
+                                    <td className="hidden px-4 py-3 lg:table-cell">
                                         <ServiceSparkline
                                             serviceName={service.service_name}
+                                            metric="cpu"
+                                            range={range}
+                                            refreshKey={refreshKey}
+                                        />
+                                    </td>
+                                    <td className="hidden px-4 py-3 lg:table-cell">
+                                        <ServiceSparkline
+                                            serviceName={service.service_name}
+                                            metric="memory"
                                             range={range}
                                             refreshKey={refreshKey}
                                         />
@@ -1603,7 +1800,7 @@ function ServicesTable({
                                 </tr>
                                 {isOpen && (
                                     <tr className="border-b border-white/40 bg-white/30">
-                                        <td colSpan={6} className="px-4 py-3">
+                                        <td colSpan={7} className="px-4 py-3">
                                             {rows.length === 0 ? (
                                                 <p className="text-xs text-slate-500">
                                                     No replicas reporting.
@@ -2085,16 +2282,93 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
     const [overview, setOverview] = useState<MetricsOverview | null>(null);
     const [nodeServices, setNodeServices] = useState<MetricService[]>([]);
     const [tab, setTab] = useState<"node" | "service">("node");
-    const [rangeKey, setRangeKey] = useState("24h");
+    // Defaults on load: last 7 days, hourly granularity, avg aggregation.
+    const [rangeKey, setRangeKey] = useState("7d");
+    const [granularity, setGranularity] = useState<MetricGranularity>("hour");
+    const [agg, setAgg] = useState<MetricAgg>("avg");
     const [selectedNode, setSelectedNode] = useState<string | null>(null);
     const [showAlerts, setShowAlerts] = useState(false);
     const [refreshKey, setRefreshKey] = useState(0);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState("");
 
-    const range =
+    // Custom date-range state. `customRange` (when set) is the applied window and
+    // overrides the preset pills; `customOpen` toggles the picker popover and the
+    // two inputs hold the in-progress selection.
+    const [customOpen, setCustomOpen] = useState(false);
+    const [customFrom, setCustomFrom] = useState("");
+    const [customTo, setCustomTo] = useState("");
+    const [customRange, setCustomRange] = useState<{
+        from: string;
+        to: string;
+    } | null>(null);
+
+    const presetRange =
         METRIC_RANGE_OPTIONS.find((option) => option.key === rangeKey) ??
         METRIC_RANGE_OPTIONS[2];
+
+    // Span (days) of the active window; drives which granularities are allowed.
+    const activeSpanDays = customRange
+        ? customSpanDays(customRange.from, customRange.to)
+        : presetRange.rangeDays;
+
+    // Active range threaded to the charts: the applied custom window when set,
+    // otherwise the selected preset. Granularity/agg come from the user's
+    // explicit selection rather than the preset mapping.
+    const range: MetricRangeOption = useMemo(() => {
+        if (!customRange) {
+            return { ...presetRange, granularity, agg };
+        }
+        return {
+            key: "custom",
+            label: "Custom",
+            granularity,
+            rangeDays: 0,
+            from: customRange.from,
+            to: customRange.to,
+            custom: true,
+            agg,
+        };
+    }, [customRange, presetRange, granularity, agg]);
+
+    // Live-editing (in-popover) span → derived granularity + validity.
+    const draftSpan = customSpanDays(customFrom, customTo);
+    const draftGranularity = customGranularityFor(draftSpan);
+    const draftValid =
+        Boolean(customFrom) &&
+        Boolean(customTo) &&
+        Number.isFinite(draftSpan) &&
+        draftSpan > 0 &&
+        draftSpan <= METRIC_CUSTOM_MAX_DAYS &&
+        customDateMs(customFrom) <= Date.now();
+
+    // Skip the 30s timeseries refresh when a custom range ending before today is
+    // active (the window is historical and fixed). A `to` of today still polls.
+    const pauseTimeseriesRefresh =
+        customRange != null && customRange.to < todayUtc();
+
+    const applyCustomRange = () => {
+        if (!draftValid) return;
+        setCustomRange({ from: customFrom, to: customTo });
+        // Auto-suggest the granularity for the chosen span (user may override).
+        setGranularity(draftGranularity);
+        setCustomOpen(false);
+    };
+
+    // Clicking a preset clears any custom range and re-suggests that preset's
+    // granularity (still user-overridable afterward).
+    const selectPreset = (option: MetricRangeOption) => {
+        setCustomRange(null);
+        setCustomOpen(false);
+        setRangeKey(option.key);
+        setGranularity(option.granularity);
+    };
+
+    const clearCustomRange = () => {
+        setCustomRange(null);
+        setCustomOpen(false);
+        setGranularity(presetRange.granularity);
+    };
 
     const loadOverview = useCallback(async () => {
         try {
@@ -2115,10 +2389,13 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
         void loadOverview();
         const timer = setInterval(() => {
             void loadOverview();
-            setRefreshKey((prev) => prev + 1);
+            // Historical custom windows are fixed; don't re-fetch the charts.
+            if (!pauseTimeseriesRefresh) {
+                setRefreshKey((prev) => prev + 1);
+            }
         }, 30000);
         return () => clearInterval(timer);
-    }, [loadOverview]);
+    }, [loadOverview, pauseTimeseriesRefresh]);
 
     // Filter the services table to the selected node (By Node tab).
     useEffect(() => {
@@ -2166,9 +2443,9 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                                 <button
                                     key={option.key}
                                     type="button"
-                                    onClick={() => setRangeKey(option.key)}
+                                    onClick={() => selectPreset(option)}
                                     className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
-                                        rangeKey === option.key
+                                        !customRange && rangeKey === option.key
                                             ? "bg-slate-900 text-white"
                                             : "text-slate-600 hover:bg-white/70"
                                     }`}
@@ -2177,6 +2454,127 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                                 </button>
                             ))}
                         </div>
+                        <div className="relative">
+                            <button
+                                type="button"
+                                onClick={() => setCustomOpen((prev) => !prev)}
+                                className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition ${
+                                    customRange
+                                        ? "border-slate-900 bg-slate-900 text-white"
+                                        : "border-white/60 bg-white/50 text-slate-600 hover:bg-white/80"
+                                }`}
+                            >
+                                <FaRegCalendarAlt className="text-[11px]" />
+                                {customRange
+                                    ? formatCustomRangeLabel(
+                                          customRange.from,
+                                          customRange.to,
+                                      )
+                                    : "Custom"}
+                            </button>
+                            {customOpen && (
+                                <div className="absolute right-0 z-20 mt-2 w-64 rounded-xl border border-white/60 bg-white/95 p-4 shadow-xl backdrop-blur">
+                                    <div className="flex flex-col gap-3">
+                                        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                                            From
+                                            <input
+                                                type="date"
+                                                value={customFrom}
+                                                max={todayUtc()}
+                                                onChange={(event) =>
+                                                    setCustomFrom(
+                                                        event.target.value,
+                                                    )
+                                                }
+                                                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-sm text-slate-800"
+                                            />
+                                        </label>
+                                        <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                                            To
+                                            <input
+                                                type="date"
+                                                value={customTo}
+                                                max={todayUtc()}
+                                                onChange={(event) =>
+                                                    setCustomTo(
+                                                        event.target.value,
+                                                    )
+                                                }
+                                                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-sm text-slate-800"
+                                            />
+                                        </label>
+                                        <p className="text-[11px] text-slate-500">
+                                            {draftValid
+                                                ? `Granularity: ${draftGranularity}`
+                                                : customFrom && customTo
+                                                  ? "Invalid range (max 90 days, no future dates)."
+                                                  : "Pick a start and end date."}
+                                        </p>
+                                        <div className="flex justify-end gap-2">
+                                            {customRange && (
+                                                <button
+                                                    type="button"
+                                                    onClick={clearCustomRange}
+                                                    className="rounded-md px-2.5 py-1 text-xs font-medium text-slate-500 hover:text-slate-700"
+                                                >
+                                                    Clear
+                                                </button>
+                                            )}
+                                            <button
+                                                type="button"
+                                                onClick={applyCustomRange}
+                                                disabled={!draftValid}
+                                                className="rounded-md bg-slate-900 px-3 py-1 text-xs font-medium text-white transition disabled:cursor-not-allowed disabled:opacity-40"
+                                            >
+                                                Apply
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex rounded-lg border border-white/60 bg-white/50 p-0.5">
+                            {METRIC_GRANULARITY_OPTIONS.map((option) => {
+                                const disabled =
+                                    activeSpanDays > option.maxDays;
+                                return (
+                                    <button
+                                        key={option.value}
+                                        type="button"
+                                        disabled={disabled}
+                                        title={
+                                            disabled
+                                                ? `Unavailable for spans over ${option.maxDays} days`
+                                                : undefined
+                                        }
+                                        onClick={() =>
+                                            setGranularity(option.value)
+                                        }
+                                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-30 ${
+                                            granularity === option.value
+                                                ? "bg-slate-900 text-white"
+                                                : "text-slate-600 hover:bg-white/70"
+                                        }`}
+                                    >
+                                        {option.label}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        <select
+                            value={agg}
+                            onChange={(event) =>
+                                setAgg(event.target.value as MetricAgg)
+                            }
+                            aria-label="Aggregation"
+                            className="rounded-lg border border-white/60 bg-white/50 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-white/80"
+                        >
+                            {METRIC_AGG_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                    {option.label}
+                                </option>
+                            ))}
+                        </select>
                         <button
                             type="button"
                             onClick={() => setShowAlerts((prev) => !prev)}

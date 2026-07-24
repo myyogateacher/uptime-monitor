@@ -1,0 +1,42 @@
+# Docker Compose deployment for a STANDALONE VM (not part of a swarm).
+#
+# Runs one collector on this host, reading the local Docker socket + host
+# /proc and pushing one batch per interval to the server. Containers without
+# swarm labels report service_name=null, so they appear in the node's VM-level
+# metrics and container count but not under a named service in the dashboard.
+#
+#   METRICS_INGEST_TOKEN=... NODE_NAME=my-vm-01 docker compose -f deploy/docker-compose.yml up -d
+#
+# Or put METRICS_INGEST_TOKEN / NODE_NAME / METRICS_INGEST_URL in a .env file
+# next to this compose file. Set IMAGE to your registry-pushed image (built
+# from the Dockerfile in sidecar-swarm/).
+
+services:
+  metrics-sidecar:
+    image: ${IMAGE:-registry.example.com/uptime-sidecar-swarm:latest}
+    restart: always
+    cpus: 0.25
+    mem_limit: 128m
+    environment:
+      METRICS_INGEST_URL: ${METRICS_INGEST_URL:-https://uptime.example.com/api/metrics/ingest}
+      # No swarm secrets outside a swarm — token comes from the environment/.env.
+      METRICS_INGEST_TOKEN: ${METRICS_INGEST_TOKEN:?set METRICS_INGEST_TOKEN}
+      # Standalone daemons have no swarm node id; a stable name keeps the VM
+      # recognizable in the dashboard (defaults to the daemon hostname).
+      NODE_NAME: ${NODE_NAME:-}
+      METRICS_INTERVAL_MS: "15000"
+      HOST_PROC: /host/proc
+      DOCKER_SOCKET: /var/run/docker.sock
+      STATS_CONCURRENCY: "8"
+      LOG_LEVEL: info
+      TZ: UTC
+    volumes:
+      # Read-only: the daemon socket (container stats) and host /proc (VM metrics).
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true

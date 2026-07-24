@@ -22,6 +22,7 @@ export type UserRole = 'admin' | 'editor' | 'viewer'
 
 export type MetricKind = 'cpu' | 'memory'
 export type MetricGranularity = 'minute' | 'hour' | 'day'
+export type MetricAgg = 'avg' | 'sum' | 'count' | 'max' | 'p95' | 'p99'
 export type AlertScope = 'node' | 'service' | 'container'
 // Operator values are the exact strings the server validates and the DB enum
 // stores (migration 17: ENUM('>','>=','<','<=')).
@@ -122,7 +123,12 @@ export interface MetricContainerSubject {
 export interface MetricTimeseriesResponse {
   metric: MetricKind
   granularity: MetricGranularity
+  agg?: MetricAgg
   range_days: number
+  // Effective window echoed by the server (ISO 8601). Present for both the
+  // range_days path ([now - range_days, now)) and custom from/to windows.
+  from?: string
+  to?: string
   retention_days: number
   points: MetricTimeseriesPoint[]
   node?: MetricNodeSubject
@@ -160,6 +166,12 @@ export interface MetricTimeseriesOptions {
   metric: MetricKind
   granularity: MetricGranularity
   rangeDays: number
+  // Optional custom window (ISO 8601 datetime or YYYY-MM-DD). When both are
+  // set they override rangeDays on the server.
+  from?: string
+  to?: string
+  // Aggregation applied when re-bucketing; defaults to 'avg' server-side.
+  agg?: MetricAgg
 }
 
 export interface SessionUser {
@@ -667,6 +679,15 @@ function metricsQuery(options: MetricTimeseriesOptions): string {
   const params = new URLSearchParams()
   params.set('metric', options.metric)
   params.set('granularity', options.granularity)
-  params.set('range_days', String(options.rangeDays))
+  if (options.agg) {
+    params.set('agg', options.agg)
+  }
+  if (options.from && options.to) {
+    // Custom window overrides range_days server-side.
+    params.set('from', options.from)
+    params.set('to', options.to)
+  } else {
+    params.set('range_days', String(options.rangeDays))
+  }
   return `?${params.toString()}`
 }

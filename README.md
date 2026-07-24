@@ -1,6 +1,6 @@
 # Uptime Monitor
 
-Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, Redis, NATS JetStream, and TCP ports.
+Uptime Monitor is a single-service uptime platform for monitoring HTTP APIs, MySQL, Redis, NATS JetStream, and TCP ports — plus container and VM level infrastructure metrics (CPU, memory, network) collected from Docker hosts by a lightweight sidecar.
 
 ![Uptime Control Panel](images/screenshot_control_panel.png)
 ![Status Page - Monitored Services](images/screenshot_status_page.png)
@@ -26,6 +26,8 @@ One service that watches your APIs, databases, message bus, and cron jobs — an
 - **Cron monitoring** — schedules and fires your crons over NATS or HTTP, then tracks each run through start/ping/stop reports; runs that never report or go silent past their deadline are marked missed and alerted on.
 - **Retry-aware health transitions** — configurable retries before marking down or back up, so a single blip never pages anyone.
 - **Realtime control plane and status page** — WebSocket pushes every check result and config change to all open tabs; the public status page shows grouped service health, latency trend graphs, and cron run history.
+- **Container & VM metrics** — a lightweight sidecar (one per Docker Swarm node, or any standalone Docker VM) pushes host CPU/memory and per-container CPU, memory, and network usage every 15s. The dashboard keeps 90 days of minute-resolution history with drill-down from VM → service → replica/container, and plots usage against allotted CPU quota and memory limits.
+- **Metric threshold alerts** — rules on CPU% / memory% at node, service, or container scope with sustained-duration windows and cooldowns; firing and resolved notifications go through the same Slack/webhook channels.
 - **Alerts where you live** — rich Slack notifications and pluggable webhooks on up/down transitions and failed/missed cron runs.
 - **Built for operating** — pause/resume single monitors or whole groups, manual "check now", per-monitor history cleanup, Google sign-in with an editor email allowlist, versioned DB migrations, and one-command Docker deploy.
 
@@ -33,6 +35,7 @@ One service that watches your APIs, databases, message bus, and cron jobs — an
 
 - `/` landing page
 - `/monitors` control plane
+- `/metrics` container & VM metrics dashboard (logged-in users)
 - `/status` public status page
 - `/login` Google sign-in page
 
@@ -69,6 +72,10 @@ Use `.env` (see `.env.example`):
 - `SLACK_BOT_TOKEN`
 - `SLACK_CHANNEL_ID`
 - `NOTIFICATION_TARGETS_JSON`
+- `METRICS_INGEST_TOKEN`
+- `METRIC_RETENTION_DAYS`
+- `METRIC_DIMENSION_PRUNE_DAYS`
+- `METRIC_ALERT_POLL_MS`
 
 Access control:
 
@@ -186,6 +193,17 @@ NATS JetStream probe commands (set as the monitor's probe command):
 - `jetstream.info`, `stream.info:<name>` - account/stream health
 - `consumers.lag[:<threshold>]` - lag check across all consumers; `consumer.lag:<stream>:<consumer>[:<threshold>]` for one
 - A consumer is flagged when `num_ack_pending`, `num_pending`, or `num_waiting` exceeds the threshold (default 128). Override per consumer via `"lag_thresholds": { "my_consumer": 1024, "default": 128 }` in Connection JSON, or globally with `NATS_LAG_THRESHOLDS` (Connection JSON wins). Draining consumers (backlog shrinking since the last check) are not flagged.
+
+## Container & VM Metrics
+
+Infrastructure metrics are pushed by the collector in [`sidecar-swarm/`](sidecar-swarm/README.md) — a zero-dependency Bun service deployed as a Docker Swarm `mode: global` stack (one instance per node) or as a plain container on any standalone Docker VM.
+
+- The sidecar reads the Docker socket and the host's `/proc` (read-only mounts) and POSTs one batch per node every 15s to `POST /api/metrics/ingest`, authenticated with a Bearer token (`METRICS_INGEST_TOKEN` — must match on both sides; ingest is disabled until it is set).
+- Samples are rolled up into 1-minute buckets on ingest and retained for `METRIC_RETENTION_DAYS` (default 90). Containers unseen for `METRIC_DIMENSION_PRUNE_DAYS` (default 7) are pruned along with their history.
+- The `/metrics` page shows VM-level charts on top and a services table below, with **By Node** and **By Service** views drilling down to per-replica, minute-level charts. Allotted CPU quota and memory limits are drawn as reference lines so you can see % used vs allotted over time.
+- Alert rules (node / service / container scope, CPU% or memory%, sustained-minutes window, cooldown) are managed from the same page by editors and delivered via the configured Slack/webhook targets.
+
+See [`sidecar-swarm/README.md`](sidecar-swarm/README.md) for the payload contract, sidecar env vars, and deploy instructions.
 
 ## Database Migrations
 

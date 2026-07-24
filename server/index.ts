@@ -69,10 +69,13 @@ import {
   stopCronMonitor,
 } from "./cronMonitorService";
 import {
+  METRIC_AGGS,
   METRIC_GRANULARITIES,
   METRIC_RETENTION_DAYS,
+  type MetricAgg,
   type MetricGranularity,
   type MetricKind,
+  type MetricWindow,
   createAlertRule,
   deleteAlertRule,
   getAlertRule,
@@ -789,6 +792,13 @@ const parseMetricGranularity = (value: unknown): MetricGranularity => {
   return METRIC_GRANULARITIES.has(normalized) ? normalized : "minute";
 };
 
+const parseMetricAgg = (value: unknown): MetricAgg => {
+  const normalized = String(value ?? "avg")
+    .trim()
+    .toLowerCase() as MetricAgg;
+  return METRIC_AGGS.has(normalized) ? normalized : "avg";
+};
+
 const parseMetricRangeDays = (
   value: unknown,
   granularity: MetricGranularity,
@@ -796,6 +806,80 @@ const parseMetricRangeDays = (
   const maxRangeDays = METRIC_MAX_RANGE_DAYS[granularity];
   const parsed = toInteger(value, maxRangeDays) ?? maxRangeDays;
   return Math.max(1, Math.min(parsed, maxRangeDays));
+};
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Accepts ISO 8601 datetimes and bare YYYY-MM-DD dates. Date-only values are
+// anchored in UTC: `from` at start-of-day, `to` at end-of-day.
+const parseMetricDateParam = (
+  raw: string,
+  endOfDay: boolean,
+): Date | null => {
+  const value = raw.trim();
+  if (!value) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return new Date(
+      `${value}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`,
+    );
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+type MetricWindowResult =
+  | { ok: true; window: MetricWindow; rangeDays: number }
+  | { ok: false; error: string };
+
+// Resolves the effective [from, to) window for a timeseries request. When
+// from/to are supplied they override range_days; otherwise the legacy
+// range_days path is used ([now - range_days, now)), preserving prior behavior.
+const resolveMetricWindow = (
+  query: Request["query"],
+  granularity: MetricGranularity,
+): MetricWindowResult => {
+  const fromRaw = query.from;
+  const toRaw = query.to;
+  const hasCustom = fromRaw != null || toRaw != null;
+
+  if (!hasCustom) {
+    const rangeDays = parseMetricRangeDays(query.range_days, granularity);
+    const to = new Date();
+    const from = new Date(to.getTime() - rangeDays * MS_PER_DAY);
+    return { ok: true, window: { from, to }, rangeDays };
+  }
+
+  if (fromRaw == null || toRaw == null) {
+    return {
+      ok: false,
+      error: "Both 'from' and 'to' are required for a custom range",
+    };
+  }
+
+  const from = parseMetricDateParam(String(fromRaw), false);
+  const to = parseMetricDateParam(String(toRaw), true);
+  if (!from) return { ok: false, error: "Invalid 'from' value" };
+  if (!to) return { ok: false, error: "Invalid 'to' value" };
+
+  // `to` is clamped to now; `from` older than retention is allowed (it just
+  // returns whatever samples still exist).
+  const now = new Date();
+  const clampedTo = to.getTime() > now.getTime() ? now : to;
+
+  if (from.getTime() >= clampedTo.getTime()) {
+    return { ok: false, error: "'from' must be earlier than 'to'" };
+  }
+
+  const maxRangeDays = METRIC_MAX_RANGE_DAYS[granularity];
+  const spanDays = (clampedTo.getTime() - from.getTime()) / MS_PER_DAY;
+  if (spanDays > maxRangeDays) {
+    return {
+      ok: false,
+      error: `Range too large for '${granularity}' granularity (max ${maxRangeDays} days)`,
+    };
+  }
+
+  return { ok: true, window: { from, to: clampedTo }, rangeDays: spanDays };
 };
 
 const getMappedEndpointById = async (
@@ -2411,13 +2495,18 @@ app.get(
     const nodeKey = String(req.params.nodeKey ?? "").trim();
     const metric = parseMetricKind(req.query.metric);
     const granularity = parseMetricGranularity(req.query.granularity);
-    const rangeDays = parseMetricRangeDays(req.query.range_days, granularity);
+    const agg = parseMetricAgg(req.query.agg);
+    const resolved = resolveMetricWindow(req.query, granularity);
+    if (!resolved.ok) {
+      return res.status(400).json({ error: resolved.error });
+    }
 
     const result = await getNodeTimeseries(
       nodeKey,
       metric,
       granularity,
-      rangeDays,
+      resolved.window,
+      agg,
     );
     if (!result) {
       return res.status(404).json({ error: "Node not found" });
@@ -2426,7 +2515,10 @@ app.get(
     return res.json({
       metric,
       granularity,
-      range_days: rangeDays,
+      agg,
+      range_days: resolved.rangeDays,
+      from: resolved.window.from.toISOString(),
+      to: resolved.window.to.toISOString(),
       retention_days: METRIC_RETENTION_DAYS,
       node: result.node,
       points: result.points,
@@ -2441,13 +2533,18 @@ app.get(
     const name = String(req.params.name ?? "").trim();
     const metric = parseMetricKind(req.query.metric);
     const granularity = parseMetricGranularity(req.query.granularity);
-    const rangeDays = parseMetricRangeDays(req.query.range_days, granularity);
+    const agg = parseMetricAgg(req.query.agg);
+    const resolved = resolveMetricWindow(req.query, granularity);
+    if (!resolved.ok) {
+      return res.status(400).json({ error: resolved.error });
+    }
 
     const result = await getServiceTimeseries(
       name,
       metric,
       granularity,
-      rangeDays,
+      resolved.window,
+      agg,
     );
     if (!result) {
       return res.status(404).json({ error: "Service not found" });
@@ -2456,7 +2553,10 @@ app.get(
     return res.json({
       metric,
       granularity,
-      range_days: rangeDays,
+      agg,
+      range_days: resolved.rangeDays,
+      from: resolved.window.from.toISOString(),
+      to: resolved.window.to.toISOString(),
       retention_days: METRIC_RETENTION_DAYS,
       service: result.service,
       points: result.points,
@@ -2471,13 +2571,18 @@ app.get(
     const key = String(req.params.key ?? "").trim();
     const metric = parseMetricKind(req.query.metric);
     const granularity = parseMetricGranularity(req.query.granularity);
-    const rangeDays = parseMetricRangeDays(req.query.range_days, granularity);
+    const agg = parseMetricAgg(req.query.agg);
+    const resolved = resolveMetricWindow(req.query, granularity);
+    if (!resolved.ok) {
+      return res.status(400).json({ error: resolved.error });
+    }
 
     const result = await getContainerTimeseries(
       key,
       metric,
       granularity,
-      rangeDays,
+      resolved.window,
+      agg,
     );
     if (!result) {
       return res.status(404).json({ error: "Container not found" });
@@ -2486,7 +2591,10 @@ app.get(
     return res.json({
       metric,
       granularity,
-      range_days: rangeDays,
+      agg,
+      range_days: resolved.rangeDays,
+      from: resolved.window.from.toISOString(),
+      to: resolved.window.to.toISOString(),
       retention_days: METRIC_RETENTION_DAYS,
       container: result.container,
       points: result.points,
