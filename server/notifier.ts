@@ -31,6 +31,19 @@ export type CronRunNotificationEvent = {
     reason: string | null;
 };
 
+export type MetricAlertNotificationEvent = {
+    ruleId: number;
+    scope: "node" | "service" | "container";
+    target: string;
+    targetLabel: string;
+    metric: "cpu" | "memory";
+    operator: string;
+    value: number | null;
+    threshold: number;
+    sustainedMinutes: number;
+    state: "FIRING" | "RESOLVED";
+};
+
 type JsonPayload = Record<string, unknown>;
 
 const isValidEvent = (status: unknown): boolean =>
@@ -364,6 +377,161 @@ export async function notifyCronRun(
                     error instanceof Error ? error.message : String(error);
                 console.error(
                     `[notify] target=${target.name || target.type} cron=${event.cron} failed: ${message}`,
+                );
+            }
+        }),
+    );
+}
+
+const formatMetricValue = (
+    metric: "cpu" | "memory",
+    value: number | null,
+): string => {
+    if (value == null) return "n/a";
+    return `${Number(value).toFixed(1)}%`;
+};
+
+const buildMetricSlackPayload = (
+    event: MetricAlertNotificationEvent,
+): JsonPayload => {
+    const isFiring = event.state === "FIRING";
+    const title = isFiring ? "Metric Alert FIRING" : "Metric Alert RESOLVED";
+    const color = isFiring ? "#dc2626" : "#16a34a";
+    const environment = String(config.nodeEnv ?? "unknown");
+    const metricLabel = event.metric === "cpu" ? "CPU" : "Memory";
+
+    return {
+        text: `[${environment}] ${title}: ${event.scope} ${event.targetLabel} ${metricLabel}`,
+        attachments: [
+            {
+                color,
+                title: `[${environment}] ${title}: ${event.targetLabel}`,
+                fields: [
+                    {
+                        title: "State",
+                        value: event.state,
+                        short: true,
+                    },
+                    {
+                        title: "Scope",
+                        value: String(event.scope).toUpperCase(),
+                        short: true,
+                    },
+                    {
+                        title: "Target",
+                        value: event.targetLabel,
+                        short: true,
+                    },
+                    {
+                        title: "Metric",
+                        value: metricLabel,
+                        short: true,
+                    },
+                    {
+                        title: "Value",
+                        value: formatMetricValue(event.metric, event.value),
+                        short: true,
+                    },
+                    {
+                        title: "Threshold",
+                        value: `${event.operator} ${Number(event.threshold).toFixed(1)}%`,
+                        short: true,
+                    },
+                    {
+                        title: "Sustained",
+                        value: `${event.sustainedMinutes} min`,
+                        short: true,
+                    },
+                ],
+            },
+        ],
+    };
+};
+
+const buildMetricWebhookPayload = (
+    event: MetricAlertNotificationEvent,
+): JsonPayload => {
+    return {
+        source: "uptime-monitor",
+        eventType: "metric.alert",
+        state: event.state,
+        rule: {
+            id: event.ruleId,
+            scope: event.scope,
+            metric: event.metric,
+            operator: event.operator,
+            threshold: event.threshold,
+            sustainedMinutes: event.sustainedMinutes,
+        },
+        target: {
+            key: event.target,
+            label: event.targetLabel,
+        },
+        value: event.value,
+    };
+};
+
+const notifyMetricTarget = async (
+    target: NotificationTarget,
+    event: MetricAlertNotificationEvent,
+): Promise<void> => {
+    if (target.type === "slack") {
+        const response = await fetch(SLACK_POST_MESSAGE_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${target.token}`,
+            },
+            body: JSON.stringify({
+                channel: target.channel,
+                ...buildMetricSlackPayload(event),
+            }),
+        });
+
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload?.ok) {
+            const reason = payload?.error ?? "unknown_error";
+            throw new Error(
+                `Slack chat.postMessage failed (${response.status}): ${reason}`,
+            );
+        }
+        return;
+    }
+
+    await postJson(target.url, buildMetricWebhookPayload(event), target.headers);
+};
+
+export async function notifyMetricAlert(
+    event: MetricAlertNotificationEvent,
+): Promise<void> {
+    console.log(
+        `[notify] metric alert rule=${event.ruleId} scope=${event.scope} target=${event.target} state=${event.state}`,
+    );
+    if (!config.notifications.enabled) return;
+    if (
+        !Array.isArray(config.notifications.targets) ||
+        !config.notifications.targets.length
+    )
+        return;
+
+    // FIRING maps to 'down' and RESOLVED to 'up' for the per-target event filter.
+    const mappedEvent = event.state === "FIRING" ? "down" : "up";
+
+    await Promise.all(
+        config.notifications.targets.map(async (target) => {
+            if (
+                Array.isArray(target.events) &&
+                !target.events.includes(mappedEvent)
+            )
+                return;
+
+            try {
+                await notifyMetricTarget(target, event);
+            } catch (error) {
+                const message =
+                    error instanceof Error ? error.message : String(error);
+                console.error(
+                    `[notify] target=${target.name || target.type} metric-alert rule=${event.ruleId} failed: ${message}`,
                 );
             }
         }),

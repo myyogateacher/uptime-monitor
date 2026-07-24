@@ -1,0 +1,53 @@
+# Docker Swarm stack for the uptime-monitor metrics sidecar.
+#
+# Deploys one collector per node (global mode). Each collector reads the local
+# Docker socket + host /proc and pushes one batch per interval to the server.
+#
+#   docker secret create metrics_ingest_token ./token.txt
+#   docker stack deploy -c deploy/uptime-metrics-stack.yml uptime-metrics
+#
+# Set IMAGE to your registry-pushed image (built from the Dockerfile here).
+
+version: "3.8"
+
+services:
+  metrics-sidecar:
+    image: ${IMAGE:-registry.example.com/uptime-sidecar-swarm:latest}
+    deploy:
+      mode: global
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.02"
+          memory: 32M
+    environment:
+      METRICS_INGEST_URL: ${METRICS_INGEST_URL:-https://uptime.example.com/api/metrics/ingest}
+      METRICS_INGEST_TOKEN_FILE: /run/secrets/metrics_ingest_token
+      METRICS_INTERVAL_MS: "15000"
+      HOST_PROC: /host/proc
+      DOCKER_SOCKET: /var/run/docker.sock
+      STATS_CONCURRENCY: "8"
+      LOG_LEVEL: info
+      TZ: UTC
+    secrets:
+      - metrics_ingest_token
+    volumes:
+      # Read-only: the daemon socket (container stats) and host /proc (VM metrics).
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+
+secrets:
+  # Created out-of-band: `docker secret create metrics_ingest_token ./token.txt`
+  metrics_ingest_token:
+    external: true

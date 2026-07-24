@@ -1,6 +1,8 @@
 import {
+    Fragment,
     useCallback,
     useEffect,
+    useId,
     useMemo,
     useRef,
     useState,
@@ -14,6 +16,8 @@ import {
     FaAngleDoubleLeft,
     FaAngleDoubleRight,
     FaBan,
+    FaBell,
+    FaChartArea,
     FaChevronDown,
     FaChevronRight,
     FaClipboardList,
@@ -25,6 +29,8 @@ import {
 } from "react-icons/fa";
 import {
     monitoringService,
+    type AlertOperator,
+    type AlertScope,
     type AuditLogEntry,
     type CronJob,
     type CronRun,
@@ -33,6 +39,16 @@ import {
     type EndpointCheckRun,
     type EndpointStatsBucket,
     type ManagedUser,
+    type MetricAlertRule,
+    type MetricAlertRuleInput,
+    type MetricContainer,
+    type MetricGranularity,
+    type MetricKind,
+    type MetricNode,
+    type MetricService,
+    type MetricsOverview,
+    type MetricTimeseriesPoint,
+    type MetricTimeseriesResponse,
     type MonitorEndpoint,
     type MonitorGroup,
     type MonitorStatus,
@@ -316,6 +332,38 @@ function formatFriendlyDateTime(
         dateStyle: "medium",
         timeStyle: "short",
     }).format(date);
+}
+
+// Human-readable byte size (binary units). Returns an em-dash for nullish input.
+function formatBytes(bytes: number | null | undefined): string {
+    if (bytes == null || Number.isNaN(bytes)) return "—";
+    if (bytes === 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const exponent = Math.min(
+        Math.floor(Math.log(Math.abs(bytes)) / Math.log(1024)),
+        units.length - 1,
+    );
+    const value = bytes / 1024 ** exponent;
+    const rounded = value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+    return `${rounded} ${units[exponent]}`;
+}
+
+function formatBytesRate(bytesPerSec: number | null | undefined): string {
+    if (bytesPerSec == null || Number.isNaN(bytesPerSec)) return "—";
+    return `${formatBytes(bytesPerSec)}/s`;
+}
+
+// CPU is reported with 100 == one full core (docker-stats semantics). Present it
+// as a cores-equivalent number for totals that can exceed a single core.
+function formatCores(cpuPct: number | null | undefined): string {
+    if (cpuPct == null || Number.isNaN(cpuPct)) return "—";
+    const cores = cpuPct / 100;
+    return `${cores >= 10 ? Math.round(cores) : Math.round(cores * 100) / 100} cores`;
+}
+
+function formatPct(pct: number | null | undefined): string {
+    if (pct == null || Number.isNaN(pct)) return "—";
+    return `${Math.round(pct * 10) / 10}%`;
 }
 
 function renderCronRunBadge(status: string | null | undefined): string {
@@ -760,6 +808,1507 @@ function LatencySparkline({
                 <span>{max}ms max</span>
             </div>
         </div>
+    );
+}
+
+// ===========================================================================
+// Infrastructure metrics page (Part C). Self-contained: MetricsPage owns its
+// own data loading and 30s polling; child charts refetch when the range or the
+// poll tick changes.
+// ===========================================================================
+
+interface MetricRangeOption {
+    key: string;
+    label: string;
+    granularity: MetricGranularity;
+    // range_days may be fractional for sub-day windows (server computes a
+    // now - range_days*86400s cutoff).
+    rangeDays: number;
+}
+
+const METRIC_RANGE_OPTIONS: MetricRangeOption[] = [
+    { key: "1h", label: "1h", granularity: "minute", rangeDays: 1 / 24 },
+    { key: "6h", label: "6h", granularity: "minute", rangeDays: 6 / 24 },
+    { key: "24h", label: "24h", granularity: "minute", rangeDays: 1 },
+    { key: "7d", label: "7d", granularity: "hour", rangeDays: 7 },
+    { key: "30d", label: "30d", granularity: "day", rangeDays: 30 },
+    { key: "90d", label: "90d", granularity: "day", rangeDays: 90 },
+];
+
+const ALERT_SCOPE_OPTIONS: Array<{ value: AlertScope; label: string }> = [
+    { value: "node", label: "Node" },
+    { value: "service", label: "Service" },
+    { value: "container", label: "Container" },
+];
+
+const ALERT_METRIC_OPTIONS: Array<{ value: MetricKind; label: string }> = [
+    { value: "cpu", label: "CPU %" },
+    { value: "memory", label: "Memory %" },
+];
+
+const ALERT_OPERATOR_OPTIONS: Array<{ value: AlertOperator; label: string }> = [
+    { value: ">", label: ">" },
+    { value: ">=", label: "≥" },
+    { value: "<", label: "<" },
+    { value: "<=", label: "≤" },
+];
+
+interface MetricChartHover {
+    x: number;
+    y: number;
+    valueLabel: string;
+    value2Label?: string;
+    timeLabel: string;
+}
+
+// Reusable inline-SVG chart generalized from LatencySparkline: line + area
+// fill, an optional dashed horizontal reference line (allotted quota/limit),
+// an optional second series (e.g. net rx/tx), and a hover tooltip. No chart
+// library. Accessors keep it agnostic to the point shape.
+function MetricChart<P>({
+    points,
+    getValue,
+    getTime,
+    getValue2,
+    color = "#0f766e",
+    color2 = "#0284c7",
+    seriesLabel,
+    series2Label,
+    referenceValue = null,
+    referenceLabel,
+    valueFormatter = (value: number) => `${Math.round(value)}`,
+    height = 96,
+    compact = false,
+    emptyLabel = "No samples yet.",
+}: {
+    points: P[];
+    getValue: (point: P) => number;
+    getTime: (point: P) => string | null | undefined;
+    getValue2?: (point: P) => number;
+    color?: string;
+    color2?: string;
+    seriesLabel?: string;
+    series2Label?: string;
+    referenceValue?: number | null;
+    referenceLabel?: string;
+    valueFormatter?: (value: number) => string;
+    height?: number;
+    compact?: boolean;
+    emptyLabel?: string;
+}) {
+    const gradientId = useId();
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const [hovered, setHovered] = useState<MetricChartHover | null>(null);
+
+    const series = useMemo(() => {
+        return (points ?? [])
+            .map((point) => ({
+                value: Number(getValue(point)) || 0,
+                value2: getValue2 ? Number(getValue2(point)) || 0 : null,
+                time: getTime(point),
+            }))
+            .sort((left, right) => toTimeMs(left.time) - toTimeMs(right.time));
+    }, [points, getValue, getValue2, getTime]);
+
+    if (!series.length) {
+        return <p className="text-xs text-slate-500">{emptyLabel}</p>;
+    }
+
+    const width = 320;
+    const padding = 6;
+    const yAxisWidth = compact ? 0 : 46;
+    const chartLeft = yAxisWidth + padding;
+    const chartRight = width - padding;
+
+    const hasRef =
+        referenceValue != null &&
+        Number.isFinite(referenceValue) &&
+        (referenceValue as number) > 0;
+    const allValues = series.flatMap((point) =>
+        point.value2 != null ? [point.value, point.value2] : [point.value],
+    );
+    const maxCandidate = Math.max(
+        ...allValues,
+        hasRef ? (referenceValue as number) : 0,
+    );
+    const max = maxCandidate > 0 ? maxCandidate * 1.08 : 1;
+    const min = 0;
+    const range = Math.max(max - min, 1e-9);
+    const xStep =
+        series.length > 1 ? (chartRight - chartLeft) / (series.length - 1) : 0;
+
+    const yFor = (value: number) =>
+        height - padding - ((value - min) / range) * (height - padding * 2);
+
+    const tickCount = 4;
+    const yTicks = compact
+        ? []
+        : Array.from({ length: tickCount }, (_, index) => {
+              const ratio = index / (tickCount - 1);
+              const value = max - ratio * (max - min);
+              return { value, y: padding + ratio * (height - padding * 2) };
+          });
+
+    const plotted = series.map((point, index) => ({
+        ...point,
+        x: chartLeft + xStep * index,
+        y: yFor(point.value),
+        y2: point.value2 != null ? yFor(point.value2) : null,
+    }));
+
+    const line = plotted.map((point) => `${point.x},${point.y}`).join(" ");
+    const line2 =
+        getValue2 != null
+            ? plotted
+                  .map((point) => `${point.x},${point.y2 ?? point.y}`)
+                  .join(" ")
+            : "";
+    const area = `${line} ${chartRight},${height - padding} ${chartLeft},${height - padding}`;
+    const refY = hasRef ? yFor(referenceValue as number) : 0;
+
+    const handleHover = (
+        event: ReactMouseEvent<SVGCircleElement>,
+        point: (typeof plotted)[number],
+    ) => {
+        if (!containerRef.current) return;
+        const containerRect = containerRef.current.getBoundingClientRect();
+        const targetRect = event.currentTarget.getBoundingClientRect();
+        setHovered({
+            x: targetRect.left - containerRect.left + targetRect.width / 2,
+            y: targetRect.top - containerRect.top,
+            valueLabel: `${seriesLabel ? `${seriesLabel}: ` : ""}${valueFormatter(point.value)}`,
+            value2Label:
+                point.value2 != null
+                    ? `${series2Label ? `${series2Label}: ` : ""}${valueFormatter(point.value2)}`
+                    : undefined,
+            timeLabel: formatFriendlyDateTime(point.time),
+        });
+    };
+
+    return (
+        <div ref={containerRef} className="relative">
+            <svg
+                viewBox={`0 0 ${width} ${height}`}
+                className="w-full overflow-visible"
+                style={{ height }}
+            >
+                <defs>
+                    <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={color} stopOpacity="0.32" />
+                        <stop
+                            offset="100%"
+                            stopColor={color}
+                            stopOpacity="0.02"
+                        />
+                    </linearGradient>
+                </defs>
+                {yTicks.map((tick) => (
+                    <g key={tick.y}>
+                        <line
+                            x1={chartLeft}
+                            y1={tick.y}
+                            x2={chartRight}
+                            y2={tick.y}
+                            stroke="#cbd5e1"
+                            strokeOpacity="0.6"
+                            strokeWidth="1"
+                        />
+                        <text
+                            x={yAxisWidth - 3}
+                            y={tick.y + 3}
+                            textAnchor="end"
+                            fontSize="9"
+                            fill="#64748b"
+                        >
+                            {valueFormatter(tick.value)}
+                        </text>
+                    </g>
+                ))}
+                {!compact && (
+                    <line
+                        x1={chartLeft}
+                        y1={padding}
+                        x2={chartLeft}
+                        y2={height - padding}
+                        stroke="#94a3b8"
+                        strokeWidth="1"
+                    />
+                )}
+                <polygon points={area} fill={`url(#${gradientId})`} />
+                <polyline
+                    points={line}
+                    fill="none"
+                    stroke={color}
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                />
+                {line2 && (
+                    <polyline
+                        points={line2}
+                        fill="none"
+                        stroke={color2}
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                    />
+                )}
+                {hasRef && (
+                    <>
+                        <line
+                            x1={chartLeft}
+                            y1={refY}
+                            x2={chartRight}
+                            y2={refY}
+                            stroke="#f43f5e"
+                            strokeWidth="1.25"
+                            strokeDasharray="5 4"
+                        />
+                        {!compact && referenceLabel && (
+                            <text
+                                x={chartRight}
+                                y={Math.max(refY - 3, padding + 8)}
+                                textAnchor="end"
+                                fontSize="9"
+                                fill="#e11d48"
+                            >
+                                {referenceLabel}
+                            </text>
+                        )}
+                    </>
+                )}
+                {!compact &&
+                    plotted.map((point, index) => (
+                        <circle
+                            key={`${point.time ?? "t"}-${index}`}
+                            cx={point.x}
+                            cy={point.y}
+                            r="3"
+                            fill={color}
+                            className="cursor-pointer"
+                            onMouseEnter={(event) => handleHover(event, point)}
+                            onMouseLeave={() => setHovered(null)}
+                        />
+                    ))}
+            </svg>
+            {hovered && (
+                <div
+                    className="pointer-events-none absolute z-20 min-w-40 rounded-lg border border-slate-200/90 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow-lg backdrop-blur"
+                    style={{
+                        left: `${hovered.x}px`,
+                        top: `${hovered.y - 10}px`,
+                        transform: "translate(-50%, -100%)",
+                    }}
+                >
+                    <p className="font-semibold text-slate-900">
+                        {hovered.valueLabel}
+                    </p>
+                    {hovered.value2Label && (
+                        <p className="mt-0.5 font-semibold text-sky-700">
+                            {hovered.value2Label}
+                        </p>
+                    )}
+                    <p className="mt-0.5 text-slate-600">{hovered.timeLabel}</p>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function ChartLabel({ children }: { children: ReactNode }) {
+    return (
+        <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+            {children}
+        </p>
+    );
+}
+
+// Per-VM card: current CPU/mem readouts plus CPU% and memory timeseries charts
+// (memory carries a dashed mem_total reference line). Clicking filters the
+// services table below to this node.
+function NodeCard({
+    node,
+    range,
+    refreshKey,
+    selected,
+    onSelect,
+}: {
+    node: MetricNode;
+    range: MetricRangeOption;
+    refreshKey: number;
+    selected: boolean;
+    onSelect: () => void;
+}) {
+    const [cpu, setCpu] = useState<MetricTimeseriesResponse | null>(null);
+    const [mem, setMem] = useState<MetricTimeseriesResponse | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        const load = async () => {
+            try {
+                const [cpuRes, memRes] = await Promise.all([
+                    monitoringService.getNodeTimeseries(node.node_key, {
+                        metric: "cpu",
+                        granularity: range.granularity,
+                        rangeDays: range.rangeDays,
+                    }),
+                    monitoringService.getNodeTimeseries(node.node_key, {
+                        metric: "memory",
+                        granularity: range.granularity,
+                        rangeDays: range.rangeDays,
+                    }),
+                ]);
+                if (cancelled) return;
+                setCpu(cpuRes);
+                setMem(memRes);
+            } catch {
+                if (!cancelled) {
+                    setCpu(null);
+                    setMem(null);
+                }
+            }
+        };
+        void load();
+        return () => {
+            cancelled = true;
+        };
+    }, [node.node_key, range.granularity, range.rangeDays, refreshKey]);
+
+    const memTotalRef =
+        mem?.node?.mem_total_bytes ?? node.mem_total_bytes ?? 0;
+
+    return (
+        <button
+            type="button"
+            onClick={onSelect}
+            className={`glass-card flex flex-col gap-3 rounded-2xl p-5 text-left transition ${
+                selected
+                    ? "ring-2 ring-sky-400"
+                    : "hover:ring-1 hover:ring-slate-300"
+            }`}
+        >
+            <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-slate-800">
+                        {node.hostname || node.node_key}
+                    </p>
+                    <p className="truncate text-xs text-slate-500">
+                        {node.cpu_cores} cores · {node.container_count} containers
+                    </p>
+                </div>
+                <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500">
+                    {formatRelativeTime(node.last_seen)}
+                </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-xs">
+                <div className="rounded-lg border border-white/60 bg-white/50 p-2">
+                    <p className="text-slate-500">CPU</p>
+                    <p className="text-base font-semibold text-slate-800">
+                        {formatPct(node.cpu_pct)}
+                    </p>
+                </div>
+                <div className="rounded-lg border border-white/60 bg-white/50 p-2">
+                    <p className="text-slate-500">Memory</p>
+                    <p className="text-base font-semibold text-slate-800">
+                        {formatPct(node.mem_pct)}
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                        {formatBytes(node.mem_used_bytes)} /{" "}
+                        {formatBytes(node.mem_total_bytes)}
+                    </p>
+                </div>
+            </div>
+
+            <div>
+                <ChartLabel>CPU %</ChartLabel>
+                <MetricChart
+                    points={cpu?.points ?? []}
+                    getValue={(point) => Number(point.avg ?? 0)}
+                    getTime={(point) => point.bucket_start}
+                    color="#0284c7"
+                    seriesLabel="CPU"
+                    valueFormatter={(value) => `${Math.round(value)}%`}
+                    height={80}
+                />
+            </div>
+            <div>
+                <ChartLabel>Memory</ChartLabel>
+                <MetricChart
+                    points={mem?.points ?? []}
+                    getValue={(point) => Number(point.avg_bytes ?? 0)}
+                    getTime={(point) => point.bucket_start}
+                    color="#0f766e"
+                    seriesLabel="Mem"
+                    referenceValue={memTotalRef}
+                    referenceLabel="total"
+                    valueFormatter={(value) => formatBytes(value)}
+                    height={80}
+                />
+            </div>
+        </button>
+    );
+}
+
+// A compact CPU sparkline for a services-table row.
+function ServiceSparkline({
+    serviceName,
+    range,
+    refreshKey,
+}: {
+    serviceName: string;
+    range: MetricRangeOption;
+    refreshKey: number;
+}) {
+    const [data, setData] = useState<MetricTimeseriesResponse | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        monitoringService
+            .getServiceTimeseries(serviceName, {
+                metric: "cpu",
+                granularity: range.granularity,
+                rangeDays: range.rangeDays,
+            })
+            .then((res) => {
+                if (!cancelled) setData(res);
+            })
+            .catch(() => {
+                if (!cancelled) setData(null);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [serviceName, range.granularity, range.rangeDays, refreshKey]);
+
+    return (
+        <div className="w-40">
+            <MetricChart
+                points={data?.points ?? []}
+                getValue={(point) => Number(point.avg ?? 0)}
+                getTime={(point) => point.bucket_start}
+                color="#0284c7"
+                seriesLabel="CPU"
+                valueFormatter={(value) => `${Math.round(value)}%`}
+                height={36}
+                compact
+                emptyLabel="—"
+            />
+        </div>
+    );
+}
+
+// Single-container drill-down: minute-level CPU (dashed quota line), memory
+// (dashed limit line), and net rx/tx rate charts.
+function ContainerDetail({
+    container,
+    range,
+    refreshKey,
+}: {
+    container: MetricContainer;
+    range: MetricRangeOption;
+    refreshKey: number;
+}) {
+    const [cpu, setCpu] = useState<MetricTimeseriesResponse | null>(null);
+    const [mem, setMem] = useState<MetricTimeseriesResponse | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        const load = async () => {
+            try {
+                const [cpuRes, memRes] = await Promise.all([
+                    monitoringService.getContainerTimeseries(
+                        container.container_key,
+                        {
+                            metric: "cpu",
+                            granularity: range.granularity,
+                            rangeDays: range.rangeDays,
+                        },
+                    ),
+                    monitoringService.getContainerTimeseries(
+                        container.container_key,
+                        {
+                            metric: "memory",
+                            granularity: range.granularity,
+                            rangeDays: range.rangeDays,
+                        },
+                    ),
+                ]);
+                if (cancelled) return;
+                setCpu(cpuRes);
+                setMem(memRes);
+            } catch {
+                if (!cancelled) {
+                    setCpu(null);
+                    setMem(null);
+                }
+            }
+        };
+        void load();
+        return () => {
+            cancelled = true;
+        };
+    }, [container.container_key, range.granularity, range.rangeDays, refreshKey]);
+
+    const cpuQuotaCores =
+        cpu?.container?.cpu_quota_cores ?? container.cpu_quota_cores ?? null;
+    // CPU values use docker-stats units (100 == one core); the quota reference
+    // line is therefore cores * 100.
+    const cpuQuotaRef =
+        cpuQuotaCores != null && cpuQuotaCores > 0 ? cpuQuotaCores * 100 : null;
+    const memLimit =
+        mem?.container?.mem_limit_bytes ?? container.mem_limit_bytes ?? null;
+
+    const latestCpu = cpu?.points?.[cpu.points.length - 1]?.avg ?? null;
+    const latestMem =
+        mem?.points?.[mem.points.length - 1]?.avg_bytes ??
+        container.mem_used_bytes;
+
+    const cpuUsedPct =
+        cpuQuotaRef && latestCpu != null
+            ? (Number(latestCpu) / cpuQuotaRef) * 100
+            : null;
+    const memUsedPct =
+        memLimit && memLimit > 0 && latestMem != null
+            ? (Number(latestMem) / memLimit) * 100
+            : null;
+
+    return (
+        <div className="mt-3 grid gap-4 rounded-xl border border-white/60 bg-white/40 p-4 md:grid-cols-3">
+            <div>
+                <ChartLabel>
+                    CPU (cores){" "}
+                    {cpuQuotaCores != null && (
+                        <span className="text-rose-500">
+                            quota {cpuQuotaCores}
+                        </span>
+                    )}
+                </ChartLabel>
+                <MetricChart
+                    points={cpu?.points ?? []}
+                    getValue={(point) => Number(point.avg ?? 0) / 100}
+                    getTime={(point) => point.bucket_start}
+                    color="#0284c7"
+                    seriesLabel="CPU"
+                    referenceValue={cpuQuotaCores ?? null}
+                    referenceLabel="quota"
+                    valueFormatter={(value) => `${Math.round(value * 100) / 100}`}
+                    height={96}
+                />
+                {cpuUsedPct != null && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                        {formatPct(cpuUsedPct)} of quota
+                    </p>
+                )}
+            </div>
+            <div>
+                <ChartLabel>
+                    Memory{" "}
+                    {memLimit != null && (
+                        <span className="text-rose-500">
+                            limit {formatBytes(memLimit)}
+                        </span>
+                    )}
+                </ChartLabel>
+                <MetricChart
+                    points={mem?.points ?? []}
+                    getValue={(point) => Number(point.avg_bytes ?? 0)}
+                    getTime={(point) => point.bucket_start}
+                    color="#0f766e"
+                    seriesLabel="Mem"
+                    referenceValue={memLimit}
+                    referenceLabel="limit"
+                    valueFormatter={(value) => formatBytes(value)}
+                    height={96}
+                />
+                {memUsedPct != null && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                        {formatPct(memUsedPct)} of limit
+                    </p>
+                )}
+            </div>
+            <div>
+                <ChartLabel>
+                    Network{" "}
+                    <span className="text-teal-600">rx</span>
+                    {" / "}
+                    <span className="text-sky-600">tx</span>
+                </ChartLabel>
+                <NetRateChart points={cpu?.points ?? []} />
+            </div>
+        </div>
+    );
+}
+
+// Net rx/tx rates share the container's timeseries points (net_rx_bps /
+// net_tx_bps). Rendered via the same MetricChart with a second series.
+function NetRateChart({ points }: { points: MetricTimeseriesPoint[] }) {
+    const hasNet = (points ?? []).some(
+        (point) => point.net_rx_bps != null || point.net_tx_bps != null,
+    );
+    if (!hasNet) {
+        return <p className="text-xs text-slate-500">No network samples.</p>;
+    }
+    return (
+        <MetricChart
+            points={points}
+            getValue={(point) => Number(point.net_rx_bps ?? 0)}
+            getValue2={(point) => Number(point.net_tx_bps ?? 0)}
+            getTime={(point) => point.bucket_start}
+            color="#14b8a6"
+            color2="#0284c7"
+            seriesLabel="rx"
+            series2Label="tx"
+            valueFormatter={(value) => formatBytesRate(value)}
+            height={96}
+        />
+    );
+}
+
+// Expandable services table used by both tabs. Row → per-replica rows;
+// replica → ContainerDetail.
+function ServicesTable({
+    services,
+    range,
+    refreshKey,
+    emptyLabel,
+}: {
+    services: MetricService[];
+    range: MetricRangeOption;
+    refreshKey: number;
+    emptyLabel: string;
+}) {
+    const [expanded, setExpanded] = useState<string | null>(null);
+    const [containers, setContainers] = useState<
+        Record<string, MetricContainer[]>
+    >({});
+    const [selectedContainer, setSelectedContainer] = useState<string | null>(
+        null,
+    );
+
+    const toggleService = useCallback(
+        async (serviceName: string) => {
+            setSelectedContainer(null);
+            if (expanded === serviceName) {
+                setExpanded(null);
+                return;
+            }
+            setExpanded(serviceName);
+            if (!containers[serviceName]) {
+                try {
+                    const rows =
+                        await monitoringService.getServiceContainers(
+                            serviceName,
+                        );
+                    setContainers((prev) => ({
+                        ...prev,
+                        [serviceName]: Array.isArray(rows) ? rows : [],
+                    }));
+                } catch {
+                    setContainers((prev) => ({ ...prev, [serviceName]: [] }));
+                }
+            }
+        },
+        [expanded, containers],
+    );
+
+    if (!services.length) {
+        return (
+            <p className="rounded-xl border border-white/60 bg-white/40 px-4 py-6 text-center text-sm text-slate-500">
+                {emptyLabel}
+            </p>
+        );
+    }
+
+    return (
+        <div className="overflow-x-auto rounded-xl border border-white/60 bg-white/40">
+            <table className="min-w-full text-left text-sm">
+                <thead>
+                    <tr className="border-b border-white/60 text-xs uppercase tracking-wide text-slate-500">
+                        <th className="px-4 py-3">Service</th>
+                        <th className="px-4 py-3">Replicas</th>
+                        <th className="px-4 py-3">Nodes</th>
+                        <th className="px-4 py-3">CPU</th>
+                        <th className="px-4 py-3">Memory</th>
+                        <th className="px-4 py-3">CPU trend</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {services.map((service) => {
+                        const isOpen = expanded === service.service_name;
+                        const quotaPct =
+                            service.total_quota_cores &&
+                            service.total_quota_cores > 0
+                                ? (service.cpu_pct_total ?? 0) /
+                                  service.total_quota_cores
+                                : null;
+                        const memPct =
+                            service.mem_used_bytes != null &&
+                            service.total_mem_limit_bytes &&
+                            service.total_mem_limit_bytes > 0
+                                ? (service.mem_used_bytes /
+                                      service.total_mem_limit_bytes) *
+                                  100
+                                : null;
+                        const rows = containers[service.service_name] ?? [];
+                        return (
+                            <Fragment key={service.service_name}>
+                                <tr
+                                    onClick={() =>
+                                        void toggleService(
+                                            service.service_name,
+                                        )
+                                    }
+                                    className="cursor-pointer border-b border-white/40 transition hover:bg-white/50"
+                                >
+                                    <td className="px-4 py-3 font-medium text-slate-800">
+                                        <span className="inline-flex items-center gap-2">
+                                            {isOpen ? (
+                                                <FaChevronDown className="text-xs text-slate-400" />
+                                            ) : (
+                                                <FaChevronRight className="text-xs text-slate-400" />
+                                            )}
+                                            {service.service_name}
+                                        </span>
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                        {service.container_count}
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                        {service.node_count}
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                        {formatCores(service.cpu_pct_total ?? 0)}
+                                        {quotaPct != null && (
+                                            <span className="ml-1 text-xs text-slate-400">
+                                                ({formatPct(quotaPct)})
+                                            </span>
+                                        )}
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                        {formatBytes(
+                                            service.mem_used_bytes ?? 0,
+                                        )}
+                                        {memPct != null && (
+                                            <span className="ml-1 text-xs text-slate-400">
+                                                ({formatPct(memPct)})
+                                            </span>
+                                        )}
+                                    </td>
+                                    <td className="px-4 py-3">
+                                        <ServiceSparkline
+                                            serviceName={service.service_name}
+                                            range={range}
+                                            refreshKey={refreshKey}
+                                        />
+                                    </td>
+                                </tr>
+                                {isOpen && (
+                                    <tr className="border-b border-white/40 bg-white/30">
+                                        <td colSpan={6} className="px-4 py-3">
+                                            {rows.length === 0 ? (
+                                                <p className="text-xs text-slate-500">
+                                                    No replicas reporting.
+                                                </p>
+                                            ) : (
+                                                <div className="flex flex-col gap-1">
+                                                    {rows.map((replica) => {
+                                                        const active =
+                                                            selectedContainer ===
+                                                            replica.container_key;
+                                                        return (
+                                                            <div
+                                                                key={
+                                                                    replica.container_key
+                                                                }
+                                                            >
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() =>
+                                                                        setSelectedContainer(
+                                                                            active
+                                                                                ? null
+                                                                                : replica.container_key,
+                                                                        )
+                                                                    }
+                                                                    className={`flex w-full flex-wrap items-center gap-x-4 gap-y-1 rounded-lg px-3 py-2 text-left text-xs transition ${
+                                                                        active
+                                                                            ? "bg-sky-50 ring-1 ring-sky-200"
+                                                                            : "hover:bg-white/60"
+                                                                    }`}
+                                                                >
+                                                                    <span className="font-medium text-slate-700">
+                                                                        {replica.task_name ||
+                                                                            replica.container_key}
+                                                                    </span>
+                                                                    <span className="text-slate-500">
+                                                                        {replica.hostname ||
+                                                                            replica.node_key}
+                                                                    </span>
+                                                                    <span className="text-slate-500">
+                                                                        CPU{" "}
+                                                                        {formatCores(
+                                                                            replica.cpu_pct,
+                                                                        )}
+                                                                    </span>
+                                                                    <span className="text-slate-500">
+                                                                        Mem{" "}
+                                                                        {formatBytes(
+                                                                            replica.mem_used_bytes,
+                                                                        )}
+                                                                    </span>
+                                                                </button>
+                                                                {active && (
+                                                                    <ContainerDetail
+                                                                        container={
+                                                                            replica
+                                                                        }
+                                                                        range={
+                                                                            range
+                                                                        }
+                                                                        refreshKey={
+                                                                            refreshKey
+                                                                        }
+                                                                    />
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </td>
+                                    </tr>
+                                )}
+                            </Fragment>
+                        );
+                    })}
+                </tbody>
+            </table>
+        </div>
+    );
+}
+
+interface AlertRuleFormState {
+    scope: AlertScope;
+    target_key: string;
+    metric: MetricKind;
+    operator: AlertOperator;
+    threshold_pct: string;
+    sustained_minutes: string;
+    cooldown_minutes: string;
+    enabled: boolean;
+}
+
+const INITIAL_ALERT_FORM: AlertRuleFormState = {
+    scope: "node",
+    target_key: "",
+    metric: "cpu",
+    operator: ">",
+    threshold_pct: "80",
+    sustained_minutes: "5",
+    cooldown_minutes: "30",
+    enabled: true,
+};
+
+function AlertRulesPanel({
+    canEdit,
+    overview,
+}: {
+    canEdit: boolean;
+    overview: MetricsOverview | null;
+}) {
+    const [rules, setRules] = useState<MetricAlertRule[]>([]);
+    const [form, setForm] = useState<AlertRuleFormState>(INITIAL_ALERT_FORM);
+    const [editingId, setEditingId] = useState<number | null>(null);
+    const [error, setError] = useState("");
+    const [isSaving, setIsSaving] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
+
+    const loadRules = useCallback(async () => {
+        try {
+            const rows = await monitoringService.getAlertRules();
+            setRules(Array.isArray(rows) ? rows : []);
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        void loadRules();
+    }, [loadRules]);
+
+    const targetSuggestions = useMemo(() => {
+        if (form.scope === "node") {
+            return (overview?.nodes ?? []).map((node) => node.node_key);
+        }
+        if (form.scope === "service") {
+            return (overview?.services ?? []).map(
+                (service) => service.service_name,
+            );
+        }
+        return [];
+    }, [form.scope, overview]);
+
+    const resetForm = () => {
+        setForm(INITIAL_ALERT_FORM);
+        setEditingId(null);
+    };
+
+    const startEdit = (rule: MetricAlertRule) => {
+        setEditingId(rule.id);
+        setForm({
+            scope: rule.scope,
+            target_key: rule.target_key ?? "",
+            metric: rule.metric,
+            operator: rule.operator,
+            threshold_pct: String(rule.threshold_pct),
+            sustained_minutes: String(rule.sustained_minutes),
+            cooldown_minutes: String(rule.cooldown_minutes),
+            enabled: rule.enabled,
+        });
+    };
+
+    const handleSubmit = async (event: SubmitEvent) => {
+        event.preventDefault();
+        setError("");
+        if (!canEdit) {
+            setError("You do not have permission to edit alert rules");
+            return;
+        }
+        const payload: MetricAlertRuleInput = {
+            scope: form.scope,
+            target_key: form.target_key.trim() ? form.target_key.trim() : null,
+            metric: form.metric,
+            operator: form.operator,
+            threshold_pct: Number(form.threshold_pct),
+            sustained_minutes: Number(form.sustained_minutes),
+            cooldown_minutes: Number(form.cooldown_minutes),
+            enabled: form.enabled,
+        };
+        setIsSaving(true);
+        try {
+            if (editingId != null) {
+                const updated = await monitoringService.updateAlertRule(
+                    editingId,
+                    payload,
+                );
+                setRules((prev) =>
+                    prev.map((rule) =>
+                        rule.id === editingId ? updated : rule,
+                    ),
+                );
+            } else {
+                const created =
+                    await monitoringService.createAlertRule(payload);
+                setRules((prev) => [created, ...prev]);
+            }
+            resetForm();
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    const handleDelete = async (id: number) => {
+        setError("");
+        if (!canEdit) {
+            setError("You do not have permission to edit alert rules");
+            return;
+        }
+        if (!window.confirm("Delete this alert rule?")) return;
+        try {
+            await monitoringService.deleteAlertRule(id);
+            setRules((prev) => prev.filter((rule) => rule.id !== id));
+            if (editingId === id) resetForm();
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        }
+    };
+
+    const operatorLabel = (operator: AlertOperator) =>
+        ALERT_OPERATOR_OPTIONS.find((option) => option.value === operator)
+            ?.label ?? operator;
+
+    return (
+        <section className="glass-card rounded-2xl p-5">
+            <div className="flex items-center gap-2">
+                <FaBell className="text-slate-500" />
+                <h2 className="text-lg font-semibold text-slate-800">
+                    Alert rules
+                </h2>
+            </div>
+
+            {error && (
+                <p className="mt-3 rounded-lg border border-rose-200/80 bg-rose-50/80 px-3 py-2 text-sm text-rose-700">
+                    {error}
+                </p>
+            )}
+
+            <div className="mt-4 flex flex-col gap-2">
+                {isLoading ? (
+                    <p className="text-sm text-slate-500">Loading rules…</p>
+                ) : rules.length === 0 ? (
+                    <p className="text-sm text-slate-500">
+                        No alert rules yet.
+                    </p>
+                ) : (
+                    rules.map((rule) => (
+                        <div
+                            key={rule.id}
+                            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/60 bg-white/50 px-3 py-2 text-sm"
+                        >
+                            <div className="min-w-0">
+                                <p className="font-medium text-slate-700">
+                                    <span className="capitalize">
+                                        {rule.scope}
+                                    </span>{" "}
+                                    {rule.target_key ? (
+                                        <span className="text-slate-500">
+                                            {rule.target_key}
+                                        </span>
+                                    ) : (
+                                        <span className="text-slate-400">
+                                            (all)
+                                        </span>
+                                    )}{" "}
+                                    · {rule.metric}{" "}
+                                    {operatorLabel(rule.operator)}{" "}
+                                    {rule.threshold_pct}% for{" "}
+                                    {rule.sustained_minutes}m
+                                </p>
+                                <p className="text-xs text-slate-500">
+                                    cooldown {rule.cooldown_minutes}m ·{" "}
+                                    {rule.enabled ? (
+                                        <span className="text-emerald-600">
+                                            enabled
+                                        </span>
+                                    ) : (
+                                        <span className="text-slate-400">
+                                            disabled
+                                        </span>
+                                    )}
+                                </p>
+                            </div>
+                            {canEdit && (
+                                <div className="flex shrink-0 gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => startEdit(rule)}
+                                        className="rounded-lg border border-white/60 bg-white/60 px-2 py-1 text-xs text-slate-600 hover:bg-white/80"
+                                    >
+                                        Edit
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() =>
+                                            void handleDelete(rule.id)
+                                        }
+                                        className="rounded-lg border border-rose-200/70 bg-rose-50/70 px-2 py-1 text-xs text-rose-600 hover:bg-rose-100/80"
+                                    >
+                                        Delete
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    ))
+                )}
+            </div>
+
+            {canEdit ? (
+                <form
+                    onSubmit={handleSubmit}
+                    className="mt-4 grid gap-3 border-t border-white/50 pt-4 sm:grid-cols-2"
+                >
+                    <label className="text-xs font-medium text-slate-600">
+                        Scope
+                        <select
+                            value={form.scope}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    scope: event.target.value as AlertScope,
+                                }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        >
+                            {ALERT_SCOPE_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                    {option.label}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className="text-xs font-medium text-slate-600">
+                        Target (blank = all in scope)
+                        <input
+                            list="metric-alert-targets"
+                            value={form.target_key}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    target_key: event.target.value,
+                                }))
+                            }
+                            placeholder="all in scope"
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        />
+                        <datalist id="metric-alert-targets">
+                            {targetSuggestions.map((suggestion) => (
+                                <option key={suggestion} value={suggestion} />
+                            ))}
+                        </datalist>
+                    </label>
+                    <label className="text-xs font-medium text-slate-600">
+                        Metric
+                        <select
+                            value={form.metric}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    metric: event.target.value as MetricKind,
+                                }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        >
+                            {ALERT_METRIC_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                    {option.label}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className="text-xs font-medium text-slate-600">
+                        Operator
+                        <select
+                            value={form.operator}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    operator: event.target
+                                        .value as AlertOperator,
+                                }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        >
+                            {ALERT_OPERATOR_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                    {option.label}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className="text-xs font-medium text-slate-600">
+                        Threshold %
+                        <input
+                            type="number"
+                            value={form.threshold_pct}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    threshold_pct: event.target.value,
+                                }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        />
+                    </label>
+                    <label className="text-xs font-medium text-slate-600">
+                        Sustained minutes
+                        <input
+                            type="number"
+                            value={form.sustained_minutes}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    sustained_minutes: event.target.value,
+                                }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        />
+                    </label>
+                    <label className="text-xs font-medium text-slate-600">
+                        Cooldown minutes
+                        <input
+                            type="number"
+                            value={form.cooldown_minutes}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    cooldown_minutes: event.target.value,
+                                }))
+                            }
+                            className="mt-1 w-full rounded-lg border border-white/60 bg-white/70 px-2 py-1.5 text-sm text-slate-700"
+                        />
+                    </label>
+                    <label className="flex items-center gap-2 text-xs font-medium text-slate-600 sm:mt-6">
+                        <input
+                            type="checkbox"
+                            checked={form.enabled}
+                            onChange={(event) =>
+                                setForm((prev) => ({
+                                    ...prev,
+                                    enabled: event.target.checked,
+                                }))
+                            }
+                        />
+                        Enabled
+                    </label>
+                    <div className="flex gap-2 sm:col-span-2">
+                        <button
+                            type="submit"
+                            disabled={isSaving}
+                            className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-700 disabled:opacity-50"
+                        >
+                            {editingId != null ? "Update rule" : "Create rule"}
+                        </button>
+                        {editingId != null && (
+                            <button
+                                type="button"
+                                onClick={resetForm}
+                                className="rounded-lg border border-white/60 bg-white/60 px-4 py-2 text-sm text-slate-600 hover:bg-white/80"
+                            >
+                                Cancel
+                            </button>
+                        )}
+                    </div>
+                </form>
+            ) : (
+                <p className="mt-4 border-t border-white/50 pt-4 text-xs text-slate-500">
+                    You have read-only access to alert rules.
+                </p>
+            )}
+        </section>
+    );
+}
+
+function MetricsPage({ canEdit }: { canEdit: boolean }) {
+    const [overview, setOverview] = useState<MetricsOverview | null>(null);
+    const [nodeServices, setNodeServices] = useState<MetricService[]>([]);
+    const [tab, setTab] = useState<"node" | "service">("node");
+    const [rangeKey, setRangeKey] = useState("24h");
+    const [selectedNode, setSelectedNode] = useState<string | null>(null);
+    const [showAlerts, setShowAlerts] = useState(false);
+    const [refreshKey, setRefreshKey] = useState(0);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState("");
+
+    const range =
+        METRIC_RANGE_OPTIONS.find((option) => option.key === rangeKey) ??
+        METRIC_RANGE_OPTIONS[2];
+
+    const loadOverview = useCallback(async () => {
+        try {
+            const data = await monitoringService.getMetricsOverview();
+            setOverview({
+                nodes: Array.isArray(data?.nodes) ? data.nodes : [],
+                services: Array.isArray(data?.services) ? data.services : [],
+            });
+            setError("");
+        } catch (requestError) {
+            setError(getErrorMessage(requestError));
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        void loadOverview();
+        const timer = setInterval(() => {
+            void loadOverview();
+            setRefreshKey((prev) => prev + 1);
+        }, 30000);
+        return () => clearInterval(timer);
+    }, [loadOverview]);
+
+    // Filter the services table to the selected node (By Node tab).
+    useEffect(() => {
+        if (tab !== "node" || !selectedNode) {
+            setNodeServices([]);
+            return;
+        }
+        let cancelled = false;
+        monitoringService
+            .getNodeServices(selectedNode)
+            .then((rows) => {
+                if (!cancelled) setNodeServices(Array.isArray(rows) ? rows : []);
+            })
+            .catch(() => {
+                if (!cancelled) setNodeServices([]);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [tab, selectedNode, refreshKey]);
+
+    const nodes = overview?.nodes ?? [];
+    const allServices = overview?.services ?? [];
+    const tableServices =
+        tab === "node" && selectedNode ? nodeServices : allServices;
+    const isEmpty =
+        !isLoading && nodes.length === 0 && allServices.length === 0;
+
+    return (
+        <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
+            <div className="mx-auto flex max-w-6xl flex-col gap-6">
+                <header className="glass-card flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6">
+                    <div>
+                        <h1 className="text-2xl font-semibold tracking-tight">
+                            Infrastructure metrics
+                        </h1>
+                        <p className="mt-1 text-sm text-slate-500">
+                            Container &amp; VM CPU, memory and network across the
+                            swarm.
+                        </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex rounded-lg border border-white/60 bg-white/50 p-0.5">
+                            {METRIC_RANGE_OPTIONS.map((option) => (
+                                <button
+                                    key={option.key}
+                                    type="button"
+                                    onClick={() => setRangeKey(option.key)}
+                                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                                        rangeKey === option.key
+                                            ? "bg-slate-900 text-white"
+                                            : "text-slate-600 hover:bg-white/70"
+                                    }`}
+                                >
+                                    {option.label}
+                                </button>
+                            ))}
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => setShowAlerts((prev) => !prev)}
+                            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition ${
+                                showAlerts
+                                    ? "border-sky-300 bg-sky-50 text-sky-700"
+                                    : "border-white/60 bg-white/55 text-slate-600 hover:bg-white/80"
+                            }`}
+                        >
+                            <FaBell /> Alerts
+                        </button>
+                    </div>
+                </header>
+
+                {error && (
+                    <p className="rounded-lg border border-rose-200/80 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
+                        {error}
+                    </p>
+                )}
+
+                {showAlerts && (
+                    <AlertRulesPanel canEdit={canEdit} overview={overview} />
+                )}
+
+                {isLoading ? (
+                    <p className="text-sm text-slate-500">Loading metrics…</p>
+                ) : isEmpty ? (
+                    <section className="glass-card rounded-2xl p-10 text-center">
+                        <FaChartArea className="mx-auto text-3xl text-slate-300" />
+                        <h2 className="mt-3 text-lg font-semibold text-slate-700">
+                            No metrics received yet
+                        </h2>
+                        <p className="mt-1 text-sm text-slate-500">
+                            Deploy the sidecar collector to your swarm and
+                            metrics will appear here within a minute.
+                        </p>
+                    </section>
+                ) : (
+                    <>
+                        <div className="flex gap-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setTab("node");
+                                }}
+                                className={`rounded-lg px-4 py-2 text-sm font-medium transition ${
+                                    tab === "node"
+                                        ? "bg-slate-900 text-white"
+                                        : "border border-white/60 bg-white/55 text-slate-600 hover:bg-white/80"
+                                }`}
+                            >
+                                By Node
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setTab("service");
+                                    setSelectedNode(null);
+                                }}
+                                className={`rounded-lg px-4 py-2 text-sm font-medium transition ${
+                                    tab === "service"
+                                        ? "bg-slate-900 text-white"
+                                        : "border border-white/60 bg-white/55 text-slate-600 hover:bg-white/80"
+                                }`}
+                            >
+                                By Service
+                            </button>
+                        </div>
+
+                        {tab === "node" && (
+                            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                                {nodes.map((node) => (
+                                    <NodeCard
+                                        key={node.node_key}
+                                        node={node}
+                                        range={range}
+                                        refreshKey={refreshKey}
+                                        selected={
+                                            selectedNode === node.node_key
+                                        }
+                                        onSelect={() =>
+                                            setSelectedNode((prev) =>
+                                                prev === node.node_key
+                                                    ? null
+                                                    : node.node_key,
+                                            )
+                                        }
+                                    />
+                                ))}
+                            </div>
+                        )}
+
+                        <div className="flex flex-col gap-2">
+                            <div className="flex items-center justify-between">
+                                <h2 className="text-lg font-semibold text-slate-800">
+                                    Services
+                                    {tab === "node" && selectedNode && (
+                                        <span className="ml-2 text-sm font-normal text-slate-500">
+                                            on{" "}
+                                            {nodes.find(
+                                                (node) =>
+                                                    node.node_key ===
+                                                    selectedNode,
+                                            )?.hostname ?? selectedNode}
+                                        </span>
+                                    )}
+                                </h2>
+                                {tab === "node" && selectedNode && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setSelectedNode(null)}
+                                        className="text-xs text-sky-600 hover:underline"
+                                    >
+                                        Clear filter
+                                    </button>
+                                )}
+                            </div>
+                            <ServicesTable
+                                services={tableServices}
+                                range={range}
+                                refreshKey={refreshKey}
+                                emptyLabel={
+                                    tab === "node" && selectedNode
+                                        ? "No services on this node."
+                                        : "No services reporting yet."
+                                }
+                            />
+                        </div>
+                    </>
+                )}
+            </div>
+        </main>
     );
 }
 
@@ -2912,7 +4461,7 @@ function AdminPage({
     );
 }
 
-type AppSection = "monitors" | "users" | "audit";
+type AppSection = "monitors" | "metrics" | "users" | "audit";
 
 type NavItem = {
     section: AppSection;
@@ -2938,6 +4487,7 @@ function AppSidebar({
 }) {
     const navItems: NavItem[] = [
         { section: "monitors", label: "Monitors", href: "/monitors", icon: FaServer },
+        { section: "metrics", label: "Metrics", href: "/metrics", icon: FaChartArea },
         ...(canManageUsers
             ? [
                   {
@@ -3743,6 +5293,9 @@ function App() {
     const isLoginPage = pathname.startsWith("/login");
     const isUsersPage = pathname.startsWith("/users");
     const isAuditPage = pathname.startsWith("/audit");
+    const isMetricsPage = pathname.startsWith("/metrics");
+    // Catch-all for authenticated pages; metrics is one of them (kept inside the
+    // umbrella so the existing session-check / redirect / loading gates apply).
     const isMonitorsPage =
         pathname.startsWith("/monitors") ||
         (!isHomePage && !isStatusPage && !isLoginPage);
@@ -4697,12 +6250,20 @@ function App() {
     return (
         <AppShell
             active={
-                isUsersPage ? "users" : isAuditPage ? "audit" : "monitors"
+                isMetricsPage
+                    ? "metrics"
+                    : isUsersPage
+                      ? "users"
+                      : isAuditPage
+                        ? "audit"
+                        : "monitors"
             }
             canManageUsers={canManageUsers}
             user={user}
         >
-            {isUsersPage || isAuditPage ? (
+            {isMetricsPage ? (
+                <MetricsPage canEdit={canEdit} />
+            ) : isUsersPage || isAuditPage ? (
                 !canManageUsers ? (
                     <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
                         <div className="mx-auto max-w-5xl">

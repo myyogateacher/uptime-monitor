@@ -306,6 +306,134 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 14,
+    name: "create_metric_dimensions",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_nodes (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          node_key VARCHAR(128) NOT NULL UNIQUE,
+          hostname VARCHAR(255) NULL,
+          cpu_cores INT NULL,
+          mem_total_bytes BIGINT NULL,
+          last_seen DATETIME NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_metric_nodes_last_seen (last_seen)
+        )
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_services (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          service_name VARCHAR(255) NOT NULL UNIQUE,
+          last_seen DATETIME NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_metric_services_last_seen (last_seen)
+        )
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_containers (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          container_key VARCHAR(128) NOT NULL UNIQUE,
+          node_id INT NULL,
+          service_id INT NULL,
+          name VARCHAR(255) NULL,
+          image VARCHAR(512) NULL,
+          task_name VARCHAR(255) NULL,
+          replica_slot INT NULL,
+          stack_namespace VARCHAR(255) NULL,
+          cpu_quota_cores DOUBLE NULL,
+          mem_limit_bytes BIGINT NULL,
+          last_seen DATETIME NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          KEY idx_metric_containers_last_seen (last_seen),
+          KEY idx_metric_containers_service (service_id),
+          KEY idx_metric_containers_node (node_id),
+          CONSTRAINT fk_metric_containers_node
+            FOREIGN KEY (node_id) REFERENCES metric_nodes(id) ON DELETE SET NULL,
+          CONSTRAINT fk_metric_containers_service
+            FOREIGN KEY (service_id) REFERENCES metric_services(id) ON DELETE SET NULL
+        )
+      `);
+    },
+  },
+  {
+    version: 15,
+    name: "create_metric_node_samples",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_node_samples (
+          entity_id INT NOT NULL,
+          bucket_start DATETIME NOT NULL,
+          sample_count INT NOT NULL DEFAULT 0,
+          cpu_pct_sum DOUBLE NOT NULL DEFAULT 0,
+          cpu_pct_max DOUBLE NOT NULL DEFAULT 0,
+          mem_used_sum DOUBLE NOT NULL DEFAULT 0,
+          mem_used_max BIGINT NOT NULL DEFAULT 0,
+          mem_total_last BIGINT NULL,
+          PRIMARY KEY (entity_id, bucket_start)
+        )
+      `);
+    },
+  },
+  {
+    version: 16,
+    name: "create_metric_container_samples",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_container_samples (
+          entity_id INT NOT NULL,
+          bucket_start DATETIME NOT NULL,
+          sample_count INT NOT NULL DEFAULT 0,
+          cpu_pct_sum DOUBLE NOT NULL DEFAULT 0,
+          cpu_pct_max DOUBLE NOT NULL DEFAULT 0,
+          mem_used_sum DOUBLE NOT NULL DEFAULT 0,
+          mem_used_max BIGINT NOT NULL DEFAULT 0,
+          cpu_quota_cores_last DOUBLE NULL,
+          mem_limit_bytes_last BIGINT NULL,
+          net_rx_last BIGINT NULL,
+          net_tx_last BIGINT NULL,
+          PRIMARY KEY (entity_id, bucket_start),
+          KEY idx_metric_container_samples_bucket (bucket_start)
+        )
+      `);
+    },
+  },
+  {
+    version: 17,
+    name: "create_metric_alerts",
+    up: async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_alert_rules (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          scope ENUM('node','service','container') NOT NULL,
+          target_key VARCHAR(255) NULL,
+          metric ENUM('cpu','memory') NOT NULL,
+          operator ENUM('>','>=','<','<=') NOT NULL DEFAULT '>',
+          threshold_pct DOUBLE NOT NULL,
+          sustained_minutes INT NOT NULL DEFAULT 5,
+          cooldown_minutes INT NOT NULL DEFAULT 30,
+          enabled TINYINT(1) NOT NULL DEFAULT 1,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS metric_alert_state (
+          rule_id INT NOT NULL,
+          entity_key VARCHAR(255) NOT NULL,
+          status ENUM('ok','firing') NOT NULL DEFAULT 'ok',
+          breaching_since DATETIME NULL,
+          last_notified_at DATETIME NULL,
+          last_value DOUBLE NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (rule_id, entity_key),
+          CONSTRAINT fk_metric_alert_state_rule
+            FOREIGN KEY (rule_id) REFERENCES metric_alert_rules(id) ON DELETE CASCADE
+        )
+      `);
+    },
+  },
 ];
 
 export type AppSettingRecord = {

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 
 import cors, { type CorsOptions } from "cors";
 import { CronExpressionParser } from "cron-parser";
@@ -68,6 +68,30 @@ import {
   startCronMonitor,
   stopCronMonitor,
 } from "./cronMonitorService";
+import {
+  METRIC_GRANULARITIES,
+  METRIC_RETENTION_DAYS,
+  type MetricGranularity,
+  type MetricKind,
+  createAlertRule,
+  deleteAlertRule,
+  getAlertRule,
+  getContainerTimeseries,
+  getNodeTimeseries,
+  getOverview,
+  getServiceTimeseries,
+  ingestBatch,
+  listAlertRules,
+  listNodes,
+  listServiceContainers,
+  listServices,
+  listServicesOnNode,
+  normalizeAlertRuleInput,
+  serializeAlertRule,
+  startMetricsService,
+  stopMetricsService,
+  updateAlertRule,
+} from "./metricsService";
 
 type JsonObject = Record<string, unknown>;
 type WsFrame = { type: string; payload?: unknown; timestamp?: string };
@@ -745,6 +769,35 @@ const parseStatsMode = (value: unknown): StatsMode => {
   return ALLOWED_STATS_MODES.has(normalized) ? normalized : "aggregate";
 };
 
+const METRIC_MAX_RANGE_DAYS: Record<MetricGranularity, number> = {
+  minute: 7,
+  hour: 30,
+  day: 90,
+};
+
+const parseMetricKind = (value: unknown): MetricKind => {
+  const normalized = String(value ?? "cpu")
+    .trim()
+    .toLowerCase();
+  return normalized === "memory" ? "memory" : "cpu";
+};
+
+const parseMetricGranularity = (value: unknown): MetricGranularity => {
+  const normalized = String(value ?? "minute")
+    .trim()
+    .toLowerCase() as MetricGranularity;
+  return METRIC_GRANULARITIES.has(normalized) ? normalized : "minute";
+};
+
+const parseMetricRangeDays = (
+  value: unknown,
+  granularity: MetricGranularity,
+): number => {
+  const maxRangeDays = METRIC_MAX_RANGE_DAYS[granularity];
+  const parsed = toInteger(value, maxRangeDays) ?? maxRangeDays;
+  return Math.max(1, Math.min(parsed, maxRangeDays));
+};
+
 const getMappedEndpointById = async (
   endpointId: number,
 ): Promise<EndpointResponse | null> => {
@@ -842,6 +895,53 @@ const requireAdmin = async (
   return res
     .status(403)
     .json({ error: "You do not have permission to manage users" });
+};
+
+// Metrics are logged-in-only (unlike the public monitor GETs): any resolved,
+// non-banned session may view.
+const requireViewer = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<Response | void> => {
+  const resolved = await resolveSession(req);
+  if (!resolved) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+  if (resolved.banned) {
+    return res.status(403).json({ error: "Your account has been banned" });
+  }
+  return next();
+};
+
+// Ingest is machine-to-machine: validate the Bearer token with a constant-time
+// compare. 503 when unset (never accept ingest without a token), 401 on mismatch.
+const requireMetricsIngestAuth = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Response | void => {
+  const expected = config.metrics.ingestToken;
+  if (!expected) {
+    return res
+      .status(503)
+      .json({ error: "Metrics ingest is not configured (METRICS_INGEST_TOKEN unset)" });
+  }
+
+  const authHeader = String(req.headers.authorization ?? "");
+  const token = authHeader.startsWith("Bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+
+  const expectedBuf = Buffer.from(expected);
+  const tokenBuf = Buffer.from(token);
+  if (
+    tokenBuf.length !== expectedBuf.length ||
+    !timingSafeEqual(tokenBuf, expectedBuf)
+  ) {
+    return res.status(401).json({ error: "Invalid ingest token" });
+  }
+  return next();
 };
 
 const requireGoogleConfig = (res: Response): boolean => {
@@ -2241,6 +2341,253 @@ app.delete(
   },
 );
 
+app.post(
+  "/api/metrics/ingest",
+  requireMetricsIngestAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const result = await ingestBatch(req.body);
+      return res.json(result);
+    } catch (error) {
+      return res
+        .status(400)
+        .json({ error: toErrorMessage(error, "Invalid metrics payload") });
+    }
+  },
+);
+
+app.get(
+  "/api/metrics/overview",
+  requireViewer,
+  async (_req: Request, res: Response) => {
+    res.json(await getOverview());
+  },
+);
+
+app.get(
+  "/api/metrics/nodes",
+  requireViewer,
+  async (_req: Request, res: Response) => {
+    res.json(await listNodes());
+  },
+);
+
+app.get(
+  "/api/metrics/nodes/:nodeKey/services",
+  requireViewer,
+  async (req: Request, res: Response) => {
+    const nodeKey = String(req.params.nodeKey ?? "").trim();
+    if (!nodeKey) {
+      return res.status(400).json({ error: "Invalid node key" });
+    }
+    return res.json(await listServicesOnNode(nodeKey));
+  },
+);
+
+app.get(
+  "/api/metrics/services",
+  requireViewer,
+  async (_req: Request, res: Response) => {
+    res.json(await listServices());
+  },
+);
+
+app.get(
+  "/api/metrics/services/:name/containers",
+  requireViewer,
+  async (req: Request, res: Response) => {
+    const name = String(req.params.name ?? "").trim();
+    if (!name) {
+      return res.status(400).json({ error: "Invalid service name" });
+    }
+    return res.json(await listServiceContainers(name));
+  },
+);
+
+app.get(
+  "/api/metrics/nodes/:nodeKey/timeseries",
+  requireViewer,
+  async (req: Request, res: Response) => {
+    const nodeKey = String(req.params.nodeKey ?? "").trim();
+    const metric = parseMetricKind(req.query.metric);
+    const granularity = parseMetricGranularity(req.query.granularity);
+    const rangeDays = parseMetricRangeDays(req.query.range_days, granularity);
+
+    const result = await getNodeTimeseries(
+      nodeKey,
+      metric,
+      granularity,
+      rangeDays,
+    );
+    if (!result) {
+      return res.status(404).json({ error: "Node not found" });
+    }
+
+    return res.json({
+      metric,
+      granularity,
+      range_days: rangeDays,
+      retention_days: METRIC_RETENTION_DAYS,
+      node: result.node,
+      points: result.points,
+    });
+  },
+);
+
+app.get(
+  "/api/metrics/services/:name/timeseries",
+  requireViewer,
+  async (req: Request, res: Response) => {
+    const name = String(req.params.name ?? "").trim();
+    const metric = parseMetricKind(req.query.metric);
+    const granularity = parseMetricGranularity(req.query.granularity);
+    const rangeDays = parseMetricRangeDays(req.query.range_days, granularity);
+
+    const result = await getServiceTimeseries(
+      name,
+      metric,
+      granularity,
+      rangeDays,
+    );
+    if (!result) {
+      return res.status(404).json({ error: "Service not found" });
+    }
+
+    return res.json({
+      metric,
+      granularity,
+      range_days: rangeDays,
+      retention_days: METRIC_RETENTION_DAYS,
+      service: result.service,
+      points: result.points,
+    });
+  },
+);
+
+app.get(
+  "/api/metrics/containers/:key/timeseries",
+  requireViewer,
+  async (req: Request, res: Response) => {
+    const key = String(req.params.key ?? "").trim();
+    const metric = parseMetricKind(req.query.metric);
+    const granularity = parseMetricGranularity(req.query.granularity);
+    const rangeDays = parseMetricRangeDays(req.query.range_days, granularity);
+
+    const result = await getContainerTimeseries(
+      key,
+      metric,
+      granularity,
+      rangeDays,
+    );
+    if (!result) {
+      return res.status(404).json({ error: "Container not found" });
+    }
+
+    return res.json({
+      metric,
+      granularity,
+      range_days: rangeDays,
+      retention_days: METRIC_RETENTION_DAYS,
+      container: result.container,
+      points: result.points,
+    });
+  },
+);
+
+app.get(
+  "/api/metrics/alert-rules",
+  requireViewer,
+  async (_req: Request, res: Response) => {
+    const rows = await listAlertRules();
+    res.json(rows.map(serializeAlertRule));
+  },
+);
+
+app.post(
+  "/api/metrics/alert-rules",
+  requireEditor,
+  async (req: Request, res: Response) => {
+    let input;
+    try {
+      input = normalizeAlertRuleInput(req.body ?? {});
+    } catch (error) {
+      return res
+        .status(400)
+        .json({ error: toErrorMessage(error, "Invalid payload") });
+    }
+
+    const created = await createAlertRule(input);
+    await audit(req, {
+      action: "create",
+      entityType: "metric_alert_rule",
+      entityId: created.id,
+      entityLabel: `${created.scope}:${created.target_key ?? "all"}`,
+      summary: `Created ${created.scope} ${created.metric} alert rule (${created.operator} ${created.threshold_pct}%)`,
+    });
+    return res.status(201).json(serializeAlertRule(created));
+  },
+);
+
+app.put(
+  "/api/metrics/alert-rules/:id",
+  requireEditor,
+  async (req: Request, res: Response) => {
+    const id = toInteger(req.params.id, NaN);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({ error: "Invalid alert rule id" });
+    }
+
+    let input;
+    try {
+      input = normalizeAlertRuleInput(req.body ?? {});
+    } catch (error) {
+      return res
+        .status(400)
+        .json({ error: toErrorMessage(error, "Invalid payload") });
+    }
+
+    const updated = await updateAlertRule(id, input);
+    if (!updated) {
+      return res.status(404).json({ error: "Alert rule not found" });
+    }
+
+    await audit(req, {
+      action: "update",
+      entityType: "metric_alert_rule",
+      entityId: updated.id,
+      entityLabel: `${updated.scope}:${updated.target_key ?? "all"}`,
+      summary: `Updated ${updated.scope} ${updated.metric} alert rule (${updated.operator} ${updated.threshold_pct}%)`,
+    });
+    return res.json(serializeAlertRule(updated));
+  },
+);
+
+app.delete(
+  "/api/metrics/alert-rules/:id",
+  requireEditor,
+  async (req: Request, res: Response) => {
+    const id = toInteger(req.params.id, NaN);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({ error: "Invalid alert rule id" });
+    }
+
+    const existing = await getAlertRule(id);
+    if (!existing) {
+      return res.status(404).json({ error: "Alert rule not found" });
+    }
+
+    await deleteAlertRule(id);
+    await audit(req, {
+      action: "delete",
+      entityType: "metric_alert_rule",
+      entityId: id,
+      entityLabel: `${existing.scope}:${existing.target_key ?? "all"}`,
+      summary: `Deleted ${existing.scope} ${existing.metric} alert rule`,
+    });
+    return res.status(204).send();
+  },
+);
+
 app.use(
   "/api",
   (err: unknown, _req: Request, res: Response, next: NextFunction) => {
@@ -2266,6 +2613,7 @@ async function start(): Promise<void> {
   await seedAdminUsers();
   startMonitor();
   startCronMonitor();
+  startMetricsService();
 
   httpServer.listen(config.port, () => {
     console.log(`Express server listening on http://localhost:${config.port}`);
@@ -2279,6 +2627,7 @@ start().catch((error: unknown) => {
 
 const shutdown = async (): Promise<void> => {
   stopMonitor();
+  stopMetricsService();
   await stopCronMonitor();
   await new Promise<void>((resolve) => wsServer.close(() => resolve()));
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));

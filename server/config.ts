@@ -179,6 +179,12 @@ export const config = {
     notifyToken: String(process.env.CRON_NOTIFY_TOKEN ?? '').trim(),
     runRetentionDays: toNumber(process.env.CRON_RUN_RETENTION_DAYS, 90),
   },
+  metrics: {
+    ingestToken: String(process.env.METRICS_INGEST_TOKEN ?? '').trim(),
+    retentionDays: toNumber(process.env.METRIC_RETENTION_DAYS, 90),
+    dimensionPruneDays: toNumber(process.env.METRIC_DIMENSION_PRUNE_DAYS, 7),
+    alertPollMs: toNumber(process.env.METRIC_ALERT_POLL_MS, 60000),
+  },
   corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://localhost:5173')
     .split(',')
     .map((origin) => origin.trim())

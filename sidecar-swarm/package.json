@@ -1,0 +1,12 @@
+{
+  "name": "uptime-sidecar-swarm",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Docker Swarm global-mode metrics collector sidecar for uptime-monitor. Zero npm dependencies.",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

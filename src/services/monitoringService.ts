@@ -14,6 +14,154 @@ export type CronHttpMethod = 'GET' | 'POST' | 'NONE'
 
 export type UserRole = 'admin' | 'editor' | 'viewer'
 
+// ---------------------------------------------------------------------------
+// Infrastructure metrics (Part C). These shapes mirror the server metrics APIs
+// under /api/metrics (session-authenticated). All response-shape assumptions
+// live here so the integration pass has a single place to reconcile.
+// ---------------------------------------------------------------------------
+
+export type MetricKind = 'cpu' | 'memory'
+export type MetricGranularity = 'minute' | 'hour' | 'day'
+export type AlertScope = 'node' | 'service' | 'container'
+// Operator values are the exact strings the server validates and the DB enum
+// stores (migration 17: ENUM('>','>=','<','<=')).
+export type AlertOperator = '>' | '>=' | '<' | '<='
+
+// GET /api/metrics/overview → nodes[] (and GET /api/metrics/nodes). Mirrors the
+// server's serializeNodeOverview plus the per-node container_count.
+export interface MetricNode {
+  node_key: string
+  hostname: string | null
+  cpu_cores: number | null
+  mem_total_bytes: number | null
+  last_seen: string | null
+  bucket_start: string | null
+  cpu_pct: number | null
+  cpu_pct_max: number | null
+  mem_used_bytes: number | null
+  mem_total_bytes_last: number | null
+  mem_pct: number | null
+  container_count: number
+}
+
+// GET /api/metrics/overview → services[]; also the per-node service shape from
+// GET /api/metrics/nodes/:nodeKey/services (scoped to a node). Mirrors the
+// server's serializeServiceOverview.
+export interface MetricService {
+  service_name: string
+  container_count: number
+  node_count: number
+  cpu_pct_total: number | null
+  mem_used_bytes: number | null
+  total_quota_cores: number | null
+  total_mem_limit_bytes: number | null
+  mem_pct: number | null
+  last_seen: string | null
+}
+
+export interface MetricsOverview {
+  nodes: MetricNode[]
+  services: MetricService[]
+}
+
+// GET /api/metrics/services/:name/containers → []. Mirrors serializeContainerRow.
+export interface MetricContainer {
+  container_key: string
+  name: string | null
+  image: string | null
+  task_name: string | null
+  replica_slot: number | null
+  node_key: string | null
+  hostname: string | null
+  cpu_quota_cores: number | null
+  mem_limit_bytes: number | null
+  last_seen: string | null
+  cpu_pct: number | null
+  cpu_pct_max: number | null
+  mem_used_bytes: number | null
+  mem_pct: number | null
+}
+
+// A single timeseries bucket (server TimeseriesPoint). avg/max are percentages
+// (node/service/container semantics differ; see route docs). avg_bytes/max_bytes
+// present on memory queries; net_*_bps present on container queries.
+export interface MetricTimeseriesPoint {
+  bucket_start: string
+  avg: number | null
+  max: number | null
+  avg_bytes?: number | null
+  max_bytes?: number | null
+  net_rx_bps?: number | null
+  net_tx_bps?: number | null
+}
+
+// Subject objects carry the scope-specific reference-line data (quota/limit).
+export interface MetricNodeSubject {
+  node_key: string
+  hostname: string | null
+  cpu_cores: number | null
+  mem_total_bytes: number | null
+}
+
+export interface MetricServiceSubject {
+  service_name: string
+  total_quota_cores: number | null
+  total_mem_limit_bytes: number | null
+}
+
+export interface MetricContainerSubject {
+  container_key: string
+  name: string | null
+  task_name: string | null
+  cpu_quota_cores: number | null
+  mem_limit_bytes: number | null
+}
+
+// Timeseries envelope. Exactly one of node/service/container is present,
+// depending on which endpoint produced it.
+export interface MetricTimeseriesResponse {
+  metric: MetricKind
+  granularity: MetricGranularity
+  range_days: number
+  retention_days: number
+  points: MetricTimeseriesPoint[]
+  node?: MetricNodeSubject
+  service?: MetricServiceSubject
+  container?: MetricContainerSubject
+}
+
+export interface MetricAlertRule {
+  id: number
+  scope: AlertScope
+  target_key: string | null
+  metric: MetricKind
+  operator: AlertOperator
+  threshold_pct: number
+  sustained_minutes: number
+  cooldown_minutes: number
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+// Form-driven payload: numeric fields may arrive as strings from inputs.
+export interface MetricAlertRuleInput {
+  scope: AlertScope | string
+  target_key?: string | null
+  metric: MetricKind | string
+  operator: AlertOperator | string
+  threshold_pct: number | string
+  sustained_minutes: number | string
+  cooldown_minutes: number | string
+  enabled: boolean
+}
+
+export interface MetricTimeseriesOptions {
+  metric: MetricKind
+  granularity: MetricGranularity
+  rangeDays: number
+}
+
 export interface SessionUser {
   sub: string
   email?: string
@@ -451,4 +599,74 @@ export const monitoringService = {
       `/api/crons/${encodeURIComponent(cronName)}/runs${query ? `?${query}` : ''}`,
     )
   },
+
+  // ---- Infrastructure metrics ------------------------------------------
+  getMetricsOverview(): Promise<MetricsOverview> {
+    return request<MetricsOverview>('/api/metrics/overview')
+  },
+  getMetricNodes(): Promise<MetricNode[]> {
+    return request<MetricNode[]>('/api/metrics/nodes')
+  },
+  getNodeServices(nodeKey: string): Promise<MetricService[]> {
+    return request<MetricService[]>(
+      `/api/metrics/nodes/${encodeURIComponent(nodeKey)}/services`,
+    )
+  },
+  getServiceContainers(serviceName: string): Promise<MetricContainer[]> {
+    return request<MetricContainer[]>(
+      `/api/metrics/services/${encodeURIComponent(serviceName)}/containers`,
+    )
+  },
+  getNodeTimeseries(
+    nodeKey: string,
+    options: MetricTimeseriesOptions,
+  ): Promise<MetricTimeseriesResponse> {
+    return request<MetricTimeseriesResponse>(
+      `/api/metrics/nodes/${encodeURIComponent(nodeKey)}/timeseries${metricsQuery(options)}`,
+    )
+  },
+  getServiceTimeseries(
+    serviceName: string,
+    options: MetricTimeseriesOptions,
+  ): Promise<MetricTimeseriesResponse> {
+    return request<MetricTimeseriesResponse>(
+      `/api/metrics/services/${encodeURIComponent(serviceName)}/timeseries${metricsQuery(options)}`,
+    )
+  },
+  getContainerTimeseries(
+    containerKey: string,
+    options: MetricTimeseriesOptions,
+  ): Promise<MetricTimeseriesResponse> {
+    return request<MetricTimeseriesResponse>(
+      `/api/metrics/containers/${encodeURIComponent(containerKey)}/timeseries${metricsQuery(options)}`,
+    )
+  },
+  getAlertRules(): Promise<MetricAlertRule[]> {
+    return request<MetricAlertRule[]>('/api/metrics/alert-rules')
+  },
+  createAlertRule(input: MetricAlertRuleInput): Promise<MetricAlertRule> {
+    return request<MetricAlertRule>('/api/metrics/alert-rules', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  },
+  updateAlertRule(id: number, input: MetricAlertRuleInput): Promise<MetricAlertRule> {
+    return request<MetricAlertRule>(`/api/metrics/alert-rules/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    })
+  },
+  deleteAlertRule(id: number): Promise<null> {
+    return request<null>(`/api/metrics/alert-rules/${id}`, {
+      method: 'DELETE',
+    })
+  },
+}
+
+function metricsQuery(options: MetricTimeseriesOptions): string {
+  const params = new URLSearchParams()
+  params.set('metric', options.metric)
+  params.set('granularity', options.granularity)
+  params.set('range_days', String(options.rangeDays))
+  return `?${params.toString()}`
 }
