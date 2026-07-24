@@ -60,7 +60,9 @@ export interface ContainerInspect {
   }
 }
 
-const base = `http://localhost/${config.dockerApiVersion}`
+const base = config.dockerApiVersion
+  ? `http://localhost/${config.dockerApiVersion}`
+  : 'http://localhost'
 
 const dockerFetch = async (path: string, timeoutMs: number): Promise<Response> => {
   const controller = new AbortController()

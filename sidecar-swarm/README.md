@@ -36,7 +36,7 @@ time.
 | `STATS_CONCURRENCY` | `8` | Max parallel `/stats` calls per tick. |
 | `BUFFER_MAX_BATCHES` | `60` | Ring-buffer size on ingest failure (~15 min at 15s). Oldest dropped, count reported next success. |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Docker Engine API unix socket. |
-| `DOCKER_API_VERSION` | `v1.43` | Engine API version prefix. |
+| `DOCKER_API_VERSION` | — (unversioned) | Optional Engine API version prefix (e.g. `v1.44`). Unversioned requests use the daemon's native version. |
 | `HOST_PROC` | `/host/proc` | Bind-mounted host `/proc`. |
 | `NODE_NAME` | — | Override the reported hostname (defaults to `/info` `Name`). |
 | `INSPECT_CACHE_MS` | `300000` | How long container quota/limit inspects are cached. |

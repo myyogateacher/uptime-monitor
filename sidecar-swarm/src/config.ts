@@ -63,8 +63,10 @@ export const config = {
   bufferMaxBatches: Math.max(1, toNumber(process.env.BUFFER_MAX_BATCHES, 60)),
 
   dockerSocket: toString(process.env.DOCKER_SOCKET, "/var/run/docker.sock"),
-  // Docker Engine API version prefix. v1.43 ships with Engine 24+, widely safe.
-  dockerApiVersion: toString(process.env.DOCKER_API_VERSION, "v1.43"),
+  // Optional Docker Engine API version prefix (e.g. "v1.44"). Empty means
+  // unversioned requests, which every daemon serves at its native version —
+  // new engines reject pinned versions they consider too old.
+  dockerApiVersion: toString(process.env.DOCKER_API_VERSION, ""),
 
   hostProc: toString(process.env.HOST_PROC, "/host/proc"),
   // Optional override for the node hostname reported to the server.

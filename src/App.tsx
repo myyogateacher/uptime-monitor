@@ -1310,7 +1310,9 @@ function NodeCard({
                         {node.hostname || node.node_key}
                     </p>
                     <p className="truncate text-xs text-slate-500">
-                        {node.cpu_cores} cores · {node.container_count} containers
+                        {node.cpu_cores} cores ·{" "}
+                        {formatBytes(node.mem_total_bytes)} ·{" "}
+                        {node.container_count} containers
                     </p>
                 </div>
                 <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500">
@@ -2671,6 +2673,9 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                             <div className="flex items-center justify-between">
                                 <h2 className="text-lg font-semibold text-slate-800">
                                     Services
+                                    <span className="ml-2 rounded-full bg-slate-200/70 px-2 py-0.5 text-xs font-medium text-slate-600 align-middle">
+                                        {tableServices.length}
+                                    </span>
                                     {tab === "node" && selectedNode && (
                                         <span className="ml-2 text-sm font-normal text-slate-500">
                                             on{" "}
