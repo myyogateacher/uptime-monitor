@@ -24,3 +24,4 @@ dist-ssr
 *.sln
 *.sw?
 sidecar-swarm/build.sh
+sidecar-swarm/deploy/build.sh
