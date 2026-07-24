@@ -1231,7 +1231,7 @@ interface AlertStateRow extends RowDataPacket {
   status: 'ok' | 'firing'
   breaching_since: Date | string | null
   last_notified_at: Date | string | null
-  last_value: number | null
+  last_metric_value: number | null
 }
 
 const evaluateRule = async (rule: MetricAlertRuleRow): Promise<void> => {
@@ -1277,7 +1277,7 @@ const evaluateRule = async (rule: MetricAlertRuleRow): Promise<void> => {
         latestValue,
       )
     } else if (prior) {
-      await pool.query('UPDATE metric_alert_state SET last_value = ? WHERE rule_id = ? AND entity_key = ?', [
+      await pool.query('UPDATE metric_alert_state SET last_metric_value = ? WHERE rule_id = ? AND entity_key = ?', [
         latestValue,
         rule.id,
         entity.entityKey,
@@ -1299,13 +1299,13 @@ const upsertAlertState = async (
   await pool.query(
     `
       INSERT INTO metric_alert_state
-        (rule_id, entity_key, status, breaching_since, last_notified_at, last_value)
+        (rule_id, entity_key, status, breaching_since, last_notified_at, last_metric_value)
       VALUES (?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         status = VALUES(status),
         breaching_since = VALUES(breaching_since),
         last_notified_at = VALUES(last_notified_at),
-        last_value = VALUES(last_value)
+        last_metric_value = VALUES(last_metric_value)
     `,
     [ruleId, entityKey, status, breachingSince, lastNotifiedAt, lastValue],
   )

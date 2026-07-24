@@ -425,7 +425,7 @@ const MIGRATIONS = [
           status ENUM('ok','firing') NOT NULL DEFAULT 'ok',
           breaching_since DATETIME NULL,
           last_notified_at DATETIME NULL,
-          last_value DOUBLE NULL,
+          last_metric_value DOUBLE NULL,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           PRIMARY KEY (rule_id, entity_key),
           CONSTRAINT fk_metric_alert_state_rule
