@@ -2429,7 +2429,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
     return (
         <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
             <div className="mx-auto flex max-w-6xl flex-col gap-6">
-                <header className="glass-card flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6">
+                <header className="glass-card relative z-30 flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6">
                     <div>
                         <h1 className="text-2xl font-semibold tracking-tight">
                             Infrastructure metrics
@@ -2475,7 +2475,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                                     : "Custom"}
                             </button>
                             {customOpen && (
-                                <div className="absolute right-0 z-20 mt-2 w-64 rounded-xl border border-white/60 bg-white/95 p-4 shadow-xl backdrop-blur">
+                                <div className="absolute right-0 z-50 mt-2 w-64 rounded-xl border border-white/60 bg-white/95 p-4 shadow-xl backdrop-blur">
                                     <div className="flex flex-col gap-3">
                                         <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
                                             From
