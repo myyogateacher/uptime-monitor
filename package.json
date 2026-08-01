@@ -1,8 +1,12 @@
 {
   "name": "uptime",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.2.0",
   "type": "module",
+  "author": {
+    "name": "Pankaj Soni",
+    "email": "pankaj@myyogateacher.com"
+  },
   "scripts": {
     "dev": "concurrently -k -n client,server -c cyan,green \"bun run dev:client\" \"bun run dev:server\"",
     "dev:client": "vite",
