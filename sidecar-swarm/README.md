@@ -75,8 +75,14 @@ absent, service identity falls back automatically (swarm > compose > name):
   under the compose project (`com.docker.compose.project`), with the replica
   slot taken from `com.docker.compose.container-number` — so a compose service
   shows up as a named, multi-replica service just like a swarm service.
-- **bare `docker run`** containers (no orchestration labels) appear as
-  single-replica services named after the container itself.
+- **bare `docker run`** containers (no orchestration labels) are named after the
+  container itself, with trailing machine-generated segments stripped — a full
+  UUID, a hex blob of 8+ chars, or a mostly-digits timestamp-like suffix. So
+  `recorder-3f9a12ab-77c1-4e2b-9d10-aa12bc34de56` and its siblings all group
+  under one `recorder` service instead of one single-replica service each,
+  while deliberate suffixes like `worker-2` are left alone. The full container
+  name is kept as the task name, so each instance stays identifiable in the
+  replicas drill-down.
 
 Either way every container is now drillable under the Services table, not just
 in the VM-level metrics and container count. Use

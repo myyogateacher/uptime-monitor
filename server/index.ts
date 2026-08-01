@@ -15,6 +15,13 @@ import createMySqlSession from "express-mysql-session";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { WebSocket, WebSocketServer } from "ws";
 
+import {
+  ClickhouseQueryError,
+  ClickhouseUnavailableError,
+  clickhouseStatus,
+  ensureClickhouseSchema,
+  stopClickhouseRetry,
+} from "./clickhouse";
 import { config } from "./config";
 import { initDatabase, pool } from "./db";
 import {
@@ -1026,6 +1033,23 @@ const requireMetricsIngestAuth = (
     return res.status(401).json({ error: "Invalid ingest token" });
   }
   return next();
+};
+
+// Metric samples live in ClickHouse. When it is unreachable the uptime monitor
+// itself keeps running; only the metrics surface degrades to 503 so the sidecar
+// buffers and replays instead of dropping batches.
+const requireClickhouse = (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Response | void => {
+  const status = clickhouseStatus();
+  if (status.ready) return next();
+  return res.status(503).json({
+    error: status.error
+      ? `Metrics storage (ClickHouse) is unavailable: ${status.error}`
+      : "Metrics storage (ClickHouse) is unavailable",
+  });
 };
 
 const requireGoogleConfig = (res: Response): boolean => {
@@ -2428,11 +2452,20 @@ app.delete(
 app.post(
   "/api/metrics/ingest",
   requireMetricsIngestAuth,
+  requireClickhouse,
   async (req: Request, res: Response) => {
     try {
       const result = await ingestBatch(req.body);
       return res.json(result);
     } catch (error) {
+      // Storage failures must not look like bad payloads: the sidecar keeps the
+      // batch in its ring buffer and retries on 5xx, but drops it on 4xx.
+      if (error instanceof ClickhouseUnavailableError) {
+        return res.status(503).json({ error: error.message });
+      }
+      if (error instanceof ClickhouseQueryError) {
+        return res.status(500).json({ error: error.message });
+      }
       return res
         .status(400)
         .json({ error: toErrorMessage(error, "Invalid metrics payload") });
@@ -2443,6 +2476,7 @@ app.post(
 app.get(
   "/api/metrics/overview",
   requireViewer,
+  requireClickhouse,
   async (_req: Request, res: Response) => {
     res.json(await getOverview());
   },
@@ -2451,6 +2485,7 @@ app.get(
 app.get(
   "/api/metrics/nodes",
   requireViewer,
+  requireClickhouse,
   async (_req: Request, res: Response) => {
     res.json(await listNodes());
   },
@@ -2459,6 +2494,7 @@ app.get(
 app.get(
   "/api/metrics/nodes/:nodeKey/services",
   requireViewer,
+  requireClickhouse,
   async (req: Request, res: Response) => {
     const nodeKey = String(req.params.nodeKey ?? "").trim();
     if (!nodeKey) {
@@ -2471,6 +2507,7 @@ app.get(
 app.get(
   "/api/metrics/services",
   requireViewer,
+  requireClickhouse,
   async (_req: Request, res: Response) => {
     res.json(await listServices());
   },
@@ -2479,6 +2516,7 @@ app.get(
 app.get(
   "/api/metrics/services/:name/containers",
   requireViewer,
+  requireClickhouse,
   async (req: Request, res: Response) => {
     const name = String(req.params.name ?? "").trim();
     if (!name) {
@@ -2491,6 +2529,7 @@ app.get(
 app.get(
   "/api/metrics/nodes/:nodeKey/timeseries",
   requireViewer,
+  requireClickhouse,
   async (req: Request, res: Response) => {
     const nodeKey = String(req.params.nodeKey ?? "").trim();
     const metric = parseMetricKind(req.query.metric);
@@ -2529,6 +2568,7 @@ app.get(
 app.get(
   "/api/metrics/services/:name/timeseries",
   requireViewer,
+  requireClickhouse,
   async (req: Request, res: Response) => {
     const name = String(req.params.name ?? "").trim();
     const metric = parseMetricKind(req.query.metric);
@@ -2567,6 +2607,7 @@ app.get(
 app.get(
   "/api/metrics/containers/:key/timeseries",
   requireViewer,
+  requireClickhouse,
   async (req: Request, res: Response) => {
     const key = String(req.params.key ?? "").trim();
     const metric = parseMetricKind(req.query.metric);
@@ -2718,6 +2759,9 @@ if (existsSync(distPath)) {
 
 async function start(): Promise<void> {
   await initDatabase();
+  // Never throws: on failure it logs, retries in the background and the
+  // metrics endpoints answer 503 until ClickHouse comes back.
+  await ensureClickhouseSchema();
   await seedAdminUsers();
   startMonitor();
   startCronMonitor();
@@ -2736,6 +2780,7 @@ start().catch((error: unknown) => {
 const shutdown = async (): Promise<void> => {
   stopMonitor();
   stopMetricsService();
+  stopClickhouseRetry();
   await stopCronMonitor();
   await new Promise<void>((resolve) => wsServer.close(() => resolve()));
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));

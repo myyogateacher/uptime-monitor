@@ -131,6 +131,110 @@ export interface ServiceIdentity {
   stack_namespace: string | null
 }
 
+const HEX_ONLY = /^[0-9a-f]+$/i
+const DIGITS_ONLY = /^[0-9]+$/
+
+const isUuidShape = (a: string, b: string, c: string, d: string, e: string): boolean =>
+  a.length === 8 &&
+  b.length === 4 &&
+  c.length === 4 &&
+  d.length === 4 &&
+  e.length === 12 &&
+  [a, b, c, d, e].every((t) => HEX_ONLY.test(t))
+
+// A single token looks machine-generated when it is a long hex blob or is
+// dominated by digits. Purely numeric tokens are handled separately: on their
+// own they are usually a deliberate replica suffix (`worker-2`).
+const isMachineToken = (token: string): boolean => {
+  if (DIGITS_ONLY.test(token)) return false
+  if (token.length >= 8 && HEX_ONLY.test(token)) return true
+  if (token.length >= 6) {
+    const digits = token.replace(/[^0-9]/g, '').length
+    if (digits * 2 > token.length) return true
+  }
+  return false
+}
+
+// Derive a stable service name from a bare container name by stripping trailing
+// machine-generated segments (UUIDs, hex blobs, timestamps) so that ephemeral
+// containers such as `recorder-3f9a12ab-77c1-4e2b-9d10-aa12bc34de56` collapse
+// into one `recorder` service instead of one single-replica service each.
+//
+// Only ever applied to the tier-3 bare-name fallback — swarm and compose
+// service names are authoritative and must never be rewritten.
+//
+// Rules: segments are delimited by `-` or `_`; a trailing full UUID (spanning
+// five dash-separated tokens), a hex string of length >= 8, or a >= 6 char
+// mostly-digits token is stripped, repeatedly, right to left. A purely numeric
+// token is stripped only once a longer machine segment has already been
+// stripped, so `worker-2` keeps its replica suffix. The first segment is never
+// stripped, and an empty result falls back to the original name.
+export const normalizeBareContainerName = (name: string): string => {
+  if (!name) return name
+
+  const tokens: string[] = []
+  const seps: string[] = []
+  let cur = ''
+  for (const ch of name) {
+    if (ch === '-' || ch === '_') {
+      tokens.push(cur)
+      seps.push(ch)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  tokens.push(cur)
+
+  // A name that is nothing but a UUID has no human part to keep — leave it be.
+  if (
+    tokens.length === 5 &&
+    seps.every((s) => s === '-') &&
+    isUuidShape(...(tokens as [string, string, string, string, string]))
+  ) {
+    return name
+  }
+
+  // `keep` is how many leading tokens survive; it never drops below 1.
+  let keep = tokens.length
+  let strippedMachineSegment = false
+  let pendingNumeric = 0 // trailing pure-numeric tokens, provisionally stripped
+  while (keep > 1) {
+    // Full UUID spanning the last five dash-joined tokens.
+    if (
+      keep >= 6 &&
+      seps.slice(keep - 5, keep - 1).every((s) => s === '-') &&
+      isUuidShape(...(tokens.slice(keep - 5, keep) as [string, string, string, string, string]))
+    ) {
+      keep -= 5
+      strippedMachineSegment = true
+      continue
+    }
+
+    const last = tokens[keep - 1]!
+    if (isMachineToken(last)) {
+      strippedMachineSegment = true
+      keep--
+      continue
+    }
+    // Pure numerics are only machine-generated in the company of a longer
+    // machine segment; hold them back until we know whether one turns up.
+    if (DIGITS_ONLY.test(last)) {
+      pendingNumeric++
+      keep--
+      continue
+    }
+    break
+  }
+
+  // No machine segment materialised: the numerics were deliberate (`worker-2`).
+  if (!strippedMachineSegment) keep += pendingNumeric
+
+  let out = tokens[0] ?? ''
+  for (let i = 1; i < keep; i++) out += seps[i - 1] + tokens[i]
+  return out || name
+}
+
 // `cleanedName` is the leading-slash-stripped container name (see cleanName).
 export const extractServiceIdentity = (
   labels: Record<string, string>,
@@ -163,10 +267,12 @@ export const extractServiceIdentity = (
     }
   }
 
-  // Tier 3 — bare `docker run`. No orchestration labels: use the container
-  // name as-is so every container is drillable as a single-replica service.
+  // Tier 3 — bare `docker run`. No orchestration labels: derive the service
+  // name from the container name with machine-generated suffixes stripped, so
+  // ephemeral containers group into one service instead of one each. The full
+  // container name is kept as task_name for the replicas drill-down.
   return {
-    service_name: cleanedName || null,
+    service_name: cleanedName ? normalizeBareContainerName(cleanedName) : null,
     task_name: cleanedName || null,
     replica_slot: null,
     stack_namespace: null,

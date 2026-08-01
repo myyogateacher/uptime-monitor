@@ -197,6 +197,14 @@ export const config = {
     database: process.env.MYSQL_DATABASE ?? 'uptime_monitor',
     connectionLimit: toNumber(process.env.MYSQL_CONNECTION_LIMIT, 10),
   },
+  // Raw metric samples live in ClickHouse; the dimension/alert tables stay in
+  // MySQL. Point this at an existing ClickHouse HTTP interface (port 8123).
+  clickhouse: {
+    url: String(process.env.CLICKHOUSE_URL ?? 'http://localhost:8123').trim(),
+    username: String(process.env.CLICKHOUSE_USER ?? 'default'),
+    password: String(process.env.CLICKHOUSE_PASSWORD ?? ''),
+    database: String(process.env.CLICKHOUSE_DATABASE ?? 'uptime_metrics').trim(),
+  },
   notifications: {
     enabled: String(process.env.NOTIFICATIONS_ENABLED ?? 'true').toLowerCase() !== 'false',
     targets: parseNotificationTargets(),

@@ -1,5 +1,17 @@
 import type { ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 
+import {
+  CONTAINER_SAMPLES_TABLE,
+  NODE_SAMPLES_TABLE,
+  chCommandDetached,
+  chInsert,
+  chSelect,
+  isClickhouseReady,
+  toEpochSeconds,
+  toNullableFloat,
+  toNullableUInt,
+  toUInt,
+} from './clickhouse'
 import { config } from './config'
 import { pool } from './db'
 import { notifyMetricAlert } from './notifier'
@@ -88,16 +100,13 @@ const toFiniteOrNull = (value: unknown): number | null => {
 }
 
 // Timeseries queries operate over an explicit half-open [from, to) window.
-// bucket_start columns are stored as UTC datetimes, so windows are formatted
-// as 'YYYY-MM-DD HH:MM:SS' in UTC to compare directly.
+// The window is pushed to ClickHouse as Unix epoch seconds; bucket labels come
+// back as 'YYYY-MM-DD HH:MM:SS' UTC strings, exactly as before.
 export type MetricWindow = { from: Date; to: Date }
 
-const toMysqlUtc = (value: Date): string =>
-  value.toISOString().slice(0, 19).replace('T', ' ')
-
-// Aggregation ("group by") applied when re-bucketing minute rollups. avg/sum/
-// count/max are computed in SQL; p95/p99 are computed in JS over the per-minute
-// average values within each output bucket.
+// Aggregation ("group by") applied when bucketing the ClickHouse raw samples.
+// Every aggregate — including real p95/p99 quantiles over the raw sample
+// values — is computed in ClickHouse; nothing is approximated in JS.
 export type MetricAgg = 'avg' | 'sum' | 'count' | 'max' | 'p95' | 'p99'
 export const METRIC_AGGS = new Set<MetricAgg>([
   'avg',
@@ -108,47 +117,50 @@ export const METRIC_AGGS = new Set<MetricAgg>([
   'p99',
 ])
 
-const isPercentileAgg = (agg: MetricAgg): boolean => agg === 'p95' || agg === 'p99'
-
-// Nearest-rank percentile over an ascending-sorted array.
-const percentileOf = (sortedAsc: number[], percentile: number): number | null => {
-  if (!sortedAsc.length) return null
-  const rank = Math.ceil((percentile / 100) * sortedAsc.length)
-  const index = Math.min(sortedAsc.length, Math.max(1, rank)) - 1
-  return sortedAsc[index]
+// Parses a ClickHouse JSON scalar. UInt64 columns arrive as strings and empty
+// aggregates as null/NaN, so anything non-finite collapses to null.
+const chNumber = (value: unknown): number | null => {
+  if (value == null) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
-// Truncate a minute-level 'YYYY-MM-DD HH:MM:SS' string down to a granularity
-// bucket key (mirrors bucketExprFor but in JS, for the percentile path).
-const bucketKeyFor = (
-  granularity: MetricGranularity,
-  minuteStart: string,
-): string => {
-  if (granularity === 'day') return `${minuteStart.slice(0, 10)} 00:00:00`
-  if (granularity === 'hour') return `${minuteStart.slice(0, 13)}:00:00`
-  return `${minuteStart.slice(0, 16)}:00`
+// Bucketing is always evaluated in UTC so results never depend on the
+// ClickHouse server's local timezone.
+const bucketOf = (granularity: MetricGranularity, column = 'ts'): string => {
+  if (granularity === 'hour') return `toStartOfHour(${column}, 'UTC')`
+  if (granularity === 'day') return `toStartOfDay(${column}, 'UTC')`
+  return `toStartOfMinute(${column}, 'UTC')`
 }
 
-// Selects the requested aggregate from precomputed per-bucket components.
-// Percentiles are resolved separately and never reach this helper.
-const pickAgg = (
+// Renders the bucket as the exact 'YYYY-MM-DD HH:MM:SS' string the MySQL
+// implementation returned, so bucket_start stays byte-identical for clients.
+const bucketStartExpr = (granularity: MetricGranularity, column = 'ts'): string =>
+  `formatDateTime(${bucketOf(granularity, column)}, '%Y-%m-%d %H:%M:%S', 'UTC')`
+
+const MINUTE_START_EXPR = `formatDateTime(toStartOfMinute(ts, 'UTC'), '%Y-%m-%d %H:%M:%S', 'UTC')`
+
+// Builds the per-bucket aggregate expression. `value` is the raw sample column
+// (or a pre-aggregated per-minute total for service queries); `max`/`count`
+// override the column used by those two aggregates when the caller already
+// aggregated one level down.
+const aggExprOver = (
   agg: MetricAgg,
-  components: {
-    avg: number | null
-    sum: number | null
-    count: number | null
-    max: number | null
-  },
-): number | null => {
+  columns: { value: string; max?: string; count?: string },
+): string => {
   switch (agg) {
     case 'sum':
-      return components.sum
+      return `sum(${columns.value})`
     case 'count':
-      return components.count
+      return columns.count ? `sum(${columns.count})` : 'count()'
     case 'max':
-      return components.max
+      return `max(${columns.max ?? columns.value})`
+    case 'p95':
+      return `quantile(0.95)(${columns.value})`
+    case 'p99':
+      return `quantile(0.99)(${columns.value})`
     default:
-      return components.avg
+      return `avg(${columns.value})`
   }
 }
 
@@ -300,90 +312,54 @@ const upsertContainers = async (
   for (const row of rows) containerIdCache.set(row.key_col, row.id)
 }
 
-const upsertNodeSample = async (
+// Raw sample writes go to ClickHouse. Timestamps are sent as Unix epoch
+// seconds so the value is timezone-independent on the wire. A failure throws
+// (ClickhouseQueryError / ClickhouseUnavailableError) and the ingest route
+// answers 5xx so the sidecar's ring buffer replays the batch — never a silent
+// drop.
+const insertNodeSample = async (
   nodeId: number,
-  bucketStart: string,
+  collectedAt: Date,
   node: NodeInfo,
 ): Promise<void> => {
-  // cpu_pct is null on the collector's first tick; skip so the running average
-  // (cpu_pct_sum / sample_count) stays accurate.
+  // cpu_pct is null on the collector's first tick; skip so averages over the
+  // raw samples are not dragged toward zero.
   if (node.cpu_pct == null) return
 
-  await pool.query(
-    `
-      INSERT INTO metric_node_samples (
-        entity_id, bucket_start, sample_count, cpu_pct_sum, cpu_pct_max,
-        mem_used_sum, mem_used_max, mem_total_last
-      )
-      VALUES (?, ?, 1, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        sample_count = sample_count + 1,
-        cpu_pct_sum = cpu_pct_sum + VALUES(cpu_pct_sum),
-        cpu_pct_max = GREATEST(cpu_pct_max, VALUES(cpu_pct_max)),
-        mem_used_sum = mem_used_sum + VALUES(mem_used_sum),
-        mem_used_max = GREATEST(mem_used_max, VALUES(mem_used_max)),
-        mem_total_last = VALUES(mem_total_last)
-    `,
-    [
-      nodeId,
-      bucketStart,
-      node.cpu_pct,
-      node.cpu_pct,
-      node.mem_used_bytes,
-      node.mem_used_bytes,
-      node.mem_total_bytes,
-    ],
-  )
+  await chInsert(NODE_SAMPLES_TABLE, [
+    {
+      node_id: nodeId,
+      ts: toEpochSeconds(collectedAt),
+      cpu_pct: Number(node.cpu_pct),
+      mem_used: toUInt(node.mem_used_bytes),
+      mem_total: toUInt(node.mem_total_bytes),
+    },
+  ])
 }
 
-const upsertContainerSamples = async (
+const insertContainerSamples = async (
   containers: ContainerMetrics[],
-  bucketStart: string,
+  collectedAt: Date,
 ): Promise<void> => {
-  const values: unknown[] = []
-  const placeholders: string[] = []
+  const ts = toEpochSeconds(collectedAt)
+  const rows: Record<string, unknown>[] = []
 
   for (const container of containers) {
     const entityId = containerIdCache.get(container.container_id)
     if (entityId == null) continue
-    values.push(
-      entityId,
-      bucketStart,
-      container.cpu_pct,
-      container.cpu_pct,
-      container.mem_used_bytes,
-      container.mem_used_bytes,
-      container.cpu_quota_cores,
-      container.mem_limit_bytes,
-      container.net_rx_bytes,
-      container.net_tx_bytes,
-    )
-    placeholders.push('(?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)')
+    rows.push({
+      container_id: entityId,
+      ts,
+      cpu_pct: Number(container.cpu_pct) || 0,
+      mem_used: toUInt(container.mem_used_bytes),
+      mem_limit: toNullableUInt(container.mem_limit_bytes),
+      cpu_quota_cores: toNullableFloat(container.cpu_quota_cores),
+      net_rx: toUInt(container.net_rx_bytes),
+      net_tx: toUInt(container.net_tx_bytes),
+    })
   }
 
-  if (!placeholders.length) return
-
-  await pool.query(
-    `
-      INSERT INTO metric_container_samples (
-        entity_id, bucket_start, sample_count, cpu_pct_sum, cpu_pct_max,
-        mem_used_sum, mem_used_max, cpu_quota_cores_last, mem_limit_bytes_last,
-        net_rx_last, net_tx_last
-      )
-      VALUES ${placeholders.join(', ')}
-      ON DUPLICATE KEY UPDATE
-        sample_count = sample_count + 1,
-        cpu_pct_sum = cpu_pct_sum + VALUES(cpu_pct_sum),
-        cpu_pct_max = GREATEST(cpu_pct_max, VALUES(cpu_pct_max)),
-        mem_used_sum = mem_used_sum + VALUES(mem_used_sum),
-        mem_used_max = GREATEST(mem_used_max, VALUES(mem_used_max)),
-        cpu_quota_cores_last = VALUES(cpu_quota_cores_last),
-        mem_limit_bytes_last = VALUES(mem_limit_bytes_last),
-        net_rx_last = VALUES(net_rx_last),
-        net_tx_last = VALUES(net_tx_last)
-    `,
-    values,
-  )
+  await chInsert(CONTAINER_SAMPLES_TABLE, rows)
 }
 
 export type IngestResult = {
@@ -428,8 +404,8 @@ export async function ingestBatch(payload: unknown): Promise<IngestResult> {
   await upsertServices(serviceNames)
   await upsertContainers(containers, nodeId)
 
-  await upsertNodeSample(nodeId, bucketStart, node)
-  await upsertContainerSamples(containers, bucketStart)
+  await insertNodeSample(nodeId, collectedAt, node)
+  await insertContainerSamples(containers, collectedAt)
 
   return {
     accepted: true,
@@ -443,13 +419,16 @@ export async function ingestBatch(payload: unknown): Promise<IngestResult> {
 // Query helpers
 // ---------------------------------------------------------------------------
 
-const bucketExprFor = (granularity: MetricGranularity): string => {
-  if (granularity === 'hour') return "DATE_FORMAT(bucket_start, '%Y-%m-%d %H:00:00')"
-  if (granularity === 'day') return "DATE_FORMAT(bucket_start, '%Y-%m-%d 00:00:00')"
-  return "DATE_FORMAT(bucket_start, '%Y-%m-%d %H:%i:00')"
-}
+// Latest-value lookups only consider samples from the last LIVE_WINDOW_MINUTES,
+// which is also how "live" is defined for dimension rows (last_seen). Stale
+// Swarm task generations therefore never inflate replica counts or totals,
+// while their history stays queryable through the per-container endpoints.
+const LIVE_WINDOW_MINUTES = 10
 
-interface NodeOverviewRow extends RowDataPacket {
+const liveWindowStart = (): number =>
+  toEpochSeconds(new Date(Date.now() - LIVE_WINDOW_MINUTES * 60 * 1000))
+
+type NodeOverviewRow = {
   node_key: string
   hostname: string | null
   cpu_cores: number | null
@@ -463,7 +442,7 @@ interface NodeOverviewRow extends RowDataPacket {
   container_count: number | null
 }
 
-interface ServiceOverviewRow extends RowDataPacket {
+type ServiceOverviewRow = {
   service_name: string
   container_count: number
   node_count: number
@@ -474,79 +453,228 @@ interface ServiceOverviewRow extends RowDataPacket {
   last_seen: Date | string | null
 }
 
-const listNodesQuery = async (): Promise<NodeOverviewRow[]> => {
-  const [rows] = await pool.query<NodeOverviewRow[]>(
+interface NodeDimensionRow extends RowDataPacket {
+  id: number
+  node_key: string
+  hostname: string | null
+  cpu_cores: number | null
+  mem_total_bytes: number | null
+  last_seen: Date | string | null
+  container_count: number | null
+}
+
+type ChLatestNodeRow = {
+  node_id: number | string
+  bucket_start: string
+  cpu_pct: number | string | null
+  cpu_pct_max: number | string | null
+  mem_used_bytes: number | string | null
+  mem_total_last: number | string | null
+}
+
+type ChLatestContainerRow = {
+  container_id: number | string
+  bucket_start: string
+  cpu_pct: number | string | null
+  cpu_pct_max: number | string | null
+  mem_used_bytes: number | string | null
+}
+
+// Newest minute bucket per node within the live window (ClickHouse). Mirrors
+// the previous "latest rollup row" semantics: the value is the average over
+// that minute's raw samples, cpu_pct_max the max within it.
+const latestNodeStats = async (): Promise<Map<number, ChLatestNodeRow>> => {
+  const rows = await chSelect<ChLatestNodeRow>(
     `
       SELECT
+        node_id,
+        ${MINUTE_START_EXPR} AS bucket_start,
+        avg(cpu_pct) AS cpu_pct,
+        max(cpu_pct) AS cpu_pct_max,
+        avg(mem_used) AS mem_used_bytes,
+        max(mem_total) AS mem_total_last
+      FROM ${NODE_SAMPLES_TABLE}
+      WHERE ts >= toDateTime({from:UInt32})
+      GROUP BY node_id, bucket_start
+      ORDER BY node_id ASC, bucket_start DESC
+      LIMIT 1 BY node_id
+    `,
+    { from: liveWindowStart() },
+  )
+  return new Map(rows.map((row) => [Number(row.node_id), row]))
+}
+
+// Newest minute bucket per container within the live window (ClickHouse).
+const latestContainerStats = async (): Promise<Map<number, ChLatestContainerRow>> => {
+  const rows = await chSelect<ChLatestContainerRow>(
+    `
+      SELECT
+        container_id,
+        ${MINUTE_START_EXPR} AS bucket_start,
+        avg(cpu_pct) AS cpu_pct,
+        max(cpu_pct) AS cpu_pct_max,
+        avg(mem_used) AS mem_used_bytes
+      FROM ${CONTAINER_SAMPLES_TABLE}
+      WHERE ts >= toDateTime({from:UInt32})
+      GROUP BY container_id, bucket_start
+      ORDER BY container_id ASC, bucket_start DESC
+      LIMIT 1 BY container_id
+    `,
+    { from: liveWindowStart() },
+  )
+  return new Map(rows.map((row) => [Number(row.container_id), row]))
+}
+
+const listNodesQuery = async (): Promise<NodeOverviewRow[]> => {
+  const [dimensions] = await pool.query<NodeDimensionRow[]>(
+    `
+      SELECT
+        n.id,
         n.node_key,
         n.hostname,
         n.cpu_cores,
         n.mem_total_bytes,
         n.last_seen,
-        s.bucket_start,
-        s.cpu_pct_sum / s.sample_count AS cpu_pct,
-        s.cpu_pct_max,
-        s.mem_used_sum / s.sample_count AS mem_used_bytes,
-        s.mem_total_last,
         (
           SELECT COUNT(*)
           FROM metric_containers mc
           WHERE mc.node_id = n.id
-            AND mc.last_seen >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 10 MINUTE)
+            AND mc.last_seen >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)
         ) AS container_count
       FROM metric_nodes n
-      LEFT JOIN metric_node_samples s
-        ON s.entity_id = n.id
-        AND s.bucket_start = (
-          SELECT MAX(bucket_start) FROM metric_node_samples WHERE entity_id = n.id
-        )
       ORDER BY n.hostname ASC, n.node_key ASC
     `,
+    [LIVE_WINDOW_MINUTES],
   )
-  return rows
+
+  const latest = await latestNodeStats()
+
+  return dimensions.map((row) => {
+    const sample = latest.get(row.id)
+    return {
+      node_key: row.node_key,
+      hostname: row.hostname,
+      cpu_cores: row.cpu_cores,
+      mem_total_bytes: row.mem_total_bytes,
+      last_seen: row.last_seen,
+      bucket_start: sample?.bucket_start ?? null,
+      cpu_pct: sample ? chNumber(sample.cpu_pct) : null,
+      cpu_pct_max: sample ? chNumber(sample.cpu_pct_max) : null,
+      mem_used_bytes: sample ? chNumber(sample.mem_used_bytes) : null,
+      mem_total_last: sample ? chNumber(sample.mem_total_last) : null,
+      container_count: row.container_count,
+    }
+  })
+}
+
+interface ServiceContainerDimensionRow extends RowDataPacket {
+  service_name: string
+  container_id: number
+  node_id: number | null
+  cpu_quota_cores: number | null
+  mem_limit_bytes: number | null
+  last_seen: Date | string | null
+  is_live: number
 }
 
 const listServicesQuery = async (nodeKey?: string): Promise<ServiceOverviewRow[]> => {
-  const params: unknown[] = []
+  const params: unknown[] = [LIVE_WINDOW_MINUTES]
   let nodeFilter = ''
   if (nodeKey) {
     nodeFilter = 'AND n.node_key = ?'
     params.push(nodeKey)
   }
 
-  const [rows] = await pool.query<ServiceOverviewRow[]>(
+  // Dimension rows stay in MySQL. Every container of the service is listed so
+  // last_seen keeps its "most recent replica generation" meaning, but counts
+  // and totals below only consider the live ones.
+  const [rows] = await pool.query<ServiceContainerDimensionRow[]>(
     `
       SELECT
         sv.service_name,
-        COUNT(DISTINCT c.id) AS container_count,
-        COUNT(DISTINCT c.node_id) AS node_count,
-        SUM(latest.cpu_pct) AS cpu_pct_total,
-        SUM(latest.mem_used_bytes) AS mem_used_total,
-        SUM(c.cpu_quota_cores) AS total_quota_cores,
-        SUM(c.mem_limit_bytes) AS total_mem_limit_bytes,
-        MAX(c.last_seen) AS last_seen
+        c.id AS container_id,
+        c.node_id,
+        c.cpu_quota_cores,
+        c.mem_limit_bytes,
+        c.last_seen,
+        (c.last_seen >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)) AS is_live
       FROM metric_services sv
       JOIN metric_containers c ON c.service_id = sv.id
       LEFT JOIN metric_nodes n ON n.id = c.node_id
-      LEFT JOIN (
-        SELECT
-          cs.entity_id,
-          cs.cpu_pct_sum / cs.sample_count AS cpu_pct,
-          cs.mem_used_sum / cs.sample_count AS mem_used_bytes
-        FROM metric_container_samples cs
-        JOIN (
-          SELECT entity_id, MAX(bucket_start) AS mb
-          FROM metric_container_samples
-          GROUP BY entity_id
-        ) m ON m.entity_id = cs.entity_id AND m.mb = cs.bucket_start
-      ) latest ON latest.entity_id = c.id
       WHERE 1 = 1 ${nodeFilter}
-      GROUP BY sv.id
       ORDER BY sv.service_name ASC
     `,
     params,
   )
-  return rows
+  if (!rows.length) return []
+
+  const latest = await latestContainerStats()
+
+  type Accumulator = {
+    service_name: string
+    liveContainers: number
+    liveNodes: Set<number>
+    cpuTotal: number | null
+    memTotal: number | null
+    quotaTotal: number | null
+    memLimitTotal: number | null
+    lastSeen: Date | string | null
+  }
+
+  const byService = new Map<string, Accumulator>()
+  for (const row of rows) {
+    let entry = byService.get(row.service_name)
+    if (!entry) {
+      entry = {
+        service_name: row.service_name,
+        liveContainers: 0,
+        liveNodes: new Set<number>(),
+        cpuTotal: null,
+        memTotal: null,
+        quotaTotal: null,
+        memLimitTotal: null,
+        lastSeen: null,
+      }
+      byService.set(row.service_name, entry)
+    }
+
+    if (row.last_seen != null) {
+      const current = entry.lastSeen == null ? null : new Date(entry.lastSeen).getTime()
+      const candidate = new Date(row.last_seen).getTime()
+      if (current == null || candidate > current) entry.lastSeen = row.last_seen
+    }
+
+    if (!Number(row.is_live)) continue
+
+    entry.liveContainers += 1
+    if (row.node_id != null) entry.liveNodes.add(Number(row.node_id))
+    if (row.cpu_quota_cores != null) {
+      entry.quotaTotal = (entry.quotaTotal ?? 0) + Number(row.cpu_quota_cores)
+    }
+    if (row.mem_limit_bytes != null) {
+      entry.memLimitTotal = (entry.memLimitTotal ?? 0) + Number(row.mem_limit_bytes)
+    }
+
+    const sample = latest.get(Number(row.container_id))
+    if (!sample) continue
+    const cpu = chNumber(sample.cpu_pct)
+    if (cpu != null) entry.cpuTotal = (entry.cpuTotal ?? 0) + cpu
+    const mem = chNumber(sample.mem_used_bytes)
+    if (mem != null) entry.memTotal = (entry.memTotal ?? 0) + mem
+  }
+
+  return [...byService.values()]
+    .sort((left, right) => (left.service_name < right.service_name ? -1 : left.service_name > right.service_name ? 1 : 0))
+    .map((entry) => ({
+      service_name: entry.service_name,
+      container_count: entry.liveContainers,
+      node_count: entry.liveNodes.size,
+      cpu_pct_total: entry.cpuTotal,
+      mem_used_total: entry.memTotal,
+      total_quota_cores: entry.quotaTotal,
+      total_mem_limit_bytes: entry.memLimitTotal,
+      last_seen: entry.lastSeen,
+    }))
 }
 
 const serializeNodeOverview = (row: NodeOverviewRow) => ({
@@ -606,7 +734,7 @@ export async function listServicesOnNode(nodeKey: string) {
   return rows.map(serializeServiceOverview)
 }
 
-interface ContainerListRow extends RowDataPacket {
+interface ContainerListRow {
   container_key: string
   name: string | null
   image: string | null
@@ -643,10 +771,28 @@ const serializeContainerRow = (row: ContainerListRow) => {
   }
 }
 
+interface ContainerDimensionRow extends RowDataPacket {
+  id: number
+  container_key: string
+  name: string | null
+  image: string | null
+  task_name: string | null
+  replica_slot: number | null
+  node_key: string | null
+  hostname: string | null
+  cpu_quota_cores: number | null
+  mem_limit_bytes: number | null
+  last_seen: Date | string | null
+}
+
 export async function listServiceContainers(serviceName: string) {
-  const [rows] = await pool.query<ContainerListRow[]>(
+  // Only live replicas are listed: dead Swarm task generations used to inflate
+  // the replica table (48 rows for 2 running replicas). Their samples are still
+  // in ClickHouse and still reachable via /api/metrics/containers/:key/timeseries.
+  const [dimensions] = await pool.query<ContainerDimensionRow[]>(
     `
       SELECT
+        c.id,
         c.container_key,
         c.name,
         c.image,
@@ -656,50 +802,38 @@ export async function listServiceContainers(serviceName: string) {
         n.hostname,
         c.cpu_quota_cores,
         c.mem_limit_bytes,
-        c.last_seen,
-        latest.cpu_pct,
-        latest.cpu_pct_max,
-        latest.mem_used_bytes
+        c.last_seen
       FROM metric_services sv
       JOIN metric_containers c ON c.service_id = sv.id
       LEFT JOIN metric_nodes n ON n.id = c.node_id
-      LEFT JOIN (
-        SELECT
-          cs.entity_id,
-          cs.cpu_pct_sum / cs.sample_count AS cpu_pct,
-          cs.cpu_pct_max,
-          cs.mem_used_sum / cs.sample_count AS mem_used_bytes
-        FROM metric_container_samples cs
-        JOIN (
-          SELECT entity_id, MAX(bucket_start) AS mb
-          FROM metric_container_samples
-          GROUP BY entity_id
-        ) m ON m.entity_id = cs.entity_id AND m.mb = cs.bucket_start
-      ) latest ON latest.entity_id = c.id
       WHERE sv.service_name = ?
+        AND c.last_seen >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)
       ORDER BY c.replica_slot ASC, c.name ASC
     `,
-    [serviceName],
+    [serviceName, LIVE_WINDOW_MINUTES],
   )
-  return rows.map(serializeContainerRow)
-}
+  if (!dimensions.length) return []
 
-interface NodeSampleRow extends RowDataPacket {
-  bucket_start: string
-  cpu_sum: number | null
-  cpu_max: number | null
-  mem_sum: number | null
-  mem_max: number | null
-  sample_count: number | null
-  mem_total_bytes: number | null
-}
+  const latest = await latestContainerStats()
 
-interface NodeMinuteRow extends RowDataPacket {
-  bucket_start: string
-  cpu_pct_sum: number | null
-  mem_used_sum: number | null
-  sample_count: number | null
-  mem_total_last: number | null
+  return dimensions.map((row) => {
+    const sample = latest.get(row.id)
+    return serializeContainerRow({
+      container_key: row.container_key,
+      name: row.name,
+      image: row.image,
+      task_name: row.task_name,
+      replica_slot: row.replica_slot,
+      node_key: row.node_key,
+      hostname: row.hostname,
+      cpu_quota_cores: row.cpu_quota_cores,
+      mem_limit_bytes: row.mem_limit_bytes,
+      last_seen: row.last_seen,
+      cpu_pct: sample ? chNumber(sample.cpu_pct) : null,
+      cpu_pct_max: sample ? chNumber(sample.cpu_pct_max) : null,
+      mem_used_bytes: sample ? chNumber(sample.mem_used_bytes) : null,
+    })
+  })
 }
 
 export type TimeseriesPoint = {
@@ -710,6 +844,16 @@ export type TimeseriesPoint = {
   max_bytes?: number | null
   net_rx_bps?: number | null
   net_tx_bps?: number | null
+}
+
+// Shape of every bucketed timeseries row coming back from ClickHouse. UInt64
+// columns arrive as strings, so everything is parsed with chNumber().
+type ChTimeseriesRow = {
+  bucket_start: string
+  value: number | string | null
+  reference?: number | string | null
+  net_rx_last?: number | string | null
+  net_tx_last?: number | string | null
 }
 
 export async function getNodeTimeseries(
@@ -728,9 +872,6 @@ export async function getNodeTimeseries(
   if (!nodeRows.length) return null
   const node = nodeRows[0]
 
-  const fromStr = toMysqlUtc(window.from)
-  const toStr = toMysqlUtc(window.to)
-
   const nodeSubject = {
     node_key: node.node_key,
     hostname: node.hostname,
@@ -738,132 +879,41 @@ export async function getNodeTimeseries(
     mem_total_bytes: node.mem_total_bytes == null ? null : Number(node.mem_total_bytes),
   }
 
-  if (isPercentileAgg(agg)) {
-    const [minuteRows] = await pool.query<NodeMinuteRow[]>(
-      `
-        SELECT bucket_start, cpu_pct_sum, mem_used_sum, sample_count, mem_total_last
-        FROM metric_node_samples
-        WHERE entity_id = ?
-          AND bucket_start >= ?
-          AND bucket_start < ?
-        ORDER BY bucket_start ASC
-      `,
-      [node.id, fromStr, toStr],
-    )
-    const points = percentilePoints(
-      minuteRows,
-      granularity,
-      metric,
-      agg,
-      (row) => {
-        const count = Number(row.sample_count) || 0
-        const sum = metric === 'memory' ? Number(row.mem_used_sum) : Number(row.cpu_pct_sum)
-        return count ? sum / count : null
-      },
-      (row) => (row.mem_total_last == null ? null : Number(row.mem_total_last)),
-    )
-    return { node: nodeSubject, points }
-  }
-
-  const bucketExpr = bucketExprFor(granularity)
-  const [rows] = await pool.query<NodeSampleRow[]>(
+  // One aggregate per bucket straight over the raw samples: avg/sum/count/max
+  // in ClickHouse and true quantile(0.95|0.99) percentiles (no JS nearest-rank
+  // approximation over minute rollups any more).
+  const column = metric === 'memory' ? 'mem_used' : 'cpu_pct'
+  const rows = await chSelect<ChTimeseriesRow>(
     `
       SELECT
-        ${bucketExpr} AS bucket_start,
-        SUM(cpu_pct_sum) AS cpu_sum,
-        MAX(cpu_pct_max) AS cpu_max,
-        SUM(mem_used_sum) AS mem_sum,
-        MAX(mem_used_max) AS mem_max,
-        SUM(sample_count) AS sample_count,
-        MAX(mem_total_last) AS mem_total_bytes
-      FROM metric_node_samples
-      WHERE entity_id = ?
-        AND bucket_start >= ?
-        AND bucket_start < ?
+        ${bucketStartExpr(granularity)} AS bucket_start,
+        ${aggExprOver(agg, { value: column })} AS value,
+        max(mem_total) AS reference
+      FROM ${NODE_SAMPLES_TABLE}
+      WHERE node_id = {entity_id:UInt32}
+        AND ts >= toDateTime({from:UInt32})
+        AND ts < toDateTime({to:UInt32})
       GROUP BY bucket_start
       ORDER BY bucket_start ASC
     `,
-    [node.id, fromStr, toStr],
+    {
+      entity_id: node.id,
+      from: toEpochSeconds(window.from),
+      to: toEpochSeconds(window.to),
+    },
   )
 
-  const points: TimeseriesPoint[] = rows.map((row) => {
-    const count = row.sample_count == null ? null : Number(row.sample_count)
-    const total = row.mem_total_bytes == null ? null : Number(row.mem_total_bytes)
-    if (metric === 'memory') {
-      const sum = row.mem_sum == null ? null : Number(row.mem_sum)
-      const value = pickAgg(agg, {
-        avg: sum != null && count ? sum / count : null,
-        sum,
-        count,
-        max: row.mem_max == null ? null : Number(row.mem_max),
-      })
-      return buildScalarPoint(row.bucket_start, metric, agg, value, total)
-    }
-    const sum = row.cpu_sum == null ? null : Number(row.cpu_sum)
-    const value = pickAgg(agg, {
-      avg: sum != null && count ? sum / count : null,
-      sum,
-      count,
-      max: row.cpu_max == null ? null : Number(row.cpu_max),
-    })
-    return buildScalarPoint(row.bucket_start, metric, agg, value, null)
-  })
+  const points = rows.map((row) =>
+    buildScalarPoint(
+      row.bucket_start,
+      metric,
+      agg,
+      chNumber(row.value),
+      metric === 'memory' ? chNumber(row.reference) : null,
+    ),
+  )
 
   return { node: nodeSubject, points }
-}
-
-// Shared JS percentile path: buckets per-minute rows, computes each minute's
-// value via `minuteValue`, then takes the nearest-rank percentile per bucket.
-// `reference` (mem total/limit) is carried as the max seen within the bucket.
-function percentilePoints<Row extends RowDataPacket>(
-  minuteRows: Row[],
-  granularity: MetricGranularity,
-  metric: MetricKind,
-  agg: MetricAgg,
-  minuteValue: (row: Row) => number | null,
-  referenceOf?: (row: Row) => number | null,
-): TimeseriesPoint[] {
-  const buckets = new Map<string, { values: number[]; reference: number | null }>()
-  for (const row of minuteRows) {
-    const key = bucketKeyFor(granularity, String(row.bucket_start))
-    let entry = buckets.get(key)
-    if (!entry) {
-      entry = { values: [], reference: null }
-      buckets.set(key, entry)
-    }
-    const value = minuteValue(row)
-    if (value != null && Number.isFinite(value)) entry.values.push(value)
-    if (referenceOf) {
-      const reference = referenceOf(row)
-      if (reference != null) {
-        entry.reference = entry.reference == null ? reference : Math.max(entry.reference, reference)
-      }
-    }
-  }
-  const percentile = agg === 'p99' ? 99 : 95
-  return [...buckets.entries()]
-    .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
-    .map(([key, entry]) => {
-      const sorted = entry.values.slice().sort((left, right) => left - right)
-      return buildScalarPoint(key, metric, agg, percentileOf(sorted, percentile), entry.reference)
-    })
-}
-
-interface ServiceSampleRow extends RowDataPacket {
-  bucket_start: string
-  cpu_avg: number | null
-  cpu_sum: number | null
-  cpu_max: number | null
-  mem_used_avg: number | null
-  mem_used_sum: number | null
-  mem_used_max: number | null
-  sample_count: number | null
-}
-
-interface ServiceMinuteRow extends RowDataPacket {
-  minute: string
-  cpu_total: number | null
-  mem_used_total: number | null
 }
 
 export async function getServiceTimeseries(
@@ -880,150 +930,95 @@ export async function getServiceTimeseries(
   if (!serviceRows.length) return null
   const serviceId = serviceRows[0].id
 
-  const [totalRows] = await pool.query<
-    ({ total_quota_cores: number | null; total_mem_limit_bytes: number | null; replicas: number; null_limits: number } & RowDataPacket)[]
+  // Every container ever attached to the service feeds the history; only the
+  // live ones define the quota/limit reference lines (dead task generations
+  // used to multiply them).
+  const [containerRows] = await pool.query<
+    ({ id: number; cpu_quota_cores: number | null; mem_limit_bytes: number | null; is_live: number } & RowDataPacket)[]
   >(
     `
       SELECT
-        SUM(cpu_quota_cores) AS total_quota_cores,
-        SUM(mem_limit_bytes) AS total_mem_limit_bytes,
-        COUNT(*) AS replicas,
-        SUM(CASE WHEN mem_limit_bytes IS NULL THEN 1 ELSE 0 END) AS null_limits
+        id,
+        cpu_quota_cores,
+        mem_limit_bytes,
+        (last_seen >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)) AS is_live
       FROM metric_containers
       WHERE service_id = ?
     `,
-    [serviceId],
+    [LIVE_WINDOW_MINUTES, serviceId],
   )
-  const totalQuota =
-    totalRows[0]?.total_quota_cores == null ? null : Number(totalRows[0].total_quota_cores)
-  const totalMemLimit =
-    Number(totalRows[0]?.null_limits ?? 0) > 0 || totalRows[0]?.total_mem_limit_bytes == null
-      ? null
-      : Number(totalRows[0].total_mem_limit_bytes)
 
-  const fromStr = toMysqlUtc(window.from)
-  const toStr = toMysqlUtc(window.to)
+  const containerIds = containerRows.map((row) => row.id)
+  const liveRows = containerRows.filter((row) => Number(row.is_live) === 1)
+
+  let totalQuota: number | null = null
+  for (const row of liveRows) {
+    if (row.cpu_quota_cores == null) continue
+    totalQuota = (totalQuota ?? 0) + Number(row.cpu_quota_cores)
+  }
+
+  // A service memory % is only meaningful when every live replica reports a limit.
+  let totalMemLimit: number | null = null
+  if (liveRows.length && liveRows.every((row) => row.mem_limit_bytes != null)) {
+    totalMemLimit = liveRows.reduce((sum, row) => sum + Number(row.mem_limit_bytes), 0)
+  }
+
   const serviceSubject = {
     service_name: serviceName,
     total_quota_cores: totalQuota,
     total_mem_limit_bytes: totalMemLimit,
   }
 
-  if (isPercentileAgg(agg)) {
-    // Per-minute totals across replicas; percentile taken over those minutes.
-    const [minuteRows] = await pool.query<ServiceMinuteRow[]>(
-      `
-        SELECT
-          cs.bucket_start AS minute,
-          SUM(cs.cpu_pct_sum / cs.sample_count) AS cpu_total,
-          SUM(cs.mem_used_sum / cs.sample_count) AS mem_used_total
-        FROM metric_container_samples cs
-        JOIN metric_containers c ON c.id = cs.entity_id
-        WHERE c.service_id = ?
-          AND cs.bucket_start >= ?
-          AND cs.bucket_start < ?
-        GROUP BY cs.bucket_start
-        ORDER BY cs.bucket_start ASC
-      `,
-      [serviceId, fromStr, toStr],
-    )
-    const points = percentilePoints(
-      minuteRows.map((row) => ({ ...row, bucket_start: row.minute })),
-      granularity,
-      metric,
-      agg,
-      (row) =>
-        metric === 'memory'
-          ? row.mem_used_total == null
-            ? null
-            : Number(row.mem_used_total)
-          : row.cpu_total == null
-            ? null
-            : Number(row.cpu_total),
-      () => totalMemLimit,
-    )
-    return { service: serviceSubject, points }
+  if (!containerIds.length) {
+    return { service: serviceSubject, points: [] }
   }
 
-  const bucketExpr = bucketExprFor(granularity)
-  // Inner query totals across replicas per minute; outer re-buckets over time.
-  const [rows] = await pool.query<ServiceSampleRow[]>(
+  // Two levels of aggregation, matching the previous MySQL shape exactly:
+  //   inner  – per container, per minute (avg / max / sample count)
+  //   middle – per minute totals across replicas
+  //   outer  – re-bucket to the requested granularity
+  const column = metric === 'memory' ? 'mem_used' : 'cpu_pct'
+  const rows = await chSelect<ChTimeseriesRow>(
     `
       SELECT
-        ${bucketExpr.replace(/bucket_start/g, 'm.minute')} AS bucket_start,
-        AVG(m.cpu_total) AS cpu_avg,
-        SUM(m.cpu_total) AS cpu_sum,
-        MAX(m.cpu_max_total) AS cpu_max,
-        AVG(m.mem_used_total) AS mem_used_avg,
-        SUM(m.mem_used_total) AS mem_used_sum,
-        MAX(m.mem_used_max_total) AS mem_used_max,
-        SUM(m.sample_count_total) AS sample_count
+        ${bucketStartExpr(granularity, 'minute')} AS bucket_start,
+        ${aggExprOver(agg, { value: 'avg_total', max: 'max_total', count: 'sample_count' })} AS value
       FROM (
         SELECT
-          cs.bucket_start AS minute,
-          SUM(cs.cpu_pct_sum / cs.sample_count) AS cpu_total,
-          SUM(cs.cpu_pct_max) AS cpu_max_total,
-          SUM(cs.mem_used_sum / cs.sample_count) AS mem_used_total,
-          SUM(cs.mem_used_max) AS mem_used_max_total,
-          SUM(cs.sample_count) AS sample_count_total
-        FROM metric_container_samples cs
-        JOIN metric_containers c ON c.id = cs.entity_id
-        WHERE c.service_id = ?
-          AND cs.bucket_start >= ?
-          AND cs.bucket_start < ?
-        GROUP BY cs.bucket_start
-      ) m
+          minute,
+          sum(container_avg) AS avg_total,
+          sum(container_max) AS max_total,
+          sum(container_samples) AS sample_count
+        FROM (
+          SELECT
+            container_id,
+            toStartOfMinute(ts, 'UTC') AS minute,
+            avg(${column}) AS container_avg,
+            max(${column}) AS container_max,
+            count() AS container_samples
+          FROM ${CONTAINER_SAMPLES_TABLE}
+          WHERE container_id IN ({ids:Array(UInt32)})
+            AND ts >= toDateTime({from:UInt32})
+            AND ts < toDateTime({to:UInt32})
+          GROUP BY container_id, minute
+        )
+        GROUP BY minute
+      )
       GROUP BY bucket_start
       ORDER BY bucket_start ASC
     `,
-    [serviceId, fromStr, toStr],
+    {
+      ids: containerIds,
+      from: toEpochSeconds(window.from),
+      to: toEpochSeconds(window.to),
+    },
   )
 
-  const points: TimeseriesPoint[] = rows.map((row) => {
-    const count = row.sample_count == null ? null : Number(row.sample_count)
-    if (metric === 'memory') {
-      const value = pickAgg(agg, {
-        avg: row.mem_used_avg == null ? null : Number(row.mem_used_avg),
-        sum: row.mem_used_sum == null ? null : Number(row.mem_used_sum),
-        count,
-        max: row.mem_used_max == null ? null : Number(row.mem_used_max),
-      })
-      return buildScalarPoint(row.bucket_start, metric, agg, value, totalMemLimit)
-    }
-    const value = pickAgg(agg, {
-      avg: row.cpu_avg == null ? null : Number(row.cpu_avg),
-      sum: row.cpu_sum == null ? null : Number(row.cpu_sum),
-      count,
-      max: row.cpu_max == null ? null : Number(row.cpu_max),
-    })
-    return buildScalarPoint(row.bucket_start, metric, agg, value, null)
-  })
+  const points = rows.map((row) =>
+    buildScalarPoint(row.bucket_start, metric, agg, chNumber(row.value), totalMemLimit),
+  )
 
-  return {
-    service: serviceSubject,
-    points,
-  }
-}
-
-interface ContainerSampleRow extends RowDataPacket {
-  bucket_start: string
-  cpu_sum: number | null
-  cpu_max: number | null
-  mem_sum: number | null
-  mem_max: number | null
-  sample_count: number | null
-  mem_limit_bytes: number | null
-  cpu_quota_cores: number | null
-  net_rx_last: number | null
-  net_tx_last: number | null
-}
-
-interface ContainerMinuteRow extends RowDataPacket {
-  bucket_start: string
-  cpu_pct_sum: number | null
-  mem_used_sum: number | null
-  sample_count: number | null
-  mem_limit_bytes_last: number | null
+  return { service: serviceSubject, points }
 }
 
 export async function getContainerTimeseries(
@@ -1042,61 +1037,30 @@ export async function getContainerTimeseries(
   if (!containerRows.length) return null
   const container = containerRows[0]
 
-  const fromStr = toMysqlUtc(window.from)
-  const toStr = toMysqlUtc(window.to)
-
-  const bucketExpr = bucketExprFor(granularity)
-  // The grouped query always yields the per-bucket net rate inputs plus the
-  // SQL aggregates; percentiles later override only the plotted value field.
-  const [rows] = await pool.query<ContainerSampleRow[]>(
+  // net_*_last are the newest counter readings inside each bucket; the rates
+  // are derived from bucket-to-bucket deltas below, exactly as before.
+  const column = metric === 'memory' ? 'mem_used' : 'cpu_pct'
+  const rows = await chSelect<ChTimeseriesRow>(
     `
       SELECT
-        ${bucketExpr} AS bucket_start,
-        SUM(cpu_pct_sum) AS cpu_sum,
-        MAX(cpu_pct_max) AS cpu_max,
-        SUM(mem_used_sum) AS mem_sum,
-        MAX(mem_used_max) AS mem_max,
-        SUM(sample_count) AS sample_count,
-        MAX(mem_limit_bytes_last) AS mem_limit_bytes,
-        MAX(cpu_quota_cores_last) AS cpu_quota_cores,
-        CAST(SUBSTRING_INDEX(GROUP_CONCAT(net_rx_last ORDER BY bucket_start DESC), ',', 1) AS UNSIGNED) AS net_rx_last,
-        CAST(SUBSTRING_INDEX(GROUP_CONCAT(net_tx_last ORDER BY bucket_start DESC), ',', 1) AS UNSIGNED) AS net_tx_last
-      FROM metric_container_samples
-      WHERE entity_id = ?
-        AND bucket_start >= ?
-        AND bucket_start < ?
+        ${bucketStartExpr(granularity)} AS bucket_start,
+        ${aggExprOver(agg, { value: column })} AS value,
+        max(mem_limit) AS reference,
+        argMax(net_rx, ts) AS net_rx_last,
+        argMax(net_tx, ts) AS net_tx_last
+      FROM ${CONTAINER_SAMPLES_TABLE}
+      WHERE container_id = {entity_id:UInt32}
+        AND ts >= toDateTime({from:UInt32})
+        AND ts < toDateTime({to:UInt32})
       GROUP BY bucket_start
       ORDER BY bucket_start ASC
     `,
-    [container.id, fromStr, toStr],
+    {
+      entity_id: container.id,
+      from: toEpochSeconds(window.from),
+      to: toEpochSeconds(window.to),
+    },
   )
-
-  // Percentile aggregates need per-minute values; keyed by bucket for merge.
-  let percentileByBucket: Map<string, number | null> | null = null
-  if (isPercentileAgg(agg)) {
-    const [minuteRows] = await pool.query<ContainerMinuteRow[]>(
-      `
-        SELECT bucket_start, cpu_pct_sum, mem_used_sum, sample_count
-        FROM metric_container_samples
-        WHERE entity_id = ?
-          AND bucket_start >= ?
-          AND bucket_start < ?
-        ORDER BY bucket_start ASC
-      `,
-      [container.id, fromStr, toStr],
-    )
-    const percentilePts = percentilePoints(minuteRows, granularity, metric, agg, (row) => {
-      const count = Number(row.sample_count) || 0
-      const sum = metric === 'memory' ? Number(row.mem_used_sum) : Number(row.cpu_pct_sum)
-      return count ? sum / count : null
-    })
-    percentileByBucket = new Map(
-      percentilePts.map((point) => [
-        point.bucket_start,
-        metric === 'memory' ? point.avg_bytes ?? null : point.avg,
-      ]),
-    )
-  }
 
   let prevRx: number | null = null
   let prevTx: number | null = null
@@ -1106,8 +1070,8 @@ export async function getContainerTimeseries(
     const bucketTime = new Date(`${row.bucket_start.replace(' ', 'T')}Z`).getTime()
     const deltaSeconds = prevTime == null ? null : (bucketTime - prevTime) / 1000
 
-    const rx = row.net_rx_last == null ? null : Number(row.net_rx_last)
-    const tx = row.net_tx_last == null ? null : Number(row.net_tx_last)
+    const rx = chNumber(row.net_rx_last)
+    const tx = chNumber(row.net_tx_last)
 
     let netRxBps: number | null = null
     let netTxBps: number | null = null
@@ -1126,32 +1090,13 @@ export async function getContainerTimeseries(
     prevTx = tx
     prevTime = bucketTime
 
-    const count = row.sample_count == null ? null : Number(row.sample_count)
-    const limit = row.mem_limit_bytes == null ? null : Number(row.mem_limit_bytes)
-    const reference = metric === 'memory' ? limit : null
-
-    let value: number | null
-    if (percentileByBucket) {
-      value = percentileByBucket.get(row.bucket_start) ?? null
-    } else if (metric === 'memory') {
-      const sum = row.mem_sum == null ? null : Number(row.mem_sum)
-      value = pickAgg(agg, {
-        avg: sum != null && count ? sum / count : null,
-        sum,
-        count,
-        max: row.mem_max == null ? null : Number(row.mem_max),
-      })
-    } else {
-      const sum = row.cpu_sum == null ? null : Number(row.cpu_sum)
-      value = pickAgg(agg, {
-        avg: sum != null && count ? sum / count : null,
-        sum,
-        count,
-        max: row.cpu_max == null ? null : Number(row.cpu_max),
-      })
-    }
-
-    const point = buildScalarPoint(row.bucket_start, metric, agg, value, reference)
+    const point = buildScalarPoint(
+      row.bucket_start,
+      metric,
+      agg,
+      chNumber(row.value),
+      metric === 'memory' ? chNumber(row.reference) : null,
+    )
     point.net_rx_bps = netRxBps
     point.net_tx_bps = netTxBps
     return point
@@ -1417,91 +1362,142 @@ const resolveEntities = async (rule: MetricAlertRuleRow): Promise<ResolvedEntity
 }
 
 // Returns the per-minute values (newest first) for the entity over the window,
-// or null entries where the metric can't be computed for that minute.
+// or null entries where the metric can't be computed for that minute. Values
+// are per-minute averages over the ClickHouse raw samples, which is what the
+// MySQL minute rollups stored.
 const entityWindowValues = async (
   rule: MetricAlertRuleRow,
   entity: ResolvedEntity,
 ): Promise<Array<number | null>> => {
   const limit = rule.sustained_minutes
+  // Anything older than the sustained window plus the staleness allowance can
+  // never satisfy isWindowFresh(), so bound the scan.
+  const from = toEpochSeconds(
+    new Date(Date.now() - (limit + ALERT_STALE_MINUTES + 2) * 60 * 1000),
+  )
 
   if (rule.scope === 'node') {
-    const [rows] = await pool.query<
-      ({ bucket_start: string; cpu_pct_sum: number; sample_count: number; mem_used_sum: number; mem_total_last: number | null } & RowDataPacket)[]
-    >(
+    const rows = await chSelect<{
+      bucket_start: string
+      cpu_avg: number | string | null
+      mem_avg: number | string | null
+      mem_total_last: number | string | null
+    }>(
       `
-        SELECT bucket_start, cpu_pct_sum, sample_count, mem_used_sum, mem_total_last
-        FROM metric_node_samples
-        WHERE entity_id = ?
+        SELECT
+          ${MINUTE_START_EXPR} AS bucket_start,
+          avg(cpu_pct) AS cpu_avg,
+          avg(mem_used) AS mem_avg,
+          max(mem_total) AS mem_total_last
+        FROM ${NODE_SAMPLES_TABLE}
+        WHERE node_id = {entity_id:UInt32}
+          AND ts >= toDateTime({from:UInt32})
+        GROUP BY bucket_start
         ORDER BY bucket_start DESC
-        LIMIT ?
+        LIMIT {limit:UInt32}
       `,
-      [entity.entityId, limit],
+      { entity_id: entity.entityId, from, limit },
     )
     if (!isWindowFresh(rows[0]?.bucket_start)) return []
     return rows.map((row) => {
       if (rule.metric === 'memory') {
-        const total = row.mem_total_last == null ? null : Number(row.mem_total_last)
-        return total ? (Number(row.mem_used_sum) / Number(row.sample_count) / total) * 100 : null
+        const total = chNumber(row.mem_total_last)
+        const used = chNumber(row.mem_avg)
+        return total && used != null ? (used / total) * 100 : null
       }
-      return Number(row.cpu_pct_sum) / Number(row.sample_count)
+      return chNumber(row.cpu_avg)
     })
   }
 
   if (rule.scope === 'container') {
-    const [rows] = await pool.query<
-      ({ bucket_start: string; cpu_pct_sum: number; sample_count: number; mem_used_sum: number; cpu_quota_cores_last: number | null; mem_limit_bytes_last: number | null } & RowDataPacket)[]
-    >(
+    const rows = await chSelect<{
+      bucket_start: string
+      cpu_avg: number | string | null
+      mem_avg: number | string | null
+      cpu_quota_cores_last: number | string | null
+      mem_limit_bytes_last: number | string | null
+    }>(
       `
-        SELECT bucket_start, cpu_pct_sum, sample_count, mem_used_sum, cpu_quota_cores_last, mem_limit_bytes_last
-        FROM metric_container_samples
-        WHERE entity_id = ?
+        SELECT
+          ${MINUTE_START_EXPR} AS bucket_start,
+          avg(cpu_pct) AS cpu_avg,
+          avg(mem_used) AS mem_avg,
+          argMax(cpu_quota_cores, ts) AS cpu_quota_cores_last,
+          argMax(mem_limit, ts) AS mem_limit_bytes_last
+        FROM ${CONTAINER_SAMPLES_TABLE}
+        WHERE container_id = {entity_id:UInt32}
+          AND ts >= toDateTime({from:UInt32})
+        GROUP BY bucket_start
         ORDER BY bucket_start DESC
-        LIMIT ?
+        LIMIT {limit:UInt32}
       `,
-      [entity.entityId, limit],
+      { entity_id: entity.entityId, from, limit },
     )
     if (!isWindowFresh(rows[0]?.bucket_start)) return []
     return rows.map((row) => {
-      const cpuPct = Number(row.cpu_pct_sum) / Number(row.sample_count)
+      const cpuPct = chNumber(row.cpu_avg)
       if (rule.metric === 'memory') {
-        const limitBytes = row.mem_limit_bytes_last == null ? null : Number(row.mem_limit_bytes_last)
-        return limitBytes ? (Number(row.mem_used_sum) / Number(row.sample_count) / limitBytes) * 100 : null
+        const limitBytes = chNumber(row.mem_limit_bytes_last)
+        const used = chNumber(row.mem_avg)
+        return limitBytes && used != null ? (used / limitBytes) * 100 : null
       }
       // Prefer % of allotted quota when a quota is set, else raw cpu_pct.
-      const quota = row.cpu_quota_cores_last == null ? null : Number(row.cpu_quota_cores_last)
-      return quota ? cpuPct / quota : cpuPct
+      const quota = chNumber(row.cpu_quota_cores_last)
+      return quota && cpuPct != null ? cpuPct / quota : cpuPct
     })
   }
 
   // service scope: aggregate across replicas per minute
-  const [rows] = await pool.query<
-    ({ bucket_start: string; cpu_avg: number | null; mem_used_total: number | null; mem_limit_total: number | null; null_limits: number } & RowDataPacket)[]
-  >(
+  const [containerRows] = await pool.query<({ id: number } & RowDataPacket)[]>(
+    'SELECT id FROM metric_containers WHERE service_id = ?',
+    [entity.entityId],
+  )
+  const containerIds = containerRows.map((row) => row.id)
+  if (!containerIds.length) return []
+
+  const rows = await chSelect<{
+    bucket_start: string
+    cpu_avg: number | string | null
+    mem_used_total: number | string | null
+    mem_limit_total: number | string | null
+    null_limits: number | string
+  }>(
     `
       SELECT
-        cs.bucket_start AS bucket_start,
-        SUM(cs.cpu_pct_sum) / SUM(cs.sample_count) AS cpu_avg,
-        SUM(cs.mem_used_sum / cs.sample_count) AS mem_used_total,
-        SUM(cs.mem_limit_bytes_last) AS mem_limit_total,
-        SUM(CASE WHEN cs.mem_limit_bytes_last IS NULL THEN 1 ELSE 0 END) AS null_limits
-      FROM metric_container_samples cs
-      JOIN metric_containers c ON c.id = cs.entity_id
-      WHERE c.service_id = ?
-      GROUP BY cs.bucket_start
-      ORDER BY cs.bucket_start DESC
-      LIMIT ?
+        formatDateTime(minute, '%Y-%m-%d %H:%M:%S', 'UTC') AS bucket_start,
+        sum(cpu_sum) / sum(cpu_samples) AS cpu_avg,
+        sum(mem_avg) AS mem_used_total,
+        sum(mem_limit_last) AS mem_limit_total,
+        countIf(isNull(mem_limit_last)) AS null_limits
+      FROM (
+        SELECT
+          container_id,
+          toStartOfMinute(ts, 'UTC') AS minute,
+          sum(cpu_pct) AS cpu_sum,
+          count() AS cpu_samples,
+          avg(mem_used) AS mem_avg,
+          argMax(mem_limit, ts) AS mem_limit_last
+        FROM ${CONTAINER_SAMPLES_TABLE}
+        WHERE container_id IN ({ids:Array(UInt32)})
+          AND ts >= toDateTime({from:UInt32})
+        GROUP BY container_id, minute
+      )
+      GROUP BY minute
+      ORDER BY minute DESC
+      LIMIT {limit:UInt32}
     `,
-    [entity.entityId, limit],
+    { ids: containerIds, from, limit },
   )
   if (!isWindowFresh(rows[0]?.bucket_start)) return []
   return rows.map((row) => {
     if (rule.metric === 'memory') {
       // Only a valid % when every replica reports a limit.
       if (Number(row.null_limits) > 0) return null
-      const limitTotal = row.mem_limit_total == null ? null : Number(row.mem_limit_total)
-      return limitTotal ? (Number(row.mem_used_total) / limitTotal) * 100 : null
+      const limitTotal = chNumber(row.mem_limit_total)
+      const used = chNumber(row.mem_used_total)
+      return limitTotal && used != null ? (used / limitTotal) * 100 : null
     }
-    return toFiniteOrNull(row.cpu_avg)
+    return chNumber(row.cpu_avg)
   })
 }
 
@@ -1618,6 +1614,10 @@ const sendAlert = async (
 }
 
 const evaluateAlerts = async (): Promise<void> => {
+  // Sample values come from ClickHouse; without it every rule would just log a
+  // failure, so skip the sweep entirely until the store is back.
+  if (!isClickhouseReady()) return
+
   const [rules] = await pool.query<MetricAlertRuleRow[]>(
     'SELECT * FROM metric_alert_rules WHERE enabled = 1',
   )
@@ -1636,47 +1636,51 @@ const evaluateAlerts = async (): Promise<void> => {
 // Retention + dimension pruning
 // ---------------------------------------------------------------------------
 
+// Sample retention is handled by the ClickHouse TTL (METRIC_RETENTION_DAYS),
+// so this sweep only prunes MySQL dimension rows. Pruned dimensions get their
+// ClickHouse rows removed with a fire-and-forget lightweight mutation, so no
+// orphaned samples linger for the rest of the TTL.
 const runRetention = async (): Promise<void> => {
-  const retentionDays = config.metrics.retentionDays
   const pruneDays = config.metrics.dimensionPruneDays
 
-  await pool.query(
-    'DELETE FROM metric_node_samples WHERE bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)',
-    [retentionDays],
-  )
-  await pool.query(
-    'DELETE FROM metric_container_samples WHERE bucket_start < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)',
-    [retentionDays],
-  )
-
-  // Prune stale containers (and their samples), then orphan services/nodes.
-  await pool.query(
-    `
-      DELETE s FROM metric_container_samples s
-      JOIN metric_containers c ON c.id = s.entity_id
-      WHERE c.last_seen < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
-    `,
+  const [staleContainers] = await pool.query<({ id: number } & RowDataPacket)[]>(
+    'SELECT id FROM metric_containers WHERE last_seen < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)',
     [pruneDays],
   )
   await pool.query(
     'DELETE FROM metric_containers WHERE last_seen < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)',
     [pruneDays],
   )
+  if (staleContainers.length) {
+    chCommandDetached(
+      `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} DELETE WHERE container_id IN (${staleContainers
+        .map((row) => Number(row.id))
+        .join(', ')})`,
+    )
+  }
+
   await pool.query(
     `
       DELETE FROM metric_services
       WHERE id NOT IN (SELECT service_id FROM metric_containers WHERE service_id IS NOT NULL)
     `,
   )
-  await pool.query(
+
+  const [staleNodes] = await pool.query<({ id: number } & RowDataPacket)[]>(
     `
-      DELETE s FROM metric_node_samples s
-      JOIN metric_nodes n ON n.id = s.entity_id
-      WHERE n.id NOT IN (SELECT node_id FROM metric_containers WHERE node_id IS NOT NULL)
-        AND n.last_seen < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
+      SELECT id FROM metric_nodes
+      WHERE id NOT IN (SELECT node_id FROM metric_containers WHERE node_id IS NOT NULL)
+        AND last_seen < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)
     `,
     [pruneDays],
   )
+  if (staleNodes.length) {
+    chCommandDetached(
+      `ALTER TABLE ${NODE_SAMPLES_TABLE} DELETE WHERE node_id IN (${staleNodes
+        .map((row) => Number(row.id))
+        .join(', ')})`,
+    )
+  }
   await pool.query(
     `
       DELETE FROM metric_nodes

@@ -76,6 +76,10 @@ Use `.env` (see `.env.example`):
 - `METRIC_RETENTION_DAYS`
 - `METRIC_DIMENSION_PRUNE_DAYS`
 - `METRIC_ALERT_POLL_MS`
+- `CLICKHOUSE_URL`
+- `CLICKHOUSE_USER`
+- `CLICKHOUSE_PASSWORD`
+- `CLICKHOUSE_DATABASE`
 
 Access control:
 
@@ -199,7 +203,18 @@ NATS JetStream probe commands (set as the monitor's probe command):
 Infrastructure metrics are pushed by the collector in [`sidecar-swarm/`](sidecar-swarm/README.md) — a zero-dependency Bun service deployed as a Docker Swarm `mode: global` stack (one instance per node) or as a plain container on any standalone Docker VM.
 
 - The sidecar reads the Docker socket and the host's `/proc` (read-only mounts) and POSTs one batch per node every 15s to `POST /api/metrics/ingest`, authenticated with a Bearer token (`METRICS_INGEST_TOKEN` — must match on both sides; ingest is disabled until it is set).
-- Samples are rolled up into 1-minute buckets on ingest and retained for `METRIC_RETENTION_DAYS` (default 90). Containers unseen for `METRIC_DIMENSION_PRUNE_DAYS` (default 7) are pruned along with their history.
+- **Storage:** raw samples (one row per collector tick, no pre-aggregation) go to **ClickHouse**; MySQL keeps only the dimension tables (nodes / services / containers) and the alert rules and state. Point the server at an existing ClickHouse HTTP endpoint with `CLICKHOUSE_URL` (default `http://localhost:8123`), `CLICKHOUSE_USER` (default `default`), `CLICKHOUSE_PASSWORD`, and `CLICKHOUSE_DATABASE` (default `uptime_metrics`). The database and the two tables — `metric_node_samples_raw` and `metric_container_samples_raw` — are created at startup if missing.
+- Retention is a ClickHouse `TTL ts + INTERVAL <METRIC_RETENTION_DAYS> DAY` (default 90) on both tables, so old samples expire without a delete sweep. Changing `METRIC_RETENTION_DAYS` only affects newly created tables; adjust an existing table with `ALTER TABLE <table> MODIFY TTL ts + INTERVAL <n> DAY`. Containers unseen for `METRIC_DIMENSION_PRUNE_DAYS` (default 7) are pruned from MySQL and their ClickHouse rows deleted with a lightweight mutation.
+- Keeping raw samples means p95/p99 are true quantiles over the samples themselves rather than an approximation over minute rollups.
+- If ClickHouse is unreachable the rest of the uptime monitor keeps running: the metrics APIs and `POST /api/metrics/ingest` answer `503` (the sidecar buffers and replays), and the server retries the ClickHouse connection every 30s.
+- **Backfill from the old MySQL rollups** (optional, run once after upgrading):
+
+  ```sh
+  bun server/scripts/backfillMetricsToClickhouse.ts            # refuses if the CH tables already have rows
+  bun server/scripts/backfillMetricsToClickhouse.ts --truncate # replace whatever is there
+  ```
+
+  It writes one synthetic raw row per minute bucket (`ts` = bucket start, values = the bucket average). Per-minute maxima are not recoverable, so `max`/`p95`/`p99` over backfilled ranges read as the per-minute averages; everything ingested afterwards has full raw resolution.
 - The `/metrics` page shows VM-level charts on top and a services table below, with **By Node** and **By Service** views drilling down to per-replica, minute-level charts. Allotted CPU quota and memory limits are drawn as reference lines so you can see % used vs allotted over time.
 - Alert rules (node / service / container scope, CPU% or memory%, sustained-minutes window, cooldown) are managed from the same page by editors and delivered via the configured Slack/webhook targets.
 

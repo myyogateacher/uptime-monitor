@@ -1648,8 +1648,176 @@ function NetRateChart({ points }: { points: MetricTimeseriesPoint[] }) {
     );
 }
 
-// Expandable services table used by both tabs. Row → per-replica rows;
-// replica → ContainerDetail.
+// Service-level drill-down shown at the top of an expanded services-table row.
+// Mirrors ContainerDetail (same range/agg threading, same chart styling) but
+// aggregated across replicas: CPU in cores with a dashed total-quota line and
+// memory with a dashed total-limit line. No net chart — net counters are
+// per-container only.
+function ServiceDetail({
+    service,
+    range,
+    refreshKey,
+}: {
+    service: MetricService;
+    range: MetricRangeOption;
+    refreshKey: number;
+}) {
+    const [cpu, setCpu] = useState<MetricTimeseriesResponse | null>(null);
+    const [mem, setMem] = useState<MetricTimeseriesResponse | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        const load = async () => {
+            try {
+                const [cpuRes, memRes] = await Promise.all([
+                    monitoringService.getServiceTimeseries(
+                        service.service_name,
+                        {
+                            metric: "cpu",
+                            granularity: range.granularity,
+                            rangeDays: range.rangeDays,
+                            from: range.from,
+                            to: range.to,
+                            agg: range.agg,
+                        },
+                    ),
+                    monitoringService.getServiceTimeseries(
+                        service.service_name,
+                        {
+                            metric: "memory",
+                            granularity: range.granularity,
+                            rangeDays: range.rangeDays,
+                            from: range.from,
+                            to: range.to,
+                            agg: range.agg,
+                        },
+                    ),
+                ]);
+                if (cancelled) return;
+                setCpu(cpuRes);
+                setMem(memRes);
+            } catch {
+                if (!cancelled) {
+                    setCpu(null);
+                    setMem(null);
+                }
+            }
+        };
+        void load();
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        service.service_name,
+        range.granularity,
+        range.rangeDays,
+        range.from,
+        range.to,
+        range.agg,
+        refreshKey,
+    ]);
+
+    const emptyLabel = range.custom ? "No data in this range." : undefined;
+    const countAgg = isCountAgg(range.agg);
+    const aggHint = aggLabel(range.agg);
+
+    const quotaCores =
+        cpu?.service?.total_quota_cores ?? service.total_quota_cores ?? null;
+    // CPU values use docker-stats units (100 == one core); the quota reference
+    // line is therefore cores * 100 in raw units.
+    const quotaRaw = quotaCores != null && quotaCores > 0 ? quotaCores * 100 : null;
+    const memLimit =
+        mem?.service?.total_mem_limit_bytes ??
+        service.total_mem_limit_bytes ??
+        null;
+
+    const latestCpu = cpu?.points?.[cpu.points.length - 1]?.avg ?? null;
+    const latestMem =
+        mem?.points?.[mem.points.length - 1]?.avg_bytes ??
+        service.mem_used_bytes ??
+        null;
+
+    const cpuUsedPct =
+        quotaRaw && latestCpu != null
+            ? (Number(latestCpu) / quotaRaw) * 100
+            : null;
+    const memUsedPct =
+        memLimit && memLimit > 0 && latestMem != null
+            ? (Number(latestMem) / memLimit) * 100
+            : null;
+
+    return (
+        <div className="glass-card mb-3 grid gap-4 rounded-xl border border-white/60 bg-white/40 p-4 md:grid-cols-2">
+            <div>
+                <ChartLabel>
+                    {countAgg ? "Service CPU (samples)" : "Service CPU (cores)"}{" "}
+                    · {aggHint}{" "}
+                    {!countAgg && quotaCores != null && (
+                        <span className="text-rose-500">quota {quotaCores}</span>
+                    )}
+                </ChartLabel>
+                <MetricChart
+                    points={cpu?.points ?? []}
+                    getValue={(point) =>
+                        countAgg
+                            ? Number(point.avg ?? 0)
+                            : Number(point.avg ?? 0) / 100
+                    }
+                    getTime={(point) => point.bucket_start}
+                    color="#0284c7"
+                    seriesLabel="CPU"
+                    referenceValue={countAgg ? null : (quotaCores ?? null)}
+                    referenceLabel="quota"
+                    valueFormatter={(value) =>
+                        countAgg
+                            ? `${Math.round(value)}`
+                            : `${Math.round(value * 100) / 100}`
+                    }
+                    height={96}
+                    emptyLabel={emptyLabel}
+                />
+                {!countAgg && cpuUsedPct != null && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                        {formatPct(cpuUsedPct)} of quota
+                    </p>
+                )}
+            </div>
+            <div>
+                <ChartLabel>
+                    {countAgg ? "Service memory (samples)" : "Service memory"} ·{" "}
+                    {aggHint}{" "}
+                    {!countAgg && memLimit != null && (
+                        <span className="text-rose-500">
+                            limit {formatBytes(memLimit)}
+                        </span>
+                    )}
+                </ChartLabel>
+                <MetricChart
+                    points={mem?.points ?? []}
+                    getValue={(point) => Number(point.avg_bytes ?? 0)}
+                    getTime={(point) => point.bucket_start}
+                    color="#0f766e"
+                    seriesLabel="Mem"
+                    referenceValue={countAgg ? null : memLimit}
+                    referenceLabel="limit"
+                    valueFormatter={(value) =>
+                        countAgg ? `${Math.round(value)}` : formatBytes(value)
+                    }
+                    height={96}
+                    emptyLabel={emptyLabel}
+                />
+                {!countAgg && memUsedPct != null && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                        {formatPct(memUsedPct)} of limit
+                    </p>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// Expandable services table used by both tabs. Row → service detail charts +
+// per-replica rows; replica → ContainerDetail.
 function ServicesTable({
     services,
     range,
@@ -1803,6 +1971,11 @@ function ServicesTable({
                                 {isOpen && (
                                     <tr className="border-b border-white/40 bg-white/30">
                                         <td colSpan={7} className="px-4 py-3">
+                                            <ServiceDetail
+                                                service={service}
+                                                range={range}
+                                                refreshKey={refreshKey}
+                                            />
                                             {rows.length === 0 ? (
                                                 <p className="text-xs text-slate-500">
                                                     No replicas reporting.

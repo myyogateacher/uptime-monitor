@@ -27,8 +27,12 @@ export interface ContainerMetrics {
   /**
    * Service identity, resolved via a fallback chain (swarm > compose > name):
    * com.docker.swarm.service.name, else com.docker.compose.service, else the
-   * container name as-is (bare `docker run` -> single-replica service). Only
-   * null when a container has no name at all.
+   * container name with trailing machine-generated segments stripped (bare
+   * `docker run`): UUIDs, hex blobs and timestamp-like suffixes are removed so
+   * ephemeral containers group under one service — `recorder-3f9a12ab-...`
+   * becomes `recorder`, while `worker-2` keeps its replica suffix. Stripping
+   * never applies to swarm/compose names. Only null when a container has no
+   * name at all.
    */
   service_name: string | null;
   /**

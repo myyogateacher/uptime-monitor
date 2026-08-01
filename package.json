@@ -15,6 +15,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@clickhouse/client": "^1.23.1",
     "@types/express-mysql-session": "^3.0.8",
     "cors": "^2.8.6",
     "cron-parser": "^5.5.0",
