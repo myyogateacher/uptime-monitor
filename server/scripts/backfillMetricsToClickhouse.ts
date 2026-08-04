@@ -104,6 +104,8 @@ interface NodeRollupRow extends RowDataPacket {
 
 interface ContainerRollupRow extends RowDataPacket {
   entity_id: number;
+  service_id: number | null;
+  node_id: number | null;
   bucket_start: Date | string;
   sample_count: number;
   cpu_pct_sum: number;
@@ -165,11 +167,11 @@ const backfillNodes = async (): Promise<void> => {
 const backfillContainers = async (): Promise<void> => {
   const { skip, beforeSql } = await prepareTable(CONTAINER_SAMPLES_TABLE);
   if (skip) return;
-  const where = beforeSql ? "WHERE bucket_start < ?" : "";
+  const where = beforeSql ? "WHERE s.bucket_start < ?" : "";
   const whereParams = beforeSql ? [beforeSql] : [];
 
   const [countRows] = await pool.query<({ total: number } & RowDataPacket)[]>(
-    `SELECT COUNT(*) AS total FROM metric_container_samples ${where}`,
+    `SELECT COUNT(*) AS total FROM metric_container_samples s ${where}`,
     whereParams,
   );
   const total = Number(countRows[0]?.total ?? 0);
@@ -179,13 +181,17 @@ const backfillContainers = async (): Promise<void> => {
   let copied = 0;
   for (;;) {
     const [rows] = await pool.query<ContainerRollupRow[]>(
+      // c.service_id / c.node_id are denormalized onto every ClickHouse sample so
+      // service- and node-scoped queries can filter without a container-id list.
       `
         SELECT
-          entity_id, bucket_start, sample_count, cpu_pct_sum, mem_used_sum,
-          cpu_quota_cores_last, mem_limit_bytes_last, net_rx_last, net_tx_last
-        FROM metric_container_samples
+          s.entity_id, s.bucket_start, s.sample_count, s.cpu_pct_sum, s.mem_used_sum,
+          s.cpu_quota_cores_last, s.mem_limit_bytes_last, s.net_rx_last, s.net_tx_last,
+          c.service_id, c.node_id
+        FROM metric_container_samples s
+        LEFT JOIN metric_containers c ON c.id = s.entity_id
         ${where}
-        ORDER BY entity_id ASC, bucket_start ASC
+        ORDER BY s.entity_id ASC, s.bucket_start ASC
         LIMIT ? OFFSET ?
       `,
       [...whereParams, BATCH_SIZE, offset],
@@ -196,6 +202,8 @@ const backfillContainers = async (): Promise<void> => {
       const count = Number(row.sample_count) || 1;
       return {
         container_id: Number(row.entity_id),
+        service_id: toUInt(row.service_id ?? 0),
+        node_id: toUInt(row.node_id ?? 0),
         ts: toEpochSeconds(bucketToDate(row.bucket_start)),
         cpu_pct: Number(row.cpu_pct_sum) / count,
         mem_used: toUInt(Number(row.mem_used_sum) / count),

@@ -84,21 +84,49 @@ const nodeSamplesDdl = (retentionDays: number): string => `
   TTL ts + INTERVAL ${retentionDays} DAY
 `
 
+// service_id / node_id are denormalized onto every sample so service-scoped and
+// node-scoped queries can filter by dimension directly. The alternative —
+// resolving container ids in MySQL and shipping the list to ClickHouse — grows
+// without bound, because every deployment mints a new task generation (and so a
+// new container row) per service. 0 means "unknown", which is what pre-upgrade
+// rows and containers with no service carry.
 const containerSamplesDdl = (retentionDays: number): string => `
   CREATE TABLE IF NOT EXISTS ${CONTAINER_SAMPLES_TABLE} (
     container_id UInt32,
+    service_id UInt32 DEFAULT 0,
+    node_id UInt32 DEFAULT 0,
     ts DateTime,
     cpu_pct Float32,
     mem_used UInt64,
     mem_limit Nullable(UInt64),
     cpu_quota_cores Nullable(Float32),
     net_rx UInt64,
-    net_tx UInt64
+    net_tx UInt64,
+    INDEX idx_service service_id TYPE set(0) GRANULARITY 4,
+    INDEX idx_node node_id TYPE set(0) GRANULARITY 4
   )
   ENGINE = MergeTree
   ORDER BY (container_id, ts)
   TTL ts + INTERVAL ${retentionDays} DAY
 `
+
+// In-place upgrade for tables created before service_id / node_id existed.
+// ORDER BY deliberately stays (container_id, ts) — changing the sort key would
+// require recreating the table. Rows are physically clustered by container, and
+// a container belongs to exactly one service and node, so the set(0) skipping
+// indexes prune granules very effectively despite service_id / node_id not
+// being in the sort key.
+//
+// ADD INDEX only covers parts written afterwards; existing parts are indexed by
+// the MATERIALIZE INDEX mutations that backfillSampleDimensions() issues once,
+// together with the service_id/node_id value backfill. Every statement here is
+// idempotent and cheap (metadata-only), so it is safe to run on every boot.
+const containerSamplesMigrations = (): string[] => [
+  `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} ADD COLUMN IF NOT EXISTS service_id UInt32 DEFAULT 0`,
+  `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} ADD COLUMN IF NOT EXISTS node_id UInt32 DEFAULT 0`,
+  `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} ADD INDEX IF NOT EXISTS idx_service service_id TYPE set(0) GRANULARITY 4`,
+  `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} ADD INDEX IF NOT EXISTS idx_node node_id TYPE set(0) GRANULARITY 4`,
+]
 
 /**
  * Creates the database and both sample tables if they do not exist. Never
@@ -122,6 +150,9 @@ export async function ensureClickhouseSchema(): Promise<boolean> {
     const ch = getClickhouse()
     await ch.command({ query: nodeSamplesDdl(retentionDays) })
     await ch.command({ query: containerSamplesDdl(retentionDays) })
+    for (const migration of containerSamplesMigrations()) {
+      await ch.command({ query: migration })
+    }
 
     ready = true
     lastError = null

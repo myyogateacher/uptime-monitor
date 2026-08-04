@@ -367,6 +367,7 @@ const insertNodeSample = async (
 const insertContainerSamples = async (
   containers: ContainerMetrics[],
   collectedAt: Date,
+  nodeId: number,
 ): Promise<void> => {
   const ts = toEpochSeconds(collectedAt)
   const rows: Record<string, unknown>[] = []
@@ -376,6 +377,12 @@ const insertContainerSamples = async (
     if (entityId == null) continue
     rows.push({
       container_id: entityId,
+      // Denormalized dimensions: they let service/node queries filter without a
+      // container-id list. 0 = unknown, matching the column default.
+      service_id: container.service_name
+        ? (serviceIdCache.get(container.service_name) ?? 0)
+        : 0,
+      node_id: nodeId,
       ts,
       cpu_pct: Number(container.cpu_pct) || 0,
       mem_used: toUInt(container.mem_used_bytes),
@@ -432,7 +439,7 @@ export async function ingestBatch(payload: unknown): Promise<IngestResult> {
   await upsertContainers(containers, nodeId)
 
   await insertNodeSample(nodeId, collectedAt, node)
-  await insertContainerSamples(containers, collectedAt)
+  await insertContainerSamples(containers, collectedAt, nodeId)
 
   return {
     accepted: true,
@@ -604,6 +611,7 @@ const listNodesQuery = async (): Promise<NodeOverviewRow[]> => {
 }
 
 interface ServiceContainerDimensionRow extends RowDataPacket {
+  service_id: number
   service_name: string
   container_id: number
   node_id: number | null
@@ -614,17 +622,16 @@ interface ServiceContainerDimensionRow extends RowDataPacket {
 }
 
 type ChServiceAggRow = {
-  service_idx: string | number
+  service_id: string | number
   cpu_value: unknown
   mem_value: unknown
 }
 
 // Window aggregate for every service in one ClickHouse round-trip.
 //
-// The container -> service mapping lives in MySQL, so it is pushed into the
-// query as two parallel arrays and resolved with transform(): container ids at
-// position i map to the service at serviceNames[i - 1] (1-based so 0 stays the
-// "unmapped" default, which the IN filter already excludes).
+// Filters on the denormalized service_id, so the only list crossing the wire is
+// the set of service ids — bounded by the number of services, not by the number
+// of container generations ever deployed.
 //
 // Three levels, matching getServiceTimeseries() exactly except that the outer
 // level collapses the whole window into one row per service instead of
@@ -632,35 +639,26 @@ type ChServiceAggRow = {
 //   inner  – per container, per minute (avg / max / sample count)
 //   middle – per minute totals across the service's replicas
 //   outer  – the requested agg over those per-minute totals
+//
+// `nodeId`, when set, restricts the aggregate to that node's replicas so the
+// By-Node view keeps meaning "this node's share of the service".
 const serviceWindowAggregates = async (
-  containerToService: Map<number, string>,
+  serviceIds: Map<number, string>,
   { agg, window }: ServiceAggWindow,
+  nodeId?: number,
 ): Promise<Map<string, { cpu: number | null; mem: number | null }>> => {
   const result = new Map<string, { cpu: number | null; mem: number | null }>()
-  if (!containerToService.size) return result
-
-  const serviceNames = [...new Set(containerToService.values())]
-  const serviceIndex = new Map(serviceNames.map((name, index) => [name, index + 1]))
-  const ids: number[] = []
-  const idServiceIdx: number[] = []
-  for (const [containerId, serviceName] of containerToService) {
-    ids.push(containerId)
-    idServiceIdx.push(serviceIndex.get(serviceName) as number)
-  }
-
-  // Inlined rather than bound — see toIntListSql().
-  const idsSql = toIntListSql(ids)
-  const serviceIdxSql = toIntListSql(idServiceIdx)
+  if (!serviceIds.size) return result
 
   const rows = await chSelect<ChServiceAggRow>(
     `
       SELECT
-        service_idx,
+        service_id,
         ${aggExprOver(agg, { value: 'cpu_total', max: 'cpu_max_total', count: 'sample_count' })} AS cpu_value,
         ${aggExprOver(agg, { value: 'mem_total', max: 'mem_max_total', count: 'sample_count' })} AS mem_value
       FROM (
         SELECT
-          service_idx,
+          service_id,
           minute,
           sum(cpu_avg) AS cpu_total,
           sum(cpu_max) AS cpu_max_total,
@@ -669,7 +667,7 @@ const serviceWindowAggregates = async (
           sum(container_samples) AS sample_count
         FROM (
           SELECT
-            transform(container_id, [${idsSql}], [${serviceIdxSql}], 0) AS service_idx,
+            service_id,
             toStartOfMinute(ts, 'UTC') AS minute,
             avg(cpu_pct) AS cpu_avg,
             max(cpu_pct) AS cpu_max,
@@ -677,23 +675,25 @@ const serviceWindowAggregates = async (
             max(mem_used) AS mem_max,
             count() AS container_samples
           FROM ${CONTAINER_SAMPLES_TABLE}
-          WHERE container_id IN (${idsSql})
+          WHERE service_id IN (${toIntListSql([...serviceIds.keys()])})
+            ${nodeId == null ? '' : 'AND node_id = {node_id:UInt32}'}
             AND ts >= toDateTime({from:UInt32})
             AND ts < toDateTime({to:UInt32})
-          GROUP BY service_idx, container_id, minute
+          GROUP BY service_id, container_id, minute
         )
-        GROUP BY service_idx, minute
+        GROUP BY service_id, minute
       )
-      GROUP BY service_idx
+      GROUP BY service_id
     `,
     {
       from: toEpochSeconds(window.from),
       to: toEpochSeconds(window.to),
+      ...(nodeId == null ? {} : { node_id: nodeId }),
     },
   )
 
   for (const row of rows) {
-    const name = serviceNames[Number(row.service_idx) - 1]
+    const name = serviceIds.get(Number(row.service_id))
     if (name == null) continue
     result.set(name, { cpu: chNumber(row.cpu_value), mem: chNumber(row.mem_value) })
   }
@@ -717,6 +717,7 @@ const listServicesQuery = async (
   const [rows] = await pool.query<ServiceContainerDimensionRow[]>(
     `
       SELECT
+        sv.id AS service_id,
         sv.service_name,
         c.id AS container_id,
         c.node_id,
@@ -734,17 +735,18 @@ const listServicesQuery = async (
   )
   if (!rows.length) return []
 
-  // Every container ever attached to the service feeds the window aggregate,
-  // matching getServiceTimeseries(); only live ones feed the live totals below.
-  const containerToService = new Map<number, string>()
-  for (const row of rows) {
-    containerToService.set(Number(row.container_id), row.service_name)
-  }
+  // The window aggregate is keyed by service id; only the services visible here
+  // are queried, and the node filter is reapplied inside ClickHouse so the
+  // By-Node view still reports that node's share.
+  const serviceIds = new Map<number, string>()
+  for (const row of rows) serviceIds.set(Number(row.service_id), row.service_name)
+  const aggNodeId =
+    nodeKey && rows[0]?.node_id != null ? Number(rows[0].node_id) : undefined
 
   const [latest, aggregates] = await Promise.all([
     latestContainerStats(),
     aggWindow
-      ? serviceWindowAggregates(containerToService, aggWindow)
+      ? serviceWindowAggregates(serviceIds, aggWindow, aggNodeId)
       : Promise.resolve(new Map<string, { cpu: number | null; mem: number | null }>()),
   ])
 
@@ -1075,15 +1077,14 @@ export async function getServiceTimeseries(
   if (!serviceRows.length) return null
   const serviceId = serviceRows[0].id
 
-  // Every container ever attached to the service feeds the history; only the
-  // live ones define the quota/limit reference lines (dead task generations
-  // used to multiply them).
+  // Only the live containers are needed now: history comes from the samples'
+  // own service_id, while the live replicas define the quota/limit reference
+  // lines (dead task generations used to multiply them).
   const [containerRows] = await pool.query<
-    ({ id: number; cpu_quota_cores: number | null; mem_limit_bytes: number | null; is_live: number } & RowDataPacket)[]
+    ({ cpu_quota_cores: number | null; mem_limit_bytes: number | null; is_live: number } & RowDataPacket)[]
   >(
     `
       SELECT
-        id,
         cpu_quota_cores,
         mem_limit_bytes,
         (last_seen >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)) AS is_live
@@ -1093,7 +1094,6 @@ export async function getServiceTimeseries(
     [LIVE_WINDOW_MINUTES, serviceId],
   )
 
-  const containerIds = containerRows.map((row) => row.id)
   const liveRows = containerRows.filter((row) => Number(row.is_live) === 1)
 
   let totalQuota: number | null = null
@@ -1114,17 +1114,14 @@ export async function getServiceTimeseries(
     total_mem_limit_bytes: totalMemLimit,
   }
 
-  if (!containerIds.length) {
-    return { service: serviceSubject, points: [] }
-  }
-
+  // No container-list guard: the samples carry service_id themselves, so history
+  // is returned even when the MySQL dimension rows have already been pruned.
+  //
   // Two levels of aggregation, matching the previous MySQL shape exactly:
   //   inner  – per container, per minute (avg / max / sample count)
   //   middle – per minute totals across replicas
   //   outer  – re-bucket to the requested granularity
   const column = metric === 'memory' ? 'mem_used' : 'cpu_pct'
-  // Inlined rather than bound — see toIntListSql().
-  const idsSql = toIntListSql(containerIds)
   const rows = await chSelect<ChTimeseriesRow>(
     `
       SELECT
@@ -1144,7 +1141,7 @@ export async function getServiceTimeseries(
             max(${column}) AS container_max,
             count() AS container_samples
           FROM ${CONTAINER_SAMPLES_TABLE}
-          WHERE container_id IN (${idsSql})
+          WHERE service_id = {service_id:UInt32}
             AND ts >= toDateTime({from:UInt32})
             AND ts < toDateTime({to:UInt32})
           GROUP BY container_id, minute
@@ -1155,6 +1152,7 @@ export async function getServiceTimeseries(
       ORDER BY bucket_start ASC
     `,
     {
+      service_id: serviceId,
       from: toEpochSeconds(window.from),
       to: toEpochSeconds(window.to),
     },
@@ -1593,14 +1591,9 @@ const entityWindowValues = async (
     })
   }
 
-  // service scope: aggregate across replicas per minute
-  const [containerRows] = await pool.query<({ id: number } & RowDataPacket)[]>(
-    'SELECT id FROM metric_containers WHERE service_id = ?',
-    [entity.entityId],
-  )
-  const containerIds = containerRows.map((row) => row.id)
-  if (!containerIds.length) return []
-
+  // service scope: aggregate across replicas per minute. Filtering on the
+  // samples' own service_id removes what used to be a MySQL round-trip for the
+  // replica list.
   const rows = await chSelect<{
     bucket_start: string
     cpu_avg: number | string | null
@@ -1624,7 +1617,7 @@ const entityWindowValues = async (
           avg(mem_used) AS mem_avg,
           argMax(mem_limit, ts) AS mem_limit_last
         FROM ${CONTAINER_SAMPLES_TABLE}
-        WHERE container_id IN (${toIntListSql(containerIds)})
+        WHERE service_id = {entity_id:UInt32}
           AND ts >= toDateTime({from:UInt32})
         GROUP BY container_id, minute
       )
@@ -1632,7 +1625,7 @@ const entityWindowValues = async (
       ORDER BY minute DESC
       LIMIT {limit:UInt32}
     `,
-    { from, limit },
+    { entity_id: entity.entityId, from, limit },
   )
   if (!isWindowFresh(rows[0]?.bucket_start)) return []
   return rows.map((row) => {
@@ -1779,6 +1772,74 @@ const evaluateAlerts = async (): Promise<void> => {
 }
 
 // ---------------------------------------------------------------------------
+// One-time sample dimension backfill
+// ---------------------------------------------------------------------------
+
+// Containers per mutation. Keeps each statement well inside ClickHouse's
+// max_query_size (256 KB by default) — ~2000 ids render to roughly 30 KB across
+// the three inlined lists.
+const DIMENSION_BACKFILL_CHUNK = 2000
+
+let sampleDimensionBackfillDone = false
+
+interface ContainerDimensionIdRow extends RowDataPacket {
+  id: number
+  service_id: number | null
+  node_id: number | null
+}
+
+// Stamps service_id / node_id onto samples ingested before those columns
+// existed. Without it, every service-scoped query (which now filters on
+// service_id) would silently omit all pre-upgrade history until the TTL aged it
+// out. Runs at most once per boot, and only while rows still need fixing, so it
+// becomes a single cheap probe once the fleet has been upgraded.
+//
+// The WHERE clause is restricted to the containers this chunk can actually
+// resolve, so containers that genuinely have no service (service_id stays 0) do
+// not keep the mutation alive on later boots.
+const backfillSampleDimensions = async (): Promise<void> => {
+  if (sampleDimensionBackfillDone) return
+  if (!isClickhouseReady()) return
+  // Attempt once per boot regardless of outcome: a failing mutation must not be
+  // reissued on every tick.
+  sampleDimensionBackfillDone = true
+
+  const probe = await chSelect<{ total: string | number }>(
+    `SELECT count() AS total FROM ${CONTAINER_SAMPLES_TABLE} WHERE service_id = 0 OR node_id = 0`,
+  )
+  const pending = Number(probe[0]?.total ?? 0)
+  if (!pending) return
+
+  const [rows] = await pool.query<ContainerDimensionIdRow[]>(
+    'SELECT id, service_id, node_id FROM metric_containers WHERE service_id IS NOT NULL OR node_id IS NOT NULL',
+  )
+  if (!rows.length) return
+
+  console.log(
+    `[metrics] backfilling service_id/node_id on ${pending} container samples (${rows.length} containers)`,
+  )
+
+  for (let offset = 0; offset < rows.length; offset += DIMENSION_BACKFILL_CHUNK) {
+    const chunk = rows.slice(offset, offset + DIMENSION_BACKFILL_CHUNK)
+    const idsSql = toIntListSql(chunk.map((row) => row.id))
+    const serviceIdsSql = toIntListSql(chunk.map((row) => row.service_id ?? 0))
+    const nodeIdsSql = toIntListSql(chunk.map((row) => row.node_id ?? 0))
+    chCommandDetached(
+      `ALTER TABLE ${CONTAINER_SAMPLES_TABLE}
+         UPDATE
+           service_id = transform(container_id, [${idsSql}], [${serviceIdsSql}], 0),
+           node_id = transform(container_id, [${idsSql}], [${nodeIdsSql}], 0)
+         WHERE (service_id = 0 OR node_id = 0)
+           AND container_id IN (${idsSql})`,
+    )
+  }
+
+  // Index the pre-existing parts; ADD INDEX alone only covers new ones.
+  chCommandDetached(`ALTER TABLE ${CONTAINER_SAMPLES_TABLE} MATERIALIZE INDEX idx_service`)
+  chCommandDetached(`ALTER TABLE ${CONTAINER_SAMPLES_TABLE} MATERIALIZE INDEX idx_node`)
+}
+
+// ---------------------------------------------------------------------------
 // Retention + dimension pruning
 // ---------------------------------------------------------------------------
 
@@ -1850,6 +1911,10 @@ async function tick(): Promise<void> {
   isTickRunning = true
 
   try {
+    // Deferred to the ticker rather than startup so it retries on a later tick
+    // if ClickHouse was still unreachable when the process booted.
+    await backfillSampleDimensions()
+
     if (Date.now() - lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
       await runRetention()
       lastRetentionCleanupAt = Date.now()
