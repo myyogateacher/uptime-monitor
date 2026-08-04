@@ -1887,8 +1887,9 @@ function ServicesTable({
                 <thead>
                     <tr className="border-b border-white/60 text-xs uppercase tracking-wide text-slate-500">
                         <th className="px-4 py-3">Service</th>
-                        <th className="px-4 py-3">Replicas</th>
-                        <th className="px-4 py-3">Nodes</th>
+                        <th className="whitespace-nowrap px-4 py-3">
+                            Replicas / Nodes
+                        </th>
                         <th className="whitespace-nowrap px-4 py-3">
                             CPU
                             {showAgg && (
@@ -1970,10 +1971,11 @@ function ServicesTable({
                                             {service.service_name}
                                         </span>
                                     </td>
-                                    <td className="px-4 py-3 text-slate-600">
+                                    <td className="whitespace-nowrap px-4 py-3 text-slate-600">
                                         {service.container_count}
-                                    </td>
-                                    <td className="px-4 py-3 text-slate-600">
+                                        <span className="mx-1 text-slate-300">
+                                            /
+                                        </span>
                                         {service.node_count}
                                     </td>
                                     <td className="whitespace-nowrap px-4 py-3 text-slate-600">
@@ -2063,7 +2065,7 @@ function ServicesTable({
                                 </tr>
                                 {isOpen && (
                                     <tr className="border-b border-white/40 bg-white/30">
-                                        <td colSpan={7} className="px-4 py-3">
+                                        <td colSpan={6} className="px-4 py-3">
                                             <ServiceDetail
                                                 service={service}
                                                 range={range}
@@ -2715,7 +2717,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
 
     return (
         <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
-            <div className="mx-auto flex max-w-6xl flex-col gap-6">
+            <div className="mx-auto flex max-w-7xl flex-col gap-6">
                 <header className="glass-card relative z-30 flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6">
                     <div>
                         <h1 className="text-2xl font-semibold tracking-tight">
