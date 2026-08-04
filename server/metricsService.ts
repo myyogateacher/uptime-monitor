@@ -163,9 +163,9 @@ const bucketOf = (granularity: MetricGranularity, column = 'ts'): string => {
 // Renders the bucket as the exact 'YYYY-MM-DD HH:MM:SS' string the MySQL
 // implementation returned, so bucket_start stays byte-identical for clients.
 const bucketStartExpr = (granularity: MetricGranularity, column = 'ts'): string =>
-  `formatDateTime(${bucketOf(granularity, column)}, '%Y-%m-%d %H:%M:%S', 'UTC')`
+  `formatDateTime(${bucketOf(granularity, column)}, '%Y-%m-%d %H:%i:%S', 'UTC')`
 
-const MINUTE_START_EXPR = `formatDateTime(toStartOfMinute(ts, 'UTC'), '%Y-%m-%d %H:%M:%S', 'UTC')`
+const MINUTE_START_EXPR = `formatDateTime(toStartOfMinute(ts, 'UTC'), '%Y-%m-%d %H:%i:%S', 'UTC')`
 
 // Builds the per-bucket aggregate expression. `value` is the raw sample column
 // (or a pre-aggregated per-minute total for service queries); `max`/`count`
@@ -1603,7 +1603,7 @@ const entityWindowValues = async (
   }>(
     `
       SELECT
-        formatDateTime(minute, '%Y-%m-%d %H:%M:%S', 'UTC') AS bucket_start,
+        formatDateTime(minute, '%Y-%m-%d %H:%i:%S', 'UTC') AS bucket_start,
         sum(cpu_sum) / sum(cpu_samples) AS cpu_avg,
         sum(mem_avg) AS mem_used_total,
         sum(mem_limit_last) AS mem_limit_total,
