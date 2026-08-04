@@ -448,10 +448,19 @@ type ServiceOverviewRow = {
   node_count: number
   cpu_pct_total: number | null
   mem_used_total: number | null
+  // Window-aggregated companions to the two live values above. Null unless the
+  // caller asked for an aggregate window (see ServiceAggWindow).
+  cpu_pct_total_agg: number | null
+  mem_used_agg: number | null
   total_quota_cores: number | null
   total_mem_limit_bytes: number | null
   last_seen: Date | string | null
 }
+
+// Opt-in request for the window-aggregated per-service values. Omitted by
+// callers that only need the live snapshot (keeps the extra query off the
+// default overview path).
+export type ServiceAggWindow = { agg: MetricAgg; window: MetricWindow }
 
 interface NodeDimensionRow extends RowDataPacket {
   id: number
@@ -577,7 +586,95 @@ interface ServiceContainerDimensionRow extends RowDataPacket {
   is_live: number
 }
 
-const listServicesQuery = async (nodeKey?: string): Promise<ServiceOverviewRow[]> => {
+type ChServiceAggRow = {
+  service_idx: string | number
+  cpu_value: unknown
+  mem_value: unknown
+}
+
+// Window aggregate for every service in one ClickHouse round-trip.
+//
+// The container -> service mapping lives in MySQL, so it is pushed into the
+// query as two parallel arrays and resolved with transform(): container ids at
+// position i map to the service at serviceNames[i - 1] (1-based so 0 stays the
+// "unmapped" default, which the IN filter already excludes).
+//
+// Three levels, matching getServiceTimeseries() exactly except that the outer
+// level collapses the whole window into one row per service instead of
+// re-bucketing to a granularity:
+//   inner  – per container, per minute (avg / max / sample count)
+//   middle – per minute totals across the service's replicas
+//   outer  – the requested agg over those per-minute totals
+const serviceWindowAggregates = async (
+  containerToService: Map<number, string>,
+  { agg, window }: ServiceAggWindow,
+): Promise<Map<string, { cpu: number | null; mem: number | null }>> => {
+  const result = new Map<string, { cpu: number | null; mem: number | null }>()
+  if (!containerToService.size) return result
+
+  const serviceNames = [...new Set(containerToService.values())]
+  const serviceIndex = new Map(serviceNames.map((name, index) => [name, index + 1]))
+  const ids: number[] = []
+  const idServiceIdx: number[] = []
+  for (const [containerId, serviceName] of containerToService) {
+    ids.push(containerId)
+    idServiceIdx.push(serviceIndex.get(serviceName) as number)
+  }
+
+  const rows = await chSelect<ChServiceAggRow>(
+    `
+      SELECT
+        service_idx,
+        ${aggExprOver(agg, { value: 'cpu_total', max: 'cpu_max_total', count: 'sample_count' })} AS cpu_value,
+        ${aggExprOver(agg, { value: 'mem_total', max: 'mem_max_total', count: 'sample_count' })} AS mem_value
+      FROM (
+        SELECT
+          service_idx,
+          minute,
+          sum(cpu_avg) AS cpu_total,
+          sum(cpu_max) AS cpu_max_total,
+          sum(mem_avg) AS mem_total,
+          sum(mem_max) AS mem_max_total,
+          sum(container_samples) AS sample_count
+        FROM (
+          SELECT
+            transform(container_id, {ids:Array(UInt32)}, {service_idx_map:Array(UInt32)}, 0) AS service_idx,
+            toStartOfMinute(ts, 'UTC') AS minute,
+            avg(cpu_pct) AS cpu_avg,
+            max(cpu_pct) AS cpu_max,
+            avg(mem_used) AS mem_avg,
+            max(mem_used) AS mem_max,
+            count() AS container_samples
+          FROM ${CONTAINER_SAMPLES_TABLE}
+          WHERE container_id IN ({ids:Array(UInt32)})
+            AND ts >= toDateTime({from:UInt32})
+            AND ts < toDateTime({to:UInt32})
+          GROUP BY service_idx, container_id, minute
+        )
+        GROUP BY service_idx, minute
+      )
+      GROUP BY service_idx
+    `,
+    {
+      ids,
+      service_idx_map: idServiceIdx,
+      from: toEpochSeconds(window.from),
+      to: toEpochSeconds(window.to),
+    },
+  )
+
+  for (const row of rows) {
+    const name = serviceNames[Number(row.service_idx) - 1]
+    if (name == null) continue
+    result.set(name, { cpu: chNumber(row.cpu_value), mem: chNumber(row.mem_value) })
+  }
+  return result
+}
+
+const listServicesQuery = async (
+  nodeKey?: string,
+  aggWindow?: ServiceAggWindow,
+): Promise<ServiceOverviewRow[]> => {
   const params: unknown[] = [LIVE_WINDOW_MINUTES]
   let nodeFilter = ''
   if (nodeKey) {
@@ -608,7 +705,19 @@ const listServicesQuery = async (nodeKey?: string): Promise<ServiceOverviewRow[]
   )
   if (!rows.length) return []
 
-  const latest = await latestContainerStats()
+  // Every container ever attached to the service feeds the window aggregate,
+  // matching getServiceTimeseries(); only live ones feed the live totals below.
+  const containerToService = new Map<number, string>()
+  for (const row of rows) {
+    containerToService.set(Number(row.container_id), row.service_name)
+  }
+
+  const [latest, aggregates] = await Promise.all([
+    latestContainerStats(),
+    aggWindow
+      ? serviceWindowAggregates(containerToService, aggWindow)
+      : Promise.resolve(new Map<string, { cpu: number | null; mem: number | null }>()),
+  ])
 
   type Accumulator = {
     service_name: string
@@ -671,6 +780,8 @@ const listServicesQuery = async (nodeKey?: string): Promise<ServiceOverviewRow[]
       node_count: entry.liveNodes.size,
       cpu_pct_total: entry.cpuTotal,
       mem_used_total: entry.memTotal,
+      cpu_pct_total_agg: aggregates.get(entry.service_name)?.cpu ?? null,
+      mem_used_agg: aggregates.get(entry.service_name)?.mem ?? null,
       total_quota_cores: entry.quotaTotal,
       total_mem_limit_bytes: entry.memLimitTotal,
       last_seen: entry.lastSeen,
@@ -704,6 +815,8 @@ const serializeServiceOverview = (row: ServiceOverviewRow) => {
     node_count: Number(row.node_count),
     cpu_pct_total: toFiniteOrNull(row.cpu_pct_total),
     mem_used_bytes: memUsed,
+    cpu_pct_total_agg: toFiniteOrNull(row.cpu_pct_total_agg),
+    mem_used_agg: toFiniteOrNull(row.mem_used_agg),
     total_quota_cores: row.total_quota_cores == null ? null : Number(row.total_quota_cores),
     total_mem_limit_bytes: memLimit,
     mem_pct: memUsed != null && memLimit ? (memUsed / memLimit) * 100 : null,
@@ -711,8 +824,11 @@ const serializeServiceOverview = (row: ServiceOverviewRow) => {
   }
 }
 
-export async function getOverview() {
-  const [nodes, services] = await Promise.all([listNodesQuery(), listServicesQuery()])
+export async function getOverview(aggWindow?: ServiceAggWindow) {
+  const [nodes, services] = await Promise.all([
+    listNodesQuery(),
+    listServicesQuery(undefined, aggWindow),
+  ])
   return {
     nodes: nodes.map(serializeNodeOverview),
     services: services.map(serializeServiceOverview),
@@ -724,13 +840,13 @@ export async function listNodes() {
   return rows.map(serializeNodeOverview)
 }
 
-export async function listServices() {
-  const rows = await listServicesQuery()
+export async function listServices(aggWindow?: ServiceAggWindow) {
+  const rows = await listServicesQuery(undefined, aggWindow)
   return rows.map(serializeServiceOverview)
 }
 
-export async function listServicesOnNode(nodeKey: string) {
-  const rows = await listServicesQuery(nodeKey)
+export async function listServicesOnNode(nodeKey: string, aggWindow?: ServiceAggWindow) {
+  const rows = await listServicesQuery(nodeKey, aggWindow)
   return rows.map(serializeServiceOverview)
 }
 

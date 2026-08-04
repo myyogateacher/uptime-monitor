@@ -83,6 +83,7 @@ import {
   type MetricGranularity,
   type MetricKind,
   type MetricWindow,
+  type ServiceAggWindow,
   createAlertRule,
   deleteAlertRule,
   getAlertRule,
@@ -887,6 +888,33 @@ const resolveMetricWindow = (
   }
 
   return { ok: true, window: { from, to: clampedTo }, rangeDays: spanDays };
+};
+
+type ServiceAggWindowResult =
+  | { ok: true; aggWindow: ServiceAggWindow | undefined }
+  | { ok: false; error: string };
+
+// The service listings return window-aggregated values only when the caller
+// asks for them. Any of agg / range_days / from / to opts in; a request with
+// none of them keeps the original live-only behavior (and skips the extra
+// ClickHouse query).
+const resolveServiceAggWindow = (
+  query: Request["query"],
+): ServiceAggWindowResult => {
+  const wantsAgg =
+    query.agg != null ||
+    query.range_days != null ||
+    query.from != null ||
+    query.to != null;
+  if (!wantsAgg) return { ok: true, aggWindow: undefined };
+
+  const granularity = parseMetricGranularity(query.granularity);
+  const resolved = resolveMetricWindow(query, granularity);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  return {
+    ok: true,
+    aggWindow: { agg: parseMetricAgg(query.agg), window: resolved.window },
+  };
 };
 
 const getMappedEndpointById = async (
@@ -2477,8 +2505,12 @@ app.get(
   "/api/metrics/overview",
   requireViewer,
   requireClickhouse,
-  async (_req: Request, res: Response) => {
-    res.json(await getOverview());
+  async (req: Request, res: Response) => {
+    const resolved = resolveServiceAggWindow(req.query);
+    if (!resolved.ok) {
+      return res.status(400).json({ error: resolved.error });
+    }
+    return res.json(await getOverview(resolved.aggWindow));
   },
 );
 
@@ -2500,7 +2532,11 @@ app.get(
     if (!nodeKey) {
       return res.status(400).json({ error: "Invalid node key" });
     }
-    return res.json(await listServicesOnNode(nodeKey));
+    const resolved = resolveServiceAggWindow(req.query);
+    if (!resolved.ok) {
+      return res.status(400).json({ error: resolved.error });
+    }
+    return res.json(await listServicesOnNode(nodeKey, resolved.aggWindow));
   },
 );
 
@@ -2508,8 +2544,12 @@ app.get(
   "/api/metrics/services",
   requireViewer,
   requireClickhouse,
-  async (_req: Request, res: Response) => {
-    res.json(await listServices());
+  async (req: Request, res: Response) => {
+    const resolved = resolveServiceAggWindow(req.query);
+    if (!resolved.ok) {
+      return res.status(400).json({ error: resolved.error });
+    }
+    return res.json(await listServices(resolved.aggWindow));
   },
 );
 

@@ -48,6 +48,7 @@ import {
     type MetricKind,
     type MetricNode,
     type MetricService,
+    type MetricServiceListOptions,
     type MetricsOverview,
     type MetricTimeseriesPoint,
     type MetricTimeseriesResponse,
@@ -1837,6 +1838,15 @@ function ServicesTable({
         null,
     );
 
+    // The CPU/Memory cells pair the live reading with the window aggregate.
+    // Count aggregates are sample counts, not cores/bytes, so they are skipped.
+    const showAgg = !isCountAgg(range.agg);
+    const aggTitle = `${aggLabel(range.agg)} · ${
+        range.custom && range.from && range.to
+            ? `${range.from} → ${range.to}`
+            : `last ${range.label}`
+    }`;
+
     const toggleService = useCallback(
         async (serviceName: string) => {
             setSelectedContainer(null);
@@ -1879,8 +1889,22 @@ function ServicesTable({
                         <th className="px-4 py-3">Service</th>
                         <th className="px-4 py-3">Replicas</th>
                         <th className="px-4 py-3">Nodes</th>
-                        <th className="px-4 py-3">CPU</th>
-                        <th className="px-4 py-3">Memory</th>
+                        <th className="whitespace-nowrap px-4 py-3">
+                            CPU
+                            {showAgg && (
+                                <span className="ml-1 normal-case text-slate-400">
+                                    (live / {aggLabel(range.agg)})
+                                </span>
+                            )}
+                        </th>
+                        <th className="whitespace-nowrap px-4 py-3">
+                            Memory
+                            {showAgg && (
+                                <span className="ml-1 normal-case text-slate-400">
+                                    (live / {aggLabel(range.agg)})
+                                </span>
+                            )}
+                        </th>
                         <th className="hidden px-4 py-3 lg:table-cell">
                             CPU trend
                         </th>
@@ -1905,6 +1929,25 @@ function ServicesTable({
                                 ? (service.mem_used_bytes /
                                       service.total_mem_limit_bytes) *
                                   100
+                                : null;
+                        // Window-aggregated companions. Count returns sample
+                        // counts rather than cores/bytes, so it is not shown
+                        // alongside the live reading.
+                        const cpuAgg = showAgg
+                            ? service.cpu_pct_total_agg
+                            : null;
+                        const memAgg = showAgg ? service.mem_used_agg : null;
+                        const quotaPctAgg =
+                            cpuAgg != null &&
+                            service.total_quota_cores &&
+                            service.total_quota_cores > 0
+                                ? cpuAgg / service.total_quota_cores
+                                : null;
+                        const memPctAgg =
+                            memAgg != null &&
+                            service.total_mem_limit_bytes &&
+                            service.total_mem_limit_bytes > 0
+                                ? (memAgg / service.total_mem_limit_bytes) * 100
                                 : null;
                         const rows = containers[service.service_name] ?? [];
                         return (
@@ -1933,22 +1976,72 @@ function ServicesTable({
                                     <td className="px-4 py-3 text-slate-600">
                                         {service.node_count}
                                     </td>
-                                    <td className="px-4 py-3 text-slate-600">
-                                        {formatCores(service.cpu_pct_total ?? 0)}
-                                        {quotaPct != null && (
-                                            <span className="ml-1 text-xs text-slate-400">
-                                                ({formatPct(quotaPct)})
-                                            </span>
+                                    <td className="whitespace-nowrap px-4 py-3 text-slate-600">
+                                        <span
+                                            className="text-emerald-600"
+                                            title="Live"
+                                        >
+                                            {formatCores(
+                                                service.cpu_pct_total ?? 0,
+                                            )}
+                                            {quotaPct != null && (
+                                                <span className="ml-1 text-xs text-emerald-500">
+                                                    ({formatPct(quotaPct)})
+                                                </span>
+                                            )}
+                                        </span>
+                                        {cpuAgg != null && (
+                                            <>
+                                                <span className="mx-1 text-slate-300">
+                                                    /
+                                                </span>
+                                                <span title={aggTitle}>
+                                                    {formatCores(cpuAgg)}
+                                                    {quotaPctAgg != null && (
+                                                        <span className="ml-1 text-xs text-slate-400">
+                                                            (
+                                                            {formatPct(
+                                                                quotaPctAgg,
+                                                            )}
+                                                            )
+                                                        </span>
+                                                    )}
+                                                </span>
+                                            </>
                                         )}
                                     </td>
-                                    <td className="px-4 py-3 text-slate-600">
-                                        {formatBytes(
-                                            service.mem_used_bytes ?? 0,
-                                        )}
-                                        {memPct != null && (
-                                            <span className="ml-1 text-xs text-slate-400">
-                                                ({formatPct(memPct)})
-                                            </span>
+                                    <td className="whitespace-nowrap px-4 py-3 text-slate-600">
+                                        <span
+                                            className="text-emerald-600"
+                                            title="Live"
+                                        >
+                                            {formatBytes(
+                                                service.mem_used_bytes ?? 0,
+                                            )}
+                                            {memPct != null && (
+                                                <span className="ml-1 text-xs text-emerald-500">
+                                                    ({formatPct(memPct)})
+                                                </span>
+                                            )}
+                                        </span>
+                                        {memAgg != null && (
+                                            <>
+                                                <span className="mx-1 text-slate-300">
+                                                    /
+                                                </span>
+                                                <span title={aggTitle}>
+                                                    {formatBytes(memAgg)}
+                                                    {memPctAgg != null && (
+                                                        <span className="ml-1 text-xs text-slate-400">
+                                                            (
+                                                            {formatPct(
+                                                                memPctAgg,
+                                                            )}
+                                                            )
+                                                        </span>
+                                                    )}
+                                                </span>
+                                            </>
                                         )}
                                     </td>
                                     <td className="hidden px-4 py-3 lg:table-cell">
@@ -2462,6 +2555,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
     const [granularity, setGranularity] = useState<MetricGranularity>("hour");
     const [agg, setAgg] = useState<MetricAgg>("avg");
     const [selectedNode, setSelectedNode] = useState<string | null>(null);
+    const [serviceFilter, setServiceFilter] = useState("");
     const [showAlerts, setShowAlerts] = useState(false);
     const [refreshKey, setRefreshKey] = useState(0);
     const [isLoading, setIsLoading] = useState(true);
@@ -2545,9 +2639,23 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
         setGranularity(presetRange.granularity);
     };
 
+    // Window/agg threaded to the service listings so each row can show its
+    // aggregated value next to the live one.
+    const serviceListOptions: MetricServiceListOptions = useMemo(
+        () => ({
+            agg: range.agg ?? "avg",
+            granularity: range.granularity,
+            rangeDays: range.rangeDays,
+            from: range.from,
+            to: range.to,
+        }),
+        [range],
+    );
+
     const loadOverview = useCallback(async () => {
         try {
-            const data = await monitoringService.getMetricsOverview();
+            const data =
+                await monitoringService.getMetricsOverview(serviceListOptions);
             setOverview({
                 nodes: Array.isArray(data?.nodes) ? data.nodes : [],
                 services: Array.isArray(data?.services) ? data.services : [],
@@ -2558,7 +2666,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
         } finally {
             setIsLoading(false);
         }
-    }, []);
+    }, [serviceListOptions]);
 
     useEffect(() => {
         void loadOverview();
@@ -2580,7 +2688,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
         }
         let cancelled = false;
         monitoringService
-            .getNodeServices(selectedNode)
+            .getNodeServices(selectedNode, serviceListOptions)
             .then((rows) => {
                 if (!cancelled) setNodeServices(Array.isArray(rows) ? rows : []);
             })
@@ -2590,12 +2698,18 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
         return () => {
             cancelled = true;
         };
-    }, [tab, selectedNode, refreshKey]);
+    }, [tab, selectedNode, refreshKey, serviceListOptions]);
 
     const nodes = overview?.nodes ?? [];
     const allServices = overview?.services ?? [];
-    const tableServices =
+    const baseTableServices =
         tab === "node" && selectedNode ? nodeServices : allServices;
+    const serviceFilterQuery = serviceFilter.trim().toLowerCase();
+    const tableServices = serviceFilterQuery
+        ? baseTableServices.filter((service) =>
+              service.service_name.toLowerCase().includes(serviceFilterQuery),
+          )
+        : baseTableServices;
     const isEmpty =
         !isLoading && nodes.length === 0 && allServices.length === 0;
 
@@ -2843,7 +2957,7 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                         )}
 
                         <div className="flex flex-col gap-2">
-                            <div className="flex items-center justify-between">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
                                 <h2 className="text-lg font-semibold text-slate-800">
                                     Services
                                     <span className="ml-2 rounded-full bg-slate-200/70 px-2 py-0.5 text-xs font-medium text-slate-600 align-middle">
@@ -2860,24 +2974,57 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                                         </span>
                                     )}
                                 </h2>
-                                {tab === "node" && selectedNode && (
-                                    <button
-                                        type="button"
-                                        onClick={() => setSelectedNode(null)}
-                                        className="text-xs text-sky-600 hover:underline"
-                                    >
-                                        Clear filter
-                                    </button>
-                                )}
+                                <div className="flex items-center gap-3">
+                                    <div className="relative">
+                                        <input
+                                            type="text"
+                                            value={serviceFilter}
+                                            onChange={(event) =>
+                                                setServiceFilter(
+                                                    event.target.value,
+                                                )
+                                            }
+                                            placeholder="Filter services…"
+                                            aria-label="Filter services by name"
+                                            className="w-44 rounded-lg border border-white/60 bg-white/60 px-3 py-1.5 pr-7 text-sm text-slate-700 focus:border-slate-500 focus:outline-none sm:w-56"
+                                        />
+                                        {serviceFilter && (
+                                            <button
+                                                type="button"
+                                                onClick={() =>
+                                                    setServiceFilter("")
+                                                }
+                                                aria-label="Clear service filter"
+                                                title="Clear service filter"
+                                                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded px-1 text-sm leading-none text-slate-400 hover:text-slate-700"
+                                            >
+                                                ×
+                                            </button>
+                                        )}
+                                    </div>
+                                    {tab === "node" && selectedNode && (
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                setSelectedNode(null)
+                                            }
+                                            className="whitespace-nowrap text-xs text-sky-600 hover:underline"
+                                        >
+                                            Clear node filter
+                                        </button>
+                                    )}
+                                </div>
                             </div>
                             <ServicesTable
                                 services={tableServices}
                                 range={range}
                                 refreshKey={refreshKey}
                                 emptyLabel={
-                                    tab === "node" && selectedNode
-                                        ? "No services on this node."
-                                        : "No services reporting yet."
+                                    serviceFilterQuery
+                                        ? `No services matching “${serviceFilter.trim()}”.`
+                                        : tab === "node" && selectedNode
+                                          ? "No services on this node."
+                                          : "No services reporting yet."
                                 }
                             />
                         </div>

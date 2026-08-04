@@ -54,6 +54,10 @@ export interface MetricService {
   node_count: number
   cpu_pct_total: number | null
   mem_used_bytes: number | null
+  // Window-aggregated companions to the two live values above. Null unless the
+  // request supplied MetricServiceListOptions.
+  cpu_pct_total_agg: number | null
+  mem_used_agg: number | null
   total_quota_cores: number | null
   total_mem_limit_bytes: number | null
   mem_pct: number | null
@@ -172,6 +176,16 @@ export interface MetricTimeseriesOptions {
   to?: string
   // Aggregation applied when re-bucketing; defaults to 'avg' server-side.
   agg?: MetricAgg
+}
+
+// Optional window for the service listings. When omitted the server returns
+// live values only and leaves cpu_pct_total_agg / mem_used_agg null.
+export interface MetricServiceListOptions {
+  agg: MetricAgg
+  granularity: MetricGranularity
+  rangeDays: number
+  from?: string
+  to?: string
 }
 
 export interface SessionUser {
@@ -613,15 +627,18 @@ export const monitoringService = {
   },
 
   // ---- Infrastructure metrics ------------------------------------------
-  getMetricsOverview(): Promise<MetricsOverview> {
-    return request<MetricsOverview>('/api/metrics/overview')
+  getMetricsOverview(options?: MetricServiceListOptions): Promise<MetricsOverview> {
+    return request<MetricsOverview>(`/api/metrics/overview${serviceListQuery(options)}`)
   },
   getMetricNodes(): Promise<MetricNode[]> {
     return request<MetricNode[]>('/api/metrics/nodes')
   },
-  getNodeServices(nodeKey: string): Promise<MetricService[]> {
+  getNodeServices(
+    nodeKey: string,
+    options?: MetricServiceListOptions,
+  ): Promise<MetricService[]> {
     return request<MetricService[]>(
-      `/api/metrics/nodes/${encodeURIComponent(nodeKey)}/services`,
+      `/api/metrics/nodes/${encodeURIComponent(nodeKey)}/services${serviceListQuery(options)}`,
     )
   },
   getServiceContainers(serviceName: string): Promise<MetricContainer[]> {
@@ -673,6 +690,22 @@ export const monitoringService = {
       method: 'DELETE',
     })
   },
+}
+
+// Window params for the service listings. Returns '' when no options are given
+// so the server keeps its live-only default.
+function serviceListQuery(options?: MetricServiceListOptions): string {
+  if (!options) return ''
+  const params = new URLSearchParams()
+  params.set('agg', options.agg)
+  params.set('granularity', options.granularity)
+  if (options.from && options.to) {
+    params.set('from', options.from)
+    params.set('to', options.to)
+  } else {
+    params.set('range_days', String(options.rangeDays))
+  }
+  return `?${params.toString()}`
 }
 
 function metricsQuery(options: MetricTimeseriesOptions): string {
