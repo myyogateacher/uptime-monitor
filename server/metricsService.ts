@@ -125,6 +125,33 @@ const chNumber = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+// container_id is UInt32 in ClickHouse. Bounding ids to that range also keeps
+// String() from emitting exponential notation for absurdly large values.
+const UINT32_MAX = 4294967295
+
+// Renders an id list for inlining into SQL text.
+//
+// These lists must NOT be passed as bound {x:Array(UInt32)} params:
+// @clickhouse/client serializes bound params into the request's URL query
+// string, so a service with many accumulated task generations produced a URL
+// long enough for nginx to reject with 414 Request-URI Too Large.
+//
+// The values are MySQL auto-increment ids, never user input, but they are
+// validated defensively anyway — anything non-integer would otherwise be
+// concatenated straight into the query. Callers must guard against empty
+// input; an empty list has no valid SQL rendering, so it throws.
+const toIntListSql = (values: number[]): string => {
+  const parts = values.map((value) => {
+    const parsed = value == null ? NaN : Number(value)
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > UINT32_MAX) {
+      throw new Error(`Expected a UInt32 id, received: ${String(value)}`)
+    }
+    return String(parsed)
+  })
+  if (!parts.length) throw new Error('Expected at least one id')
+  return parts.join(',')
+}
+
 // Bucketing is always evaluated in UTC so results never depend on the
 // ClickHouse server's local timezone.
 const bucketOf = (granularity: MetricGranularity, column = 'ts'): string => {
@@ -621,6 +648,10 @@ const serviceWindowAggregates = async (
     idServiceIdx.push(serviceIndex.get(serviceName) as number)
   }
 
+  // Inlined rather than bound — see toIntListSql().
+  const idsSql = toIntListSql(ids)
+  const serviceIdxSql = toIntListSql(idServiceIdx)
+
   const rows = await chSelect<ChServiceAggRow>(
     `
       SELECT
@@ -638,7 +669,7 @@ const serviceWindowAggregates = async (
           sum(container_samples) AS sample_count
         FROM (
           SELECT
-            transform(container_id, {ids:Array(UInt32)}, {service_idx_map:Array(UInt32)}, 0) AS service_idx,
+            transform(container_id, [${idsSql}], [${serviceIdxSql}], 0) AS service_idx,
             toStartOfMinute(ts, 'UTC') AS minute,
             avg(cpu_pct) AS cpu_avg,
             max(cpu_pct) AS cpu_max,
@@ -646,7 +677,7 @@ const serviceWindowAggregates = async (
             max(mem_used) AS mem_max,
             count() AS container_samples
           FROM ${CONTAINER_SAMPLES_TABLE}
-          WHERE container_id IN ({ids:Array(UInt32)})
+          WHERE container_id IN (${idsSql})
             AND ts >= toDateTime({from:UInt32})
             AND ts < toDateTime({to:UInt32})
           GROUP BY service_idx, container_id, minute
@@ -656,8 +687,6 @@ const serviceWindowAggregates = async (
       GROUP BY service_idx
     `,
     {
-      ids,
-      service_idx_map: idServiceIdx,
       from: toEpochSeconds(window.from),
       to: toEpochSeconds(window.to),
     },
@@ -1094,6 +1123,8 @@ export async function getServiceTimeseries(
   //   middle – per minute totals across replicas
   //   outer  – re-bucket to the requested granularity
   const column = metric === 'memory' ? 'mem_used' : 'cpu_pct'
+  // Inlined rather than bound — see toIntListSql().
+  const idsSql = toIntListSql(containerIds)
   const rows = await chSelect<ChTimeseriesRow>(
     `
       SELECT
@@ -1113,7 +1144,7 @@ export async function getServiceTimeseries(
             max(${column}) AS container_max,
             count() AS container_samples
           FROM ${CONTAINER_SAMPLES_TABLE}
-          WHERE container_id IN ({ids:Array(UInt32)})
+          WHERE container_id IN (${idsSql})
             AND ts >= toDateTime({from:UInt32})
             AND ts < toDateTime({to:UInt32})
           GROUP BY container_id, minute
@@ -1124,7 +1155,6 @@ export async function getServiceTimeseries(
       ORDER BY bucket_start ASC
     `,
     {
-      ids: containerIds,
       from: toEpochSeconds(window.from),
       to: toEpochSeconds(window.to),
     },
@@ -1594,7 +1624,7 @@ const entityWindowValues = async (
           avg(mem_used) AS mem_avg,
           argMax(mem_limit, ts) AS mem_limit_last
         FROM ${CONTAINER_SAMPLES_TABLE}
-        WHERE container_id IN ({ids:Array(UInt32)})
+        WHERE container_id IN (${toIntListSql(containerIds)})
           AND ts >= toDateTime({from:UInt32})
         GROUP BY container_id, minute
       )
@@ -1602,7 +1632,7 @@ const entityWindowValues = async (
       ORDER BY minute DESC
       LIMIT {limit:UInt32}
     `,
-    { ids: containerIds, from, limit },
+    { from, limit },
   )
   if (!isWindowFresh(rows[0]?.bucket_start)) return []
   return rows.map((row) => {
@@ -1769,9 +1799,9 @@ const runRetention = async (): Promise<void> => {
   )
   if (staleContainers.length) {
     chCommandDetached(
-      `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} DELETE WHERE container_id IN (${staleContainers
-        .map((row) => Number(row.id))
-        .join(', ')})`,
+      `ALTER TABLE ${CONTAINER_SAMPLES_TABLE} DELETE WHERE container_id IN (${toIntListSql(
+        staleContainers.map((row) => row.id),
+      )})`,
     )
   }
 
