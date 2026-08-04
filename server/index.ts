@@ -807,13 +807,24 @@ const parseMetricAgg = (value: unknown): MetricAgg => {
   return METRIC_AGGS.has(normalized) ? normalized : "avg";
 };
 
+// Smallest window a range_days request may resolve to (one minute). Sub-day
+// windows are legitimate — the UI's 1h/6h presets send fractional range_days —
+// but a zero or negative span would produce an empty window, so values below
+// the floor are clamped up to it.
+const METRIC_MIN_RANGE_DAYS = 1 / 1440;
+
+// Parsed as a float, not an integer: truncating here silently turned the 1h and
+// 6h presets (1/24 and 6/24 days) into a 1-day window for every chart. Missing
+// or non-numeric input still falls back to the granularity's maximum.
 const parseMetricRangeDays = (
   value: unknown,
   granularity: MetricGranularity,
 ): number => {
   const maxRangeDays = METRIC_MAX_RANGE_DAYS[granularity];
-  const parsed = toInteger(value, maxRangeDays) ?? maxRangeDays;
-  return Math.max(1, Math.min(parsed, maxRangeDays));
+  if (value == null || String(value).trim() === "") return maxRangeDays;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return maxRangeDays;
+  return Math.min(Math.max(parsed, METRIC_MIN_RANGE_DAYS), maxRangeDays);
 };
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
