@@ -1,10 +1,142 @@
-import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
+import mysql, {
+  type Pool,
+  type PoolConnection,
+  type RowDataPacket,
+} from "mysql2/promise";
 import { config } from "./config";
 
-export const pool: Pool = mysql.createPool({
+const basePool: Pool = mysql.createPool({
   ...config.mysql,
   waitForConnections: true,
 });
+
+// A pooled socket the server has already closed (wait_timeout, a MySQL
+// restart, a network blip) still looks usable to the pool and only fails when
+// a query is finally written to it. mysql2 reports that failure in one of the
+// shapes below; none of them mean the statement itself was bad, so the query
+// can be replayed on a connection that is known to be alive.
+const DEAD_CONNECTION_ERROR_CODES = new Set([
+  "PROTOCOL_CONNECTION_LOST",
+  "PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR",
+  "PROTOCOL_ENQUEUE_AFTER_QUIT",
+  "PROTOCOL_SEQUENCE_TIMEOUT",
+  "PROTOCOL_PACKETS_OUT_OF_ORDER",
+  "PROTOCOL_UNEXPECTED_PACKET",
+  // MySQL 8.0.24+ answers a query on a timed-out session with this error
+  // packet, which mysql2 also logs as "got packets out of order".
+  "ER_CLIENT_INTERACTION_TIMEOUT",
+  "ECONNRESET",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+const DEAD_CONNECTION_MESSAGES = [
+  "packets out of order",
+  "because of inactivity",
+  "connection lost",
+  "closed state",
+  "server has gone away",
+];
+
+const describeError = (error: unknown): string =>
+  error instanceof Error ? `${(error as { code?: string }).code ?? "error"}: ${error.message}` : String(error);
+
+const isDeadConnectionError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") return false;
+  const { code, message } = error as { code?: string; message?: string };
+  if (code && DEAD_CONNECTION_ERROR_CODES.has(code)) return true;
+  const text = String(message ?? "").toLowerCase();
+  return DEAD_CONNECTION_MESSAGES.some((needle) => text.includes(needle));
+};
+
+// Ping before handing the connection back: a ping is a full round trip, so a
+// connection that answers it is genuinely alive. destroy() (unlike release())
+// drops a dead one from the pool for good instead of returning it to the free
+// list to poison the next caller.
+const acquireLiveConnection = async (): Promise<PoolConnection> => {
+  const attempts = Math.max(config.mysql.connectionLimit, 1) + 1;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const connection = await basePool.getConnection();
+    try {
+      await connection.ping();
+      return connection;
+    } catch (error) {
+      connection.destroy();
+      if (attempt === attempts - 1) throw error;
+    }
+  }
+
+  throw new Error("mysql: no live connection available");
+};
+
+// Applied at the pool layer so every caller is covered without touching call
+// sites. Only one retry, and only for connection-level failures, so a genuine
+// SQL error still surfaces immediately.
+const withDeadConnectionRetry = (method: "query" | "execute") => {
+  const runOnPool = basePool[method].bind(basePool) as unknown as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+
+  return async (...args: unknown[]): Promise<unknown> => {
+    try {
+      return await runOnPool(...args);
+    } catch (error) {
+      if (!isDeadConnectionError(error)) throw error;
+
+      console.warn(`[db] stale connection on ${method}, retrying on a fresh one (${describeError(error)})`);
+      const connection = await acquireLiveConnection();
+      try {
+        const runOnConnection = connection[method].bind(connection) as unknown as (
+          ...args: unknown[]
+        ) => Promise<unknown>;
+        return await runOnConnection(...args);
+      } finally {
+        connection.release();
+      }
+    }
+  };
+};
+
+const retryingQuery = withDeadConnectionRetry("query");
+const retryingExecute = withDeadConnectionRetry("execute");
+
+export const pool: Pool = new Proxy(basePool, {
+  get(target, property, receiver) {
+    if (property === "query") return retryingQuery;
+    if (property === "execute") return retryingExecute;
+    return Reflect.get(target, property, receiver);
+  },
+});
+
+let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+
+// Idle eviction plus keepalive packets already cover most of it, but an
+// otherwise idle app can sit for hours between queries; this exercises the
+// pool often enough that a dead connection is discovered and discarded here
+// rather than by the next cron write.
+export function startPoolKeepalive(): void {
+  if (keepaliveTimer || config.mysqlPingIntervalMs <= 0) return;
+
+  keepaliveTimer = setInterval(() => {
+    void (async () => {
+      try {
+        const connection = await acquireLiveConnection();
+        connection.release();
+      } catch (error) {
+        console.warn(`[db] pool keepalive failed (${describeError(error)})`);
+      }
+    })();
+  }, config.mysqlPingIntervalMs);
+
+  keepaliveTimer.unref?.();
+}
+
+export function stopPoolKeepalive(): void {
+  if (!keepaliveTimer) return;
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+}
 
 const MIGRATIONS = [
   {
@@ -434,6 +566,29 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 18,
+    name: "add_cron_health_watchdog",
+    up: async () => {
+      // Monitor-level health, derived from a dead man's switch rather than from
+      // consumed events, so an unhealthy consumer or a stuck queue still shows up.
+      await pool.query(`
+        ALTER TABLE cron_monitoring
+          ADD COLUMN health_status VARCHAR(16) NOT NULL DEFAULT 'unknown',
+          ADD COLUMN health_reason VARCHAR(512) NULL,
+          ADD COLUMN health_changed_at DATETIME NULL,
+          ADD COLUMN last_success_at DATETIME NULL,
+          ADD COLUMN stale_after_at DATETIME NULL,
+          ADD KEY idx_cron_monitoring_stale (status, stale_after_at)
+      `);
+      // Reports that arrive after a run was already closed out (queue drained
+      // late) are counted here instead of reopening the run.
+      await pool.query(`
+        ALTER TABLE cron_runs
+          ADD COLUMN late_pings INT NOT NULL DEFAULT 0
+      `);
+    },
+  },
 ];
 
 export type AppSettingRecord = {
@@ -506,4 +661,6 @@ export async function initDatabase(): Promise<void> {
       [migration.version, migration.name],
     );
   }
+
+  startPoolKeepalive();
 }

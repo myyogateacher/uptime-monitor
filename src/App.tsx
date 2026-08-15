@@ -33,6 +33,7 @@ import {
     type AlertOperator,
     type AlertScope,
     type AuditLogEntry,
+    type CronHealthStatus,
     type CronJob,
     type CronRun,
     type CronTriggerType,
@@ -110,6 +111,16 @@ interface CronRunEventPayload {
     durationMs?: number | null;
     responseCode?: number | null;
     errorMessage?: string | null;
+}
+
+// Payload of the "cron:health" websocket event (see server emitCronHealthEvent).
+interface CronHealthEventPayload {
+    cron: string;
+    healthStatus: CronHealthStatus;
+    healthReason?: string | null;
+    healthChangedAt?: string | null;
+    staleAfterAt?: string | null;
+    lastSuccessAt?: string | null;
 }
 
 // Form state mirrors input elements: numeric fields may hold strings while
@@ -378,6 +389,12 @@ function renderCronRunBadge(status: string | null | undefined): string {
     if (status === "failed" || status === "missed")
         return "bg-rose-100/85 text-rose-700";
     return "bg-amber-100/85 text-amber-700";
+}
+
+function renderCronHealthBadge(health: CronHealthStatus | null | undefined): string {
+    if (health === "healthy") return "bg-emerald-100/85 text-emerald-700";
+    if (health === "unhealthy") return "bg-rose-100/85 text-rose-700";
+    return "bg-slate-100/85 text-slate-600";
 }
 
 function cronRunStripColor(status: string | null | undefined): string {
@@ -3100,13 +3117,13 @@ function StatusPage({
     const downCount = endpoints.filter(
         (endpoint) => endpoint.status === "down",
     ).length;
+    // Monitor-level health first: the watchdog marks a cron unhealthy even when
+    // no run event ever arrived, which last_run_status alone cannot express.
     const cronHealthyCount = crons.filter(
-        (cronJob) => cronJob.last_run_status === "success",
+        (cronJob) => cronJob.health_status === "healthy",
     ).length;
     const cronFailingCount = crons.filter(
-        (cronJob) =>
-            cronJob.last_run_status === "failed" ||
-            cronJob.last_run_status === "missed",
+        (cronJob) => cronJob.health_status === "unhealthy",
     ).length;
 
     const renderStatus = (endpoint: MonitorEndpoint): string => {
@@ -3437,13 +3454,29 @@ function StatusPage({
                                                     </span>
                                                 ) : null}
                                             </div>
-                                            {cronJob.last_run_status ? (
-                                                <span
-                                                    className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase backdrop-blur ${renderCronRunBadge(cronJob.last_run_status)}`}
-                                                >
-                                                    {cronJob.last_run_status}
-                                                </span>
-                                            ) : null}
+                                            <div className="flex items-center gap-2">
+                                                {cronJob.health_status ===
+                                                "unhealthy" ? (
+                                                    <span
+                                                        title={
+                                                            cronJob.health_reason ??
+                                                            undefined
+                                                        }
+                                                        className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase backdrop-blur ${renderCronHealthBadge(cronJob.health_status)}`}
+                                                    >
+                                                        unhealthy
+                                                    </span>
+                                                ) : null}
+                                                {cronJob.last_run_status ? (
+                                                    <span
+                                                        className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase backdrop-blur ${renderCronRunBadge(cronJob.last_run_status)}`}
+                                                    >
+                                                        {
+                                                            cronJob.last_run_status
+                                                        }
+                                                    </span>
+                                                ) : null}
+                                            </div>
                                         </div>
                                         <p className="mt-1 font-mono text-xs text-slate-600">
                                             {cronJob.expression}
@@ -4749,6 +4782,16 @@ function AdminPage({
                                                             }
                                                         </span>
                                                     ) : null}
+                                                    <span
+                                                        title={
+                                                            cronJob.health_reason ??
+                                                            undefined
+                                                        }
+                                                        className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase backdrop-blur ${renderCronHealthBadge(cronJob.health_status)}`}
+                                                    >
+                                                        {cronJob.health_status ??
+                                                            "unknown"}
+                                                    </span>
                                                 </div>
                                                 <p className="mt-1 break-all font-mono text-xs text-slate-600">
                                                     {cronJob.expression}
@@ -6433,6 +6476,35 @@ function App() {
                         delete next[payload.id];
                         return next;
                     });
+                    return;
+                }
+
+                if (message?.type === "cron:health") {
+                    const payload = (message.payload ??
+                        {}) as CronHealthEventPayload;
+                    setCrons((current) =>
+                        current.map((cronJob) =>
+                            cronJob.cron === payload.cron
+                                ? {
+                                      ...cronJob,
+                                      health_status:
+                                          payload.healthStatus ??
+                                          cronJob.health_status,
+                                      health_reason:
+                                          payload.healthReason ?? null,
+                                      health_changed_at:
+                                          payload.healthChangedAt ??
+                                          cronJob.health_changed_at,
+                                      stale_after_at:
+                                          payload.staleAfterAt ??
+                                          cronJob.stale_after_at,
+                                      last_success_at:
+                                          payload.lastSuccessAt ??
+                                          cronJob.last_success_at,
+                                  }
+                                : cronJob,
+                        ),
+                    );
                     return;
                 }
 

@@ -165,6 +165,17 @@ const parseEmailAllowlist = (rawValue: string | undefined): string[] =>
 
 const nodeEnv = process.env.NODE_ENV ?? 'development'
 
+const mysqlConnectionLimit = toNumber(process.env.MYSQL_CONNECTION_LIMIT, 10)
+
+// mysql2 only runs its idle-eviction timer when maxIdle is strictly below
+// connectionLimit (see lib/base/pool.js), so the default has to stay under the
+// limit or idleTimeout is never applied and idle sockets live until the server
+// kills them on wait_timeout.
+const mysqlMaxIdle = Math.min(
+  Math.max(toNumber(process.env.MYSQL_MAX_IDLE, Math.ceil(mysqlConnectionLimit / 2)), 0),
+  Math.max(mysqlConnectionLimit - 1, 0),
+)
+
 export const config = {
   nodeEnv,
   port: toNumber(process.env.PORT, 3001),
@@ -176,6 +187,11 @@ export const config = {
     pollMs: toNumber(process.env.CRON_POLL_MS, 1000),
     sweepIntervalMs: toNumber(process.env.CRON_SWEEP_INTERVAL_MS, 30000),
     catchupGraceMs: toNumber(process.env.CRON_CATCHUP_GRACE_MS, 120000),
+    // Dead man's switch slack: how long past the next expected occurrence (plus
+    // the run's own start/ping windows) a cron may go without a successful run
+    // before it is marked unhealthy. Independent of event consumption, so a
+    // dead consumer or a stuck queue still trips it.
+    healthGraceMs: toNumber(process.env.CRON_HEALTH_GRACE_MS, 300000),
     notifyToken: String(process.env.CRON_NOTIFY_TOKEN ?? '').trim(),
     runRetentionDays: toNumber(process.env.CRON_RUN_RETENTION_DAYS, 90),
   },
@@ -195,8 +211,19 @@ export const config = {
     user: process.env.MYSQL_USER ?? 'root',
     password: process.env.MYSQL_PASSWORD ?? '',
     database: process.env.MYSQL_DATABASE ?? 'uptime_monitor',
-    connectionLimit: toNumber(process.env.MYSQL_CONNECTION_LIMIT, 10),
+    connectionLimit: mysqlConnectionLimit,
+    // Pool hygiene. MySQL closes connections that idle past wait_timeout
+    // without the client noticing, so the pool must retire idle connections
+    // well before that instead of handing out dead sockets. Keep idleTimeout
+    // comfortably under the server's wait_timeout.
+    enableKeepAlive: toBoolean(process.env.MYSQL_ENABLE_KEEPALIVE, true),
+    keepAliveInitialDelay: toNumber(process.env.MYSQL_KEEPALIVE_INITIAL_DELAY_MS, 10000),
+    maxIdle: mysqlMaxIdle,
+    idleTimeout: toNumber(process.env.MYSQL_IDLE_TIMEOUT_MS, 60000),
   },
+  // How often a pooled connection is pinged so a dead one is discovered and
+  // discarded by the keepalive loop rather than by a failing query. 0 disables.
+  mysqlPingIntervalMs: toNumber(process.env.MYSQL_PING_INTERVAL_MS, 30000),
   // Raw metric samples live in ClickHouse; the dimension/alert tables stay in
   // MySQL. Point this at an existing ClickHouse HTTP interface (port 8123).
   clickhouse: {

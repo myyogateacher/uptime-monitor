@@ -23,12 +23,12 @@ One service that watches your APIs, databases, message bus, and cron jobs — an
 - **Five monitor types** — HTTP(S), MySQL, Redis, NATS JetStream, and TCP ports, each with per-monitor intervals and optional probe commands with expected-value matching.
 - **Deep HTTP checks** — custom method, headers, and body; assert on status code or a nested JSON path in the response.
 - **NATS JetStream consumer lag detection** — flags consumers whose backlog exceeds a threshold (global, per-monitor, or per-consumer), and is smart enough not to alert on a consumer that is already draining.
-- **Cron monitoring** — schedules and fires your crons over NATS or HTTP, then tracks each run through start/ping/stop reports; runs that never report or go silent past their deadline are marked missed and alerted on.
+- **Cron monitoring** — schedules and fires your crons over NATS or HTTP, then tracks each run through start/ping/stop reports; runs that never report or go silent past their deadline are marked missed and alerted on. A dead man's switch runs alongside: if no successful run lands by the next occurrence plus the run windows and `CRON_HEALTH_GRACE_MS`, the cron is marked unhealthy and alerted on even when no run event ever arrives (dead consumer, stuck queue, trigger never fired).
 - **Retry-aware health transitions** — configurable retries before marking down or back up, so a single blip never pages anyone.
 - **Realtime control plane and status page** — WebSocket pushes every check result and config change to all open tabs; the public status page shows grouped service health, latency trend graphs, and cron run history.
 - **Container & VM metrics** — a lightweight sidecar (one per Docker Swarm node, or any standalone Docker VM) pushes host CPU/memory and per-container CPU, memory, and network usage every 15s. The dashboard keeps 90 days of minute-resolution history with drill-down from VM → service → replica/container, and plots usage against allotted CPU quota and memory limits.
 - **Metric threshold alerts** — rules on CPU% / memory% at node, service, or container scope with sustained-duration windows and cooldowns; firing and resolved notifications go through the same Slack/webhook channels.
-- **Alerts where you live** — rich Slack notifications and pluggable webhooks on up/down transitions and failed/missed cron runs.
+- **Alerts where you live** — rich Slack notifications and pluggable webhooks on up/down transitions, failed/missed cron runs, and cron health going stale or recovering.
 - **Built for operating** — pause/resume single monitors or whole groups, manual "check now", per-monitor history cleanup, Google sign-in with an editor email allowlist, versioned DB migrations, and one-command Docker deploy.
 
 ## Pages

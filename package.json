@@ -15,6 +15,7 @@
     "start:server": "TZ=UTC bun server/index.ts",
     "build": "vite build",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.server.json --noEmit",
+    "test": "TZ=UTC bun test",
     "lint": "eslint .",
     "preview": "vite preview"
   },

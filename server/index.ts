@@ -23,10 +23,11 @@ import {
   stopClickhouseRetry,
 } from "./clickhouse";
 import { config } from "./config";
-import { initDatabase, pool } from "./db";
+import { initDatabase, pool, stopPoolKeepalive } from "./db";
 import {
   CRON_CREATED_EVENT,
   CRON_DELETED_EVENT,
+  CRON_HEALTH_EVENT,
   CRON_RUN_EVENT,
   CRON_UPDATED_EVENT,
   ENDPOINT_CREATED_EVENT,
@@ -255,6 +256,7 @@ const BROADCAST_EVENTS: readonly string[] = [
   CRON_UPDATED_EVENT,
   CRON_DELETED_EVENT,
   CRON_RUN_EVENT,
+  CRON_HEALTH_EVENT,
 ];
 
 for (const eventName of BROADCAST_EVENTS) {
@@ -2832,6 +2834,7 @@ const shutdown = async (): Promise<void> => {
   stopMonitor();
   stopMetricsService();
   stopClickhouseRetry();
+  stopPoolKeepalive();
   await stopCronMonitor();
   await new Promise<void>((resolve) => wsServer.close(() => resolve()));
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));

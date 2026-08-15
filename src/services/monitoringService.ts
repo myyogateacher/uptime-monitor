@@ -11,6 +11,7 @@ export type StatsGranularity = 'minute' | 'hour' | 'day'
 export type StatsMode = 'aggregate' | 'raw'
 export type CronTriggerType = 'nats' | 'http'
 export type CronHttpMethod = 'GET' | 'POST' | 'NONE'
+export type CronHealthStatus = 'unknown' | 'healthy' | 'unhealthy'
 
 export type UserRole = 'admin' | 'editor' | 'viewer'
 
@@ -355,6 +356,13 @@ export interface CronJob {
   status: boolean
   track_run: boolean
   next_run_at: string | null
+  // Monitor-level health from the staleness watchdog: set even when no run
+  // event ever arrives (dead consumer, stuck queue, trigger never fired).
+  health_status: CronHealthStatus
+  health_reason: string | null
+  health_changed_at: string | null
+  last_success_at: string | null
+  stale_after_at: string | null
   created_date: string
   modified_date: string
   // Present on GET /api/crons (joined from the latest cron run).
@@ -375,6 +383,8 @@ export interface CronRun {
   last_ping_at: string | null
   completed_at: string | null
   pings: number
+  // Reports that arrived after the run was closed out (backlog drained late).
+  late_pings: number
   duration_ms: number | null
   response_code: number | null
   error_message: string | null

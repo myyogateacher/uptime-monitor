@@ -211,6 +211,11 @@ const formatCronTimestamp = (
     return date.toISOString();
 };
 
+// 'success'/'recovered' are the healthy outcomes; everything else ('failed',
+// 'missed', 'stale') is an incident.
+const isHealthyCronOutcome = (outcome: string | null | undefined): boolean =>
+    outcome === "success" || outcome === "recovered";
+
 const buildCronSlackPayload = (event: CronRunNotificationEvent): JsonPayload => {
     const title = `Cron ${String(event.outcome ?? "failed").toUpperCase()}`;
     const environment = String(config.nodeEnv ?? "unknown");
@@ -223,7 +228,7 @@ const buildCronSlackPayload = (event: CronRunNotificationEvent): JsonPayload => 
         text: `[${environment}] ${title}: ${event.cron}`,
         attachments: [
             {
-                color: "#dc2626",
+                color: isHealthyCronOutcome(event.outcome) ? "#16a34a" : "#dc2626",
                 title: `[${environment}] ${title}: ${event.cron}`,
                 fields: [
                     {
@@ -296,7 +301,10 @@ const buildCronWebhookPayload = (
 ): JsonPayload => {
     return {
         source: "uptime-monitor",
-        eventType: "cron.run_failed",
+        eventType:
+            event.outcome === "stale" || event.outcome === "recovered"
+                ? "cron.health_changed"
+                : "cron.run_failed",
         outcome: event.outcome,
         cron: {
             name: event.cron,
@@ -359,8 +367,9 @@ export async function notifyCronRun(
     )
         return;
 
-    // Failed/missed runs map to 'down' for the existing per-target event filter.
-    const mappedEvent = event.outcome === "success" ? "up" : "down";
+    // Failed/missed/stale outcomes map to 'down' for the existing per-target
+    // event filter; success and recovery map to 'up'.
+    const mappedEvent = isHealthyCronOutcome(event.outcome) ? "up" : "down";
 
     await Promise.all(
         config.notifications.targets.map(async (target) => {

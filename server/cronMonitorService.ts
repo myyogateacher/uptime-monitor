@@ -6,13 +6,14 @@ import { connect as connectNats, type NatsConnection } from 'nats'
 
 import { config } from './config'
 import { getAppSetting, getAppSettingRecord, pool, setAppSetting } from './db'
-import { CRON_RUN_EVENT, monitorEvents } from './events'
+import { CRON_HEALTH_EVENT, CRON_RUN_EVENT, monitorEvents } from './events'
 import { notifyCronRun } from './notifier'
 
 type JsonObject = Record<string, unknown>
 
 export type CronTriggerType = 'nats' | 'http'
 export type CronHttpMethod = 'GET' | 'POST' | 'NONE'
+export type CronHealthStatus = 'unknown' | 'healthy' | 'unhealthy'
 
 // Row shape of the cron_monitoring table.
 export interface CronRow extends RowDataPacket {
@@ -30,6 +31,11 @@ export interface CronRow extends RowDataPacket {
   status: number
   track_run: number
   next_run_at: Date | string | null
+  health_status: CronHealthStatus
+  health_reason: string | null
+  health_changed_at: Date | string | null
+  last_success_at: Date | string | null
+  stale_after_at: Date | string | null
   created_date: Date | string
   modified_date: Date | string
 }
@@ -47,6 +53,7 @@ export interface CronRunRow extends RowDataPacket {
   last_ping_at: Date | string | null
   completed_at: Date | string | null
   pings: number
+  late_pings: number
   duration_ms: number | null
   response_code: number | null
   error_message: string | null
@@ -56,6 +63,7 @@ export interface CronRunRow extends RowDataPacket {
 interface CronRunDetailsRow extends CronRunRow {
   expression: string | null
   service: string | null
+  start_window_seconds: number | null
   ping_window_seconds: number | null
 }
 
@@ -68,7 +76,35 @@ interface OverdueRunRow extends RowDataPacket {
   run_id: string
   pings: number
   elapsed_seconds: number | null
+  orphaned: number
 }
+
+// Minimal projection used by the health watchdog and health transitions.
+interface CronHealthRow extends RowDataPacket {
+  cron: string
+  expression: string
+  service: string | null
+  trigger_type: CronTriggerType
+  start_window_seconds: number
+  ping_window_seconds: number
+  health_status: CronHealthStatus
+  health_reason: string | null
+  last_success_at: Date | string | null
+  stale_after_at: Date | string | null
+}
+
+const CRON_HEALTH_COLUMNS = `
+  cron,
+  expression,
+  service,
+  trigger_type,
+  start_window_seconds,
+  ping_window_seconds,
+  health_status,
+  health_reason,
+  last_success_at,
+  stale_after_at
+`
 
 type TriggerOutcome = {
   ok: boolean
@@ -124,6 +160,14 @@ export async function setCronMonitorEnabled(
   updatedBy: string | null = null,
 ): Promise<void> {
   await setAppSetting(CRON_MONITOR_ENABLED_SETTING, enabled ? '1' : '0', updatedBy)
+
+  // Deadlines accumulated while the master switch was off would all be in the
+  // past on re-enable. Disarm them; the next claim re-arms from the live clock.
+  if (enabled) {
+    await pool.query(
+      `UPDATE cron_monitoring SET stale_after_at = NULL WHERE stale_after_at IS NOT NULL`,
+    )
+  }
 }
 
 const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
@@ -166,8 +210,74 @@ const toErrorMessage = (error: unknown, fallback: string): string =>
 
 const toSqlDateTime = (date: Date): string => date.toISOString().slice(0, 19).replace('T', ' ')
 
+// Compact age rendering for logs: seconds close in, coarser units further out.
+const formatAgeMs = (ageMs: number): string => {
+  const seconds = Math.round(ageMs / 1000)
+  const abs = Math.abs(seconds)
+  if (abs < 120) return `${seconds}s`
+  if (abs < 7200) return `${Math.round(seconds / 60)}m`
+  if (abs < 172800) return `${Math.round(seconds / 3600)}h`
+  return `${Math.round(seconds / 86400)}d`
+}
+
+// Run ids are caller-supplied (our own triggers mint a UUID), and status
+// reports carry no timestamp of their own. A 13-digit id in a sane range is
+// almost certainly epoch millis, so decode it to give the log a run time;
+// anything else logs as n/a rather than guessing.
+const RUN_ID_EPOCH_MS_MIN = Date.UTC(2001, 0, 1)
+const RUN_ID_EPOCH_MS_MAX = Date.UTC(2100, 0, 1)
+
+const runIdTimestamp = (runId: string): Date | null => {
+  if (!/^\d{13}$/.test(runId)) return null
+  const ms = Number(runId)
+  if (ms < RUN_ID_EPOCH_MS_MIN || ms > RUN_ID_EPOCH_MS_MAX) return null
+  return new Date(ms)
+}
+
+// Time context for run-scoped logs: when the run claims to be from, how stale
+// that makes it, and when we processed the report.
+const describeRunTiming = (runId: string, at: Date | string | null, now: Date = new Date()): string => {
+  const runAt = at == null ? runIdTimestamp(runId) : new Date(at)
+  const nowPart = `now=${now.toISOString()}`
+  if (!runAt || Number.isNaN(runAt.getTime())) return `run_at=n/a age=n/a ${nowPart}`
+  return `run_at=${runAt.toISOString()} age=${formatAgeMs(now.getTime() - runAt.getTime())} ${nowPart}`
+}
+
 export const computeNextRunAt = (expression: string, from: Date = new Date()): Date =>
   CronExpressionParser.parse(expression, { currentDate: from, tz: 'UTC' }).next().toDate()
+
+// Dead man's switch deadline. By the time the *next* occurrence has come and
+// gone, plus the run's own start/ping windows and a grace period, a healthy
+// cron must have recorded a successful run. Nothing here depends on an event
+// being consumed, so a dead consumer or a stuck queue still trips it.
+export const computeStaleAfterAt = (
+  expression: string,
+  startWindowSeconds: number,
+  pingWindowSeconds: number,
+  from: Date = new Date(),
+  graceMs: number = config.cron.healthGraceMs,
+): Date => {
+  const next = computeNextRunAt(expression, from)
+  const windowMs =
+    (Number(startWindowSeconds) || 0) * 1000 + (Number(pingWindowSeconds) || 0) * 1000 + graceMs
+  return new Date(next.getTime() + Math.max(0, windowMs))
+}
+
+// A run whose full window (start + ping + grace) has elapsed can no longer be
+// completed: a report arriving now came off a backlog, not a live execution.
+export const isRunWindowExpired = (
+  triggeredAt: Date | string,
+  startWindowSeconds: number | null,
+  pingWindowSeconds: number | null,
+  now: Date = new Date(),
+  graceMs: number = config.cron.healthGraceMs,
+): boolean => {
+  const triggered = new Date(triggeredAt).getTime()
+  if (!Number.isFinite(triggered)) return false
+  const windowMs =
+    (Number(startWindowSeconds) || 60) * 1000 + (Number(pingWindowSeconds) || 60) * 1000 + graceMs
+  return now.getTime() > triggered + windowMs
+}
 
 const getNatsConnection = (): Promise<NatsConnection> => {
   if (!config.nats?.servers?.length) {
@@ -200,11 +310,27 @@ const getNatsConnection = (): Promise<NatsConnection> => {
   return natsConnectionPromise
 }
 
-async function fireNatsTrigger(cron: CronRow, runId: string): Promise<TriggerOutcome> {
+async function fireNatsTrigger(
+  cron: CronRow,
+  runId: string,
+  triggeredAt: Date,
+): Promise<TriggerOutcome> {
   try {
     const nc = await withTimeout(getNatsConnection(), config.requestTimeoutMs, 'NATS connect')
     const subject = String(cron.nats_subject ?? '').trim() || DEFAULT_NATS_SUBJECT
-    const payload = JSON.stringify({ run_id: runId, cron: String(cron.cron) })
+    // triggered_at/expires_at let a consumer draining a backlog recognise that a
+    // payload is stale and skip the work instead of running it hours late.
+    const expiresAt = new Date(
+      triggeredAt.getTime() +
+        ((Number(cron.start_window_seconds) || 60) + (Number(cron.ping_window_seconds) || 60)) *
+          1000,
+    )
+    const payload = JSON.stringify({
+      run_id: runId,
+      cron: String(cron.cron),
+      triggered_at: triggeredAt.toISOString(),
+      expires_at: expiresAt.toISOString(),
+    })
 
     nc.publish(subject, new TextEncoder().encode(payload))
     await withTimeout(nc.flush(), config.requestTimeoutMs, 'NATS flush')
@@ -291,6 +417,122 @@ async function fireHttpTrigger(cron: CronRow, runId: string): Promise<TriggerOut
   }
 }
 
+const loadCronHealthRow = async (cronName: string): Promise<CronHealthRow | null> => {
+  const [rows] = await pool.query<CronHealthRow[]>(
+    `SELECT ${CRON_HEALTH_COLUMNS} FROM cron_monitoring WHERE cron = ? LIMIT 1`,
+    [cronName],
+  )
+  return rows.length ? rows[0] : null
+}
+
+const emitCronHealthEvent = (
+  row: CronHealthRow,
+  healthStatus: CronHealthStatus,
+  healthReason: string | null,
+  staleAfterAt: Date | string | null,
+  lastSuccessAt: Date | string | null,
+): void => {
+  monitorEvents.emit(CRON_HEALTH_EVENT, {
+    cron: row.cron,
+    healthStatus,
+    healthReason,
+    healthChangedAt: new Date().toISOString(),
+    staleAfterAt,
+    lastSuccessAt,
+  })
+}
+
+// Routes cron health transitions through the same notifier the per-run
+// failures use, so they land on the existing Slack/webhook targets.
+const notifyCronHealthChange = async (
+  row: CronHealthRow,
+  outcome: 'stale' | 'recovered',
+  reason: string | null,
+  runId: string | null,
+): Promise<void> => {
+  await notifyCronRun({
+    cron: row.cron,
+    runId: runId ?? 'n/a',
+    outcome,
+    expression: row.expression ?? null,
+    service: row.service ?? null,
+    triggerType: row.trigger_type ?? null,
+    pings: 0,
+    triggeredAt: null,
+    firstPingAt: null,
+    lastPingAt: row.last_success_at ?? null,
+    durationMs: null,
+    reason,
+  })
+}
+
+// Records a successful run as the monitor's heartbeat and re-arms the dead
+// man's switch from now. Recovery from unhealthy notifies once, on transition.
+const markCronHealthy = async (cronName: string, completedAt: Date | string | null): Promise<void> => {
+  const row = await loadCronHealthRow(cronName)
+  if (!row) return
+
+  let staleAfterAt: string | null = null
+  try {
+    staleAfterAt = toSqlDateTime(
+      computeStaleAfterAt(
+        String(row.expression),
+        Number(row.start_window_seconds),
+        Number(row.ping_window_seconds),
+      ),
+    )
+  } catch (error) {
+    console.error(
+      `[cron-monitor] cannot arm health watchdog for cron=${cronName}: ${toErrorMessage(error, 'parse error')}`,
+    )
+  }
+
+  await pool.query(
+    `
+      UPDATE cron_monitoring
+      SET
+        last_success_at = COALESCE(?, UTC_TIMESTAMP()),
+        stale_after_at = COALESCE(?, stale_after_at),
+        health_status = 'healthy',
+        health_reason = NULL,
+        health_changed_at = IF(health_status = 'healthy', health_changed_at, UTC_TIMESTAMP())
+      WHERE cron = ?
+    `,
+    [completedAt ?? null, staleAfterAt, cronName],
+  )
+
+  emitCronHealthEvent(row, 'healthy', null, staleAfterAt, completedAt ?? new Date().toISOString())
+
+  if (row.health_status === 'unhealthy') {
+    await notifyCronHealthChange(row, 'recovered', row.health_reason ?? 'Cron recovered', null)
+  }
+}
+
+// `notify` is false when the caller already sent a per-run failure alert.
+const markCronUnhealthy = async (
+  cronName: string,
+  reason: string,
+  notify: boolean,
+  runId: string | null = null,
+): Promise<void> => {
+  const row = await loadCronHealthRow(cronName)
+  if (!row) return
+
+  const [result] = await pool.query<ResultSetHeader>(
+    `
+      UPDATE cron_monitoring
+      SET health_status = 'unhealthy', health_reason = ?, health_changed_at = UTC_TIMESTAMP()
+      WHERE cron = ? AND health_status <> 'unhealthy'
+    `,
+    [reason.slice(0, 512), cronName],
+  )
+
+  if (!result.affectedRows) return
+
+  emitCronHealthEvent(row, 'unhealthy', reason, row.stale_after_at, row.last_success_at)
+  if (notify) await notifyCronHealthChange(row, 'stale', reason, runId)
+}
+
 const loadRun = async (runId: string): Promise<CronRunDetailsRow | null> => {
   const [rows] = await pool.query<CronRunDetailsRow[]>(
     `
@@ -298,6 +540,7 @@ const loadRun = async (runId: string): Promise<CronRunDetailsRow | null> => {
         r.*,
         c.expression,
         c.service,
+        c.start_window_seconds,
         c.ping_window_seconds
       FROM cron_runs r
       LEFT JOIN cron_monitoring c ON c.cron = r.cron
@@ -350,6 +593,20 @@ const finalizeRun = async (runId: string, notifyFailure: boolean): Promise<void>
   if (!run) return
 
   emitRunEvent(run)
+
+  if (run.status === 'success') {
+    await markCronHealthy(run.cron, run.completed_at)
+  } else if (run.status === 'failed' || run.status === 'missed') {
+    // The per-run alert below is the notification for this incident, so the
+    // monitor-level transition stays silent to avoid a duplicate message.
+    await markCronUnhealthy(
+      run.cron,
+      `Run ${run.run_id} ${run.status}: ${run.error_message ?? 'no reason reported'}`,
+      false,
+      run.run_id,
+    )
+  }
+
   if (notifyFailure && (run.status === 'failed' || run.status === 'missed')) {
     await notifyRunFailure(run)
   }
@@ -376,9 +633,29 @@ const claimNextRunAt = async (cron: CronRow): Promise<boolean> => {
     return false
   }
 
+  // Arm the dead man's switch only when it is not already armed. Advancing it
+  // on every occurrence would let a cron whose runs never complete keep
+  // pushing its own deadline into the future; only a success may do that.
+  let staleAfterAt: string | null = null
+  try {
+    staleAfterAt = toSqlDateTime(
+      computeStaleAfterAt(
+        String(cron.expression),
+        Number(cron.start_window_seconds),
+        Number(cron.ping_window_seconds),
+      ),
+    )
+  } catch {
+    staleAfterAt = null
+  }
+
   const [result] = await pool.query<ResultSetHeader>(
-    'UPDATE cron_monitoring SET next_run_at = ? WHERE cron = ? AND next_run_at <=> ?',
-    [nextRunAt, cron.cron, cron.next_run_at],
+    `
+      UPDATE cron_monitoring
+      SET next_run_at = ?, stale_after_at = COALESCE(stale_after_at, ?)
+      WHERE cron = ? AND next_run_at <=> ?
+    `,
+    [nextRunAt, staleAfterAt, cron.cron, cron.next_run_at],
   )
 
   return Boolean(result.affectedRows)
@@ -390,6 +667,7 @@ async function fireCron(cron: CronRow): Promise<void> {
 
   const runId = randomUUID()
   const triggerType = cron.trigger_type === 'http' ? 'http' : 'nats'
+  const triggeredAt = new Date()
 
   await pool.query(
     `
@@ -400,7 +678,9 @@ async function fireCron(cron: CronRow): Promise<void> {
   )
 
   const outcome =
-    triggerType === 'http' ? await fireHttpTrigger(cron, runId) : await fireNatsTrigger(cron, runId)
+    triggerType === 'http'
+      ? await fireHttpTrigger(cron, runId)
+      : await fireNatsTrigger(cron, runId, triggeredAt)
 
   if (!outcome.ok) {
     await pool.query(
@@ -435,6 +715,9 @@ async function fireCron(cron: CronRow): Promise<void> {
     return
   }
 
+  // track_run off: the trigger was delivered but nobody reports back, so the
+  // run is closed as successful on delivery alone. Delivery is not execution --
+  // turn track_run on for crons where a silent consumer must be detected.
   await pool.query(
     `
       UPDATE cron_runs
@@ -450,11 +733,68 @@ async function fireCron(cron: CronRow): Promise<void> {
   await finalizeRun(runId, false)
 }
 
+// Reports that show up after a run was closed out (the consumer recovered and
+// drained a backlog) are counted separately: the original run keeps its
+// outcome, timestamps and duration so a stale payload can never register as a
+// fresh success.
+const recordLateReport = async (runId: string): Promise<void> => {
+  await pool.query('UPDATE cron_runs SET late_pings = late_pings + 1 WHERE run_id = ?', [runId])
+}
+
+const expireRun = async (runId: string, message: string): Promise<boolean> => {
+  const [result] = await pool.query<ResultSetHeader>(
+    `
+      UPDATE cron_runs
+      SET
+        status = 'missed',
+        completed_at = UTC_TIMESTAMP(),
+        duration_ms = TIMESTAMPDIFF(MICROSECOND, triggered_at, UTC_TIMESTAMP()) DIV 1000,
+        error_message = ?
+      WHERE run_id = ? AND status IN ('triggered', 'running')
+    `,
+    [message, runId],
+  )
+  return Boolean(result.affectedRows)
+}
+
 export async function recordCronRunStatus(report: CronRunStatusReport): Promise<CronRunStatusResult> {
   const run = await loadRun(report.runId)
   if (!run) {
-    console.warn(`[cron-monitor] status report for unknown run=${report.runId} cron=${report.cron}`)
+    console.warn(
+      `[cron-monitor] status report for unknown run=${report.runId} cron=${report.cron} ${describeRunTiming(report.runId, null)}`,
+    )
     return { accepted: false, reason: 'unknown_run' }
+  }
+
+  if (report.cron && String(run.cron) !== report.cron) {
+    console.warn(
+      `[cron-monitor] status report cron mismatch run=${report.runId} reported=${report.cron} actual=${run.cron} ${describeRunTiming(report.runId, run.triggered_at)}`,
+    )
+    return { accepted: false, reason: 'cron_mismatch' }
+  }
+
+  // Already closed out: count the late arrival, leave the run untouched.
+  if (run.status !== 'triggered' && run.status !== 'running') {
+    await recordLateReport(report.runId)
+    return {
+      accepted: false,
+      reason: run.status === 'missed' ? 'run_expired' : 'already_completed',
+    }
+  }
+
+  // Still open but past its whole window -- the sweeper has not reached it yet,
+  // or the run was orphaned without a deadline. Either way this report came off
+  // a backlog, so close the run as missed instead of accepting it.
+  if (
+    isRunWindowExpired(run.triggered_at, run.start_window_seconds, run.ping_window_seconds)
+  ) {
+    const closed = await expireRun(
+      report.runId,
+      `late "${report.status}" report received after the run window elapsed`,
+    )
+    await recordLateReport(report.runId)
+    if (closed) await finalizeRun(report.runId, true)
+    return { accepted: false, reason: 'run_expired' }
   }
 
   if (report.status === 'start' || report.status === 'ping') {
@@ -521,25 +861,45 @@ export async function recordCronRunStatus(report: CronRunStatusReport): Promise<
 }
 
 async function sweepOverdueRuns(): Promise<void> {
+  const graceSeconds = Math.ceil(config.cron.healthGraceMs / 1000)
+
+  // The second branch catches orphaned runs: rows that were inserted but never
+  // got a deadline (process died mid-fire, or the deadline update lost a race).
+  // Without it they sit in 'triggered' forever and never turn into an alert.
   const [rows] = await pool.query<OverdueRunRow[]>(
     `
       SELECT
-        id,
-        run_id,
-        pings,
-        TIMESTAMPDIFF(SECOND, triggered_at, UTC_TIMESTAMP()) AS elapsed_seconds
-      FROM cron_runs
-      WHERE status IN ('triggered', 'running')
-        AND deadline_at IS NOT NULL
-        AND deadline_at <= UTC_TIMESTAMP()
+        r.id,
+        r.run_id,
+        r.pings,
+        TIMESTAMPDIFF(SECOND, r.triggered_at, UTC_TIMESTAMP()) AS elapsed_seconds,
+        (r.deadline_at IS NULL) AS orphaned
+      FROM cron_runs r
+      LEFT JOIN cron_monitoring c ON c.cron = r.cron
+      WHERE r.status IN ('triggered', 'running')
+        AND (
+          (r.deadline_at IS NOT NULL AND r.deadline_at <= UTC_TIMESTAMP())
+          OR (
+            r.deadline_at IS NULL
+            AND r.triggered_at <= DATE_SUB(
+              UTC_TIMESTAMP(),
+              INTERVAL (
+                COALESCE(c.start_window_seconds, 60) + COALESCE(c.ping_window_seconds, 60) + ?
+              ) SECOND
+            )
+          )
+        )
+      ORDER BY r.id ASC
       LIMIT 100
     `,
+    [graceSeconds],
   )
 
   for (const row of rows) {
-    const message = `ping missing, received ${Number(row.pings ?? 0)} pings for ${Number(
-      row.elapsed_seconds ?? 0,
-    ).toFixed(2)} seconds`
+    const elapsed = Number(row.elapsed_seconds ?? 0).toFixed(2)
+    const message = Number(row.orphaned)
+      ? `run never reached a deadline and was abandoned after ${elapsed} seconds`
+      : `ping missing, received ${Number(row.pings ?? 0)} pings for ${elapsed} seconds`
 
     const [result] = await pool.query<ResultSetHeader>(
       `
@@ -556,6 +916,36 @@ async function sweepOverdueRuns(): Promise<void> {
 
     if (!result.affectedRows) continue
     await finalizeRun(row.run_id, true)
+  }
+}
+
+// Dead man's switch. Runs off cron_monitoring alone, so a cron goes unhealthy
+// when no successful run lands in time -- whether that is because the consumer
+// is down, the queue is stuck, the trigger never fired, or no run row was ever
+// created. None of those produce a run-state transition to hang an alert on.
+async function sweepStaleCrons(): Promise<void> {
+  const [rows] = await pool.query<CronHealthRow[]>(
+    `
+      SELECT ${CRON_HEALTH_COLUMNS}
+      FROM cron_monitoring
+      WHERE status = 1
+        AND stale_after_at IS NOT NULL
+        AND stale_after_at <= UTC_TIMESTAMP()
+        AND health_status <> 'unhealthy'
+      ORDER BY stale_after_at ASC
+      LIMIT 100
+    `,
+  )
+
+  for (const row of rows) {
+    const since = row.last_success_at
+      ? new Date(row.last_success_at).toISOString()
+      : 'never (no successful run on record)'
+    const expectedBy = row.stale_after_at ? new Date(row.stale_after_at).toISOString() : 'n/a'
+    const reason = `No successful run since ${since}; a completed run was expected by ${expectedBy}. The trigger may not have been consumed (dead consumer or stuck queue).`
+
+    console.warn(`[cron-monitor] cron=${row.cron} is stale: ${reason}`)
+    await markCronUnhealthy(row.cron, reason, true)
   }
 }
 
@@ -579,6 +969,7 @@ async function tick(): Promise<void> {
 
     if (Date.now() - lastSweepAt >= config.cron.sweepIntervalMs) {
       await sweepOverdueRuns()
+      await sweepStaleCrons()
       lastSweepAt = Date.now()
     }
 
@@ -631,7 +1022,12 @@ async function tick(): Promise<void> {
 }
 
 export async function resetCronSchedule(cronName: string): Promise<void> {
-  await pool.query('UPDATE cron_monitoring SET next_run_at = NULL WHERE cron = ?', [cronName])
+  // The schedule (and therefore the health deadline) changed: disarm the
+  // watchdog so the next claim re-arms it against the new expression.
+  await pool.query(
+    'UPDATE cron_monitoring SET next_run_at = NULL, stale_after_at = NULL WHERE cron = ?',
+    [cronName],
+  )
 }
 
 export function startCronMonitor(): void {
