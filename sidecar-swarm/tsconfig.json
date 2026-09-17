@@ -15,5 +15,7 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Tests import `bun:test`, whose types are not in @types/node; bun runs them.
+  "exclude": ["src/**/*.test.ts"]
 }

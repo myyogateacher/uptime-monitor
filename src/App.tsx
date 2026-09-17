@@ -2565,6 +2565,8 @@ function AlertRulesPanel({
     );
 }
 
+const METRICS_SHOW_INACTIVE_STORAGE_KEY = "metrics_show_inactive_services";
+
 function MetricsPage({ canEdit }: { canEdit: boolean }) {
     const [overview, setOverview] = useState<MetricsOverview | null>(null);
     const [nodeServices, setNodeServices] = useState<MetricService[]>([]);
@@ -2575,6 +2577,23 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
     const [agg, setAgg] = useState<MetricAgg>("avg");
     const [selectedNode, setSelectedNode] = useState<string | null>(null);
     const [serviceFilter, setServiceFilter] = useState("");
+    // Services with no live containers are hidden by default (the server drops
+    // them unless include_inactive=1). The preference is sticky per browser.
+    const [showInactiveServices, setShowInactiveServices] = useState<boolean>(
+        () => {
+            if (typeof window === "undefined") return false;
+            try {
+                return (
+                    window.localStorage.getItem(
+                        METRICS_SHOW_INACTIVE_STORAGE_KEY,
+                    ) === "1"
+                );
+            } catch {
+                // localStorage may be unavailable; fall back to the default.
+                return false;
+            }
+        },
+    );
     const [showAlerts, setShowAlerts] = useState(false);
     const [refreshKey, setRefreshKey] = useState(0);
     const [isLoading, setIsLoading] = useState(true);
@@ -2667,8 +2686,9 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
             rangeDays: range.rangeDays,
             from: range.from,
             to: range.to,
+            includeInactive: showInactiveServices,
         }),
-        [range],
+        [range, showInactiveServices],
     );
 
     const loadOverview = useCallback(async () => {
@@ -2678,6 +2698,10 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
             setOverview({
                 nodes: Array.isArray(data?.nodes) ? data.nodes : [],
                 services: Array.isArray(data?.services) ? data.services : [],
+                hidden_inactive_count:
+                    typeof data?.hidden_inactive_count === "number"
+                        ? data.hidden_inactive_count
+                        : 0,
             });
             setError("");
         } catch (requestError) {
@@ -2731,6 +2755,24 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
         : baseTableServices;
     const isEmpty =
         !isLoading && nodes.length === 0 && allServices.length === 0;
+    // Only the overview reports the hidden count, so the note is suppressed
+    // while the table is scoped to a single node.
+    const hiddenInactiveCount =
+        showInactiveServices || (tab === "node" && selectedNode)
+            ? 0
+            : (overview?.hidden_inactive_count ?? 0);
+
+    const toggleShowInactiveServices = (next: boolean) => {
+        setShowInactiveServices(next);
+        try {
+            window.localStorage.setItem(
+                METRICS_SHOW_INACTIVE_STORAGE_KEY,
+                next ? "1" : "0",
+            );
+        } catch {
+            // localStorage may be unavailable; the toggle still works in-memory.
+        }
+    };
 
     return (
         <main className="min-h-screen px-4 py-8 text-slate-900 md:px-8">
@@ -3021,6 +3063,22 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                                             </button>
                                         )}
                                     </div>
+                                    <label
+                                        className="flex cursor-pointer items-center gap-2 whitespace-nowrap text-xs font-medium text-slate-600"
+                                        title="Include services with no containers seen in the last 10 minutes"
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            checked={showInactiveServices}
+                                            onChange={(event) =>
+                                                toggleShowInactiveServices(
+                                                    event.target.checked,
+                                                )
+                                            }
+                                            className="h-4 w-4 cursor-pointer rounded border-slate-300"
+                                        />
+                                        Show inactive
+                                    </label>
                                     {tab === "node" && selectedNode && (
                                         <button
                                             type="button"
@@ -3046,6 +3104,13 @@ function MetricsPage({ canEdit }: { canEdit: boolean }) {
                                           : "No services reporting yet."
                                 }
                             />
+                            {hiddenInactiveCount > 0 && (
+                                <p className="text-xs text-slate-500">
+                                    {hiddenInactiveCount} inactive service
+                                    {hiddenInactiveCount === 1 ? "" : "s"}{" "}
+                                    hidden.
+                                </p>
+                            )}
                         </div>
                     </>
                 )}

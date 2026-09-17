@@ -68,6 +68,9 @@ export interface MetricService {
 export interface MetricsOverview {
   nodes: MetricNode[]
   services: MetricService[]
+  // Services dropped because they have no live containers. 0 when the request
+  // asked for them via includeInactive.
+  hidden_inactive_count?: number
 }
 
 // GET /api/metrics/services/:name/containers → []. Mirrors serializeContainerRow.
@@ -187,6 +190,8 @@ export interface MetricServiceListOptions {
   rangeDays: number
   from?: string
   to?: string
+  // Include services with zero live containers (server default: false).
+  includeInactive?: boolean
 }
 
 export interface SessionUser {
@@ -715,6 +720,7 @@ function serviceListQuery(options?: MetricServiceListOptions): string {
   } else {
     params.set('range_days', String(options.rangeDays))
   }
+  if (options.includeInactive) params.set('include_inactive', '1')
   return `?${params.toString()}`
 }
 

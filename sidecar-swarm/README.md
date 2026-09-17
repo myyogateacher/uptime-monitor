@@ -71,10 +71,22 @@ token via the external secret using `METRICS_INGEST_TOKEN_FILE`.
 The collector also works on any plain Docker host. When the swarm labels are
 absent, service identity falls back automatically (swarm > compose > name):
 
+- **Docker Swarm** tasks group by `com.docker.swarm.service.name`. That name is
+  first run through the same suffix normalisation as bare container names
+  below, so per-session services deployed one-per-session as
+  `recorder-<uuid>` all group under a single `recorder` service. The raw swarm
+  service name is preserved in the task name (the swarm task label already
+  embeds it), so each session is still identifiable in the replicas drill-down;
+  the replica slot is dropped for those, since slots are numbered per swarm
+  service and every session would otherwise claim slot 1. Ordinary services
+  (`api`, `worker-2`) are unaffected — normalisation is a no-op for them and
+  their service name, task name, slot and stack namespace are unchanged.
 - **docker-compose** containers group by their `com.docker.compose.service`
   under the compose project (`com.docker.compose.project`), with the replica
   slot taken from `com.docker.compose.container-number` — so a compose service
   shows up as a named, multi-replica service just like a swarm service.
+  Compose service names are authored by hand in a compose file, so they are
+  never normalised.
 - **bare `docker run`** containers (no orchestration labels) are named after the
   container itself, with trailing machine-generated segments stripped — a full
   UUID, a hex blob of 8+ chars, or a mostly-digits timestamp-like suffix. So

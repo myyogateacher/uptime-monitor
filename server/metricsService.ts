@@ -700,10 +700,17 @@ const serviceWindowAggregates = async (
   return result
 }
 
+// Services whose live container count is 0 are hidden by default: short-lived
+// services (per-session workers) keep their dimension rows for
+// METRIC_DIMENSION_PRUNE_DAYS and would otherwise clutter the table with
+// "0 / 0" rows for a week. `includeInactive` opts them back in. The filter is
+// applied after accumulation so the SQL — and with it the `last_seen`
+// semantics — stays untouched.
 const listServicesQuery = async (
   nodeKey?: string,
   aggWindow?: ServiceAggWindow,
-): Promise<ServiceOverviewRow[]> => {
+  includeInactive = false,
+): Promise<{ rows: ServiceOverviewRow[]; hiddenInactive: number }> => {
   const params: unknown[] = [LIVE_WINDOW_MINUTES]
   let nodeFilter = ''
   if (nodeKey) {
@@ -733,7 +740,7 @@ const listServicesQuery = async (
     `,
     params,
   )
-  if (!rows.length) return []
+  if (!rows.length) return { rows: [], hiddenInactive: 0 }
 
   // The window aggregate is keyed by service id; only the services visible here
   // are queried, and the node filter is reapplied inside ClickHouse so the
@@ -803,9 +810,16 @@ const listServicesQuery = async (
     if (mem != null) entry.memTotal = (entry.memTotal ?? 0) + mem
   }
 
-  return [...byService.values()]
-    .sort((left, right) => (left.service_name < right.service_name ? -1 : left.service_name > right.service_name ? 1 : 0))
-    .map((entry) => ({
+  const accumulated = [...byService.values()].sort((left, right) =>
+    left.service_name < right.service_name ? -1 : left.service_name > right.service_name ? 1 : 0,
+  )
+  const visible = includeInactive
+    ? accumulated
+    : accumulated.filter((entry) => entry.liveContainers > 0)
+
+  return {
+    hiddenInactive: accumulated.length - visible.length,
+    rows: visible.map((entry) => ({
       service_name: entry.service_name,
       container_count: entry.liveContainers,
       node_count: entry.liveNodes.size,
@@ -816,7 +830,8 @@ const listServicesQuery = async (
       total_quota_cores: entry.quotaTotal,
       total_mem_limit_bytes: entry.memLimitTotal,
       last_seen: entry.lastSeen,
-    }))
+    })),
+  }
 }
 
 const serializeNodeOverview = (row: NodeOverviewRow) => ({
@@ -855,14 +870,15 @@ const serializeServiceOverview = (row: ServiceOverviewRow) => {
   }
 }
 
-export async function getOverview(aggWindow?: ServiceAggWindow) {
+export async function getOverview(aggWindow?: ServiceAggWindow, includeInactive = false) {
   const [nodes, services] = await Promise.all([
     listNodesQuery(),
-    listServicesQuery(undefined, aggWindow),
+    listServicesQuery(undefined, aggWindow, includeInactive),
   ])
   return {
     nodes: nodes.map(serializeNodeOverview),
-    services: services.map(serializeServiceOverview),
+    services: services.rows.map(serializeServiceOverview),
+    hidden_inactive_count: services.hiddenInactive,
   }
 }
 
@@ -871,13 +887,17 @@ export async function listNodes() {
   return rows.map(serializeNodeOverview)
 }
 
-export async function listServices(aggWindow?: ServiceAggWindow) {
-  const rows = await listServicesQuery(undefined, aggWindow)
+export async function listServices(aggWindow?: ServiceAggWindow, includeInactive = false) {
+  const { rows } = await listServicesQuery(undefined, aggWindow, includeInactive)
   return rows.map(serializeServiceOverview)
 }
 
-export async function listServicesOnNode(nodeKey: string, aggWindow?: ServiceAggWindow) {
-  const rows = await listServicesQuery(nodeKey, aggWindow)
+export async function listServicesOnNode(
+  nodeKey: string,
+  aggWindow?: ServiceAggWindow,
+  includeInactive = false,
+) {
+  const { rows } = await listServicesQuery(nodeKey, aggWindow, includeInactive)
   return rows.map(serializeServiceOverview)
 }
 

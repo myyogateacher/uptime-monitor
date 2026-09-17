@@ -155,13 +155,15 @@ const isMachineToken = (token: string): boolean => {
   return false
 }
 
-// Derive a stable service name from a bare container name by stripping trailing
-// machine-generated segments (UUIDs, hex blobs, timestamps) so that ephemeral
-// containers such as `recorder-3f9a12ab-77c1-4e2b-9d10-aa12bc34de56` collapse
-// into one `recorder` service instead of one single-replica service each.
+// Derive a stable service name by stripping trailing machine-generated segments
+// (UUIDs, hex blobs, timestamps) so that ephemeral containers such as
+// `recorder-3f9a12ab-77c1-4e2b-9d10-aa12bc34de56` collapse into one `recorder`
+// service instead of one single-replica service each.
 //
-// Only ever applied to the tier-3 bare-name fallback — swarm and compose
-// service names are authoritative and must never be rewritten.
+// Applied to the tier-3 bare container name and to the tier-1 swarm service
+// name (per-session swarm services are named `<service>-<uuid>`); the raw name
+// is always preserved as task_name so the session stays identifiable. Compose
+// service names come from a static compose file and are left untouched.
 //
 // Rules: segments are delimited by `-` or `_`; a trailing full UUID (spanning
 // five dash-separated tokens), a hex string of length >= 8, or a >= 6 char
@@ -242,9 +244,28 @@ export const extractServiceIdentity = (
 ): ServiceIdentity => {
   // Tier 1 — Docker Swarm. Present on swarm tasks (including swarm stacks
   // deployed from compose files, which also carry compose labels); swarm wins.
+  //
+  // Per-session workloads are sometimes launched as one swarm service each
+  // (`recorder-<uuid>`), which would otherwise show up as one single-replica
+  // service per session. The same suffix normalisation as tier 3 collapses
+  // them into one `recorder` service. When normalisation is a no-op — the
+  // normal case, e.g. `api` or `worker-2` — output is byte-for-byte what it
+  // always was. When it does rewrite the name, the raw swarm service name is
+  // kept in task_name (the swarm task label already embeds it, so it is used
+  // as-is when present) and replica_slot is dropped: slots are numbered per
+  // swarm service, so every merged session would claim slot 1.
   const swarmService = labels[LABEL_SERVICE]
   if (swarmService) {
     const taskName = labels[LABEL_TASK] ?? null
+    const normalized = normalizeBareContainerName(swarmService)
+    if (normalized !== swarmService) {
+      return {
+        service_name: normalized,
+        task_name: taskName ?? swarmService,
+        replica_slot: null,
+        stack_namespace: labels[LABEL_STACK] ?? null,
+      }
+    }
     return {
       service_name: swarmService,
       task_name: taskName,
@@ -254,7 +275,9 @@ export const extractServiceIdentity = (
   }
 
   // Tier 2 — docker-compose. Groups replicas by the compose service; the
-  // container-number label is the per-service instance index.
+  // container-number label is the per-service instance index. Not normalised:
+  // compose service names are authored by hand in a compose file, so a name
+  // that looks machine-generated is far more likely to be deliberate.
   const composeService = labels[LABEL_COMPOSE_SERVICE]
   if (composeService) {
     const rawNumber = labels[LABEL_COMPOSE_CONTAINER_NUMBER]

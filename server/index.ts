@@ -930,6 +930,18 @@ const resolveServiceAggWindow = (
   };
 };
 
+// `include_inactive=1` opts the services listings back into services whose live
+// container count is 0. Default false: short-lived services keep their metric
+// dimension rows for METRIC_DIMENSION_PRUNE_DAYS and otherwise linger in the
+// table as "0 / 0" rows. Alerting never goes through these routes.
+const parseIncludeInactive = (value: unknown): boolean => {
+  if (value == null) return false;
+  const raw = String(Array.isArray(value) ? value[0] : value)
+    .trim()
+    .toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+};
+
 const getMappedEndpointById = async (
   endpointId: number,
 ): Promise<EndpointResponse | null> => {
@@ -2523,7 +2535,12 @@ app.get(
     if (!resolved.ok) {
       return res.status(400).json({ error: resolved.error });
     }
-    return res.json(await getOverview(resolved.aggWindow));
+    return res.json(
+      await getOverview(
+        resolved.aggWindow,
+        parseIncludeInactive(req.query.include_inactive),
+      ),
+    );
   },
 );
 
@@ -2549,7 +2566,13 @@ app.get(
     if (!resolved.ok) {
       return res.status(400).json({ error: resolved.error });
     }
-    return res.json(await listServicesOnNode(nodeKey, resolved.aggWindow));
+    return res.json(
+      await listServicesOnNode(
+        nodeKey,
+        resolved.aggWindow,
+        parseIncludeInactive(req.query.include_inactive),
+      ),
+    );
   },
 );
 
@@ -2562,7 +2585,12 @@ app.get(
     if (!resolved.ok) {
       return res.status(400).json({ error: resolved.error });
     }
-    return res.json(await listServices(resolved.aggWindow));
+    return res.json(
+      await listServices(
+        resolved.aggWindow,
+        parseIncludeInactive(req.query.include_inactive),
+      ),
+    );
   },
 );
 
